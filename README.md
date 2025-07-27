@@ -210,6 +210,11 @@ The tool generates:
 - `{input}_{target_lang}.srt` - Translated subtitles (optional)
 - `artifacts/` - Debug files, transcriptions, and intermediate audio
 
+## Demo Video
+
+[![DubbLM Demo](example.png)](https://youtu.be/UADjkgMXQCY)
+
+
 ## Performance Tips
 
 - Use `--no_cache` to force fresh processing
