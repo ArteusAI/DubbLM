@@ -2,7 +2,7 @@
 
 # Required parameters (input must be provided via CLI --input)
 source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
-target_language: "ru"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
+target_language: "fr"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
 
 # Debug options
 debug_info: false  # Generate debug video with speaker labels and timing info
@@ -10,7 +10,7 @@ debug_diarize_only: false  # Stop after diarization/transcription and generate d
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: true  # Preserve background music/sounds in output
+keep_background: false  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
