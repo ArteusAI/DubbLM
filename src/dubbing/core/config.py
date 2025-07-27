@@ -93,10 +93,10 @@ class DubbingConfig:
     
     def load_from_cli(self, args: argparse.Namespace) -> None:
         """Load configuration from CLI arguments."""
-        # Override config with CLI arguments that are not None
+        # Override config with CLI arguments that are not None and actually present
         arg_dict = vars(args)
         for key, value in arg_dict.items():
-            if key != 'config' and value is not None:
+            if key != 'config' and hasattr(args, key) and value is not None:
                 self.config[key] = value
     
     def validate(self) -> None:
@@ -206,10 +206,10 @@ class DubbingConfig:
         parser.add_argument('--source_language', type=str, help='Video source language')
         parser.add_argument('--target_language', type=str, help='Video target language')
         parser.add_argument('--whisper_model', type=str, help='Whisper model size for transcription')
-        parser.add_argument('--keep_background', action='store_true', help='Keep the background audio in the output')
+        parser.add_argument('--keep_background', action='store_true', default=argparse.SUPPRESS, help='Keep the background audio in the output')
         parser.add_argument('--start_time', type=float, help='Start time in seconds to begin processing')
         parser.add_argument('--duration', type=float, help='Duration in seconds to process')
-        parser.add_argument('--no_cache', action='store_true', help='Disable caching of pipeline steps')
+        parser.add_argument('--no_cache', action='store_true', default=argparse.SUPPRESS, help='Disable caching of pipeline steps')
         parser.add_argument('--tts_system', type=str, choices=['coqui', 'openai', 'f5_tts', 'gemini'], help='Text-to-speech system to use')
         parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx'], help='Transcription system to use')
         parser.add_argument('--translator_type', type=str, choices=['llm'], help='Translator type to use')
@@ -222,9 +222,9 @@ class DubbingConfig:
         parser.add_argument('--refinement_max_tokens', type=int, help='Maximum tokens for OpenRouter refinement')
         parser.add_argument('--refinement_persona', type=str, choices=['normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
         parser.add_argument('--voice_name', type=str, help='Voice to use for TTS')
-        parser.add_argument('--debug_info', action='store_true', help='Generate a debug video with speaker labels')
-        parser.add_argument('--save_original_subtitles', action='store_true', help='Save original language subtitles')
-        parser.add_argument('--save_translated_subtitles', action='store_true', help='Save translated language subtitles')
+        parser.add_argument('--debug_info', action='store_true', default=argparse.SUPPRESS, help='Generate a debug video with speaker labels')
+        parser.add_argument('--save_original_subtitles', action='store_true', default=argparse.SUPPRESS, help='Save original language subtitles')
+        parser.add_argument('--save_translated_subtitles', action='store_true', default=argparse.SUPPRESS, help='Save translated language subtitles')
         parser.add_argument('--reference_audio', type=str, help='Path to a reference audio file for f5_tts system')
         parser.add_argument('--reference_text', type=str, help='Text corresponding to the reference audio for f5_tts system')
         parser.add_argument('--watermark_path', type=str, help='Path to the watermark PNG image')
@@ -235,9 +235,9 @@ class DubbingConfig:
                             help='Run only a specific, advanced pipeline step. This is intended for debugging or resuming a failed run where prior steps have successfully created their expected output files in the default locations. \
                                   Example: --run_step combine_video (Assumes audio/output.wav and potentially audio/background.wav exist from prior steps). \
                                   Note: For most users, running the full pipeline or using --generate_speaker_report is recommended.')
-        parser.add_argument('--include_original_audio', action='store_true', help='Include the original audio track in the final video')
+        parser.add_argument('--include_original_audio', action='store_true', default=argparse.SUPPRESS, help='Include the original audio track in the final video')
         parser.add_argument('--output', type=str, help='Path to the output video file (default: input_name + target_language + extension in current directory)')
-        parser.add_argument('--generate_speaker_report', action='store_true', help='Generate a report of identified speakers and their voice samples, then exit.')
+        parser.add_argument('--generate_speaker_report', action='store_true', default=argparse.SUPPRESS, help='Generate a report of identified speakers and their voice samples, then exit.')
         parser.add_argument('--tts_system_mapping', type=str, help='JSON string mapping speakers to TTS systems')
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
         parser.add_argument('--remove_pauses', type=lambda x: (str(x).lower() == 'true'), help='Remove small pauses from video while preserving keyframes (True/False)')

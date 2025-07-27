@@ -23,7 +23,8 @@ class SubtitleManager:
             output_path: Path to save the SRT file
             max_chars_per_line: Maximum characters per subtitle line (default: 160)
         """
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if os.path.dirname(output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
         # Prepare optimized entries
         optimized_entries = []

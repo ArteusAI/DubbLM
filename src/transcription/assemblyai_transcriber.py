@@ -104,7 +104,7 @@ class AssemblyAITranscriber(BaseTranscriber):
             config = self.aai.TranscriptionConfig(
                 speech_model=getattr(self.aai.SpeechModel, self.speech_model),
                 speaker_labels=True,  # Enable speaker diarization
-                language_code=self._get_assemblyai_language_code(),
+                language_code=self.source_language,
                 word_boost=None,  # Can be configured if needed
                 boost_param="default"  # Can be configured if needed
             )
@@ -146,38 +146,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         except Exception as e:
             logger.error(f"AssemblyAI transcription failed: {e}")
             raise RuntimeError(f"AssemblyAI transcription failed: {e}")
-    
-    def _get_assemblyai_language_code(self) -> Optional[str]:
-        """
-        Convert source language to AssemblyAI language code format.
         
-        Returns:
-            AssemblyAI language code or None for auto-detection
-        """
-        # Map common language codes to AssemblyAI format
-        language_mapping = {
-            "en": "en",
-            "es": "es", 
-            "fr": "fr",
-            "de": "de",
-            "it": "it",
-            "pt": "pt",
-            "nl": "nl",
-            "hi": "hi",
-            "ja": "ja",
-            "ko": "ko",
-            "zh": "zh",
-            "ru": "ru",
-            "ar": "ar",
-            "tr": "tr",
-            "pl": "pl",
-            "uk": "uk",
-            "vi": "vi",
-            "th": "th"
-        }
-        
-        return language_mapping.get(self.source_language, None)
-    
     def _process_diarization_result(self, transcript) -> Dict[Tuple[float, float], str]:
         """
         Process AssemblyAI transcript to extract speaker diarization information.

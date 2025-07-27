@@ -55,8 +55,8 @@ The `refinement_persona` feature adapts translations for specific audiences:
 
 ### Voice Selection
 - **Automatic**: AI matches voices to speaker characteristics
-- **Manual**: Assign specific voices per speaker
-- **Note**: Voice cloning is not yet implemented
+- **Manual**: Assign specific voices per speaker from config
+**Note**: Voice cloning is not yet implemented
 
 ### Background Audio Processing
 - **`keep_background: true`** - Preserves original background music and ambient sounds
