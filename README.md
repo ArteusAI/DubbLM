@@ -69,10 +69,13 @@ The `refinement_persona` feature adapts translations for specific audiences:
 ```bash
 # Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
 
 # Clone and install dependencies
 git clone https://github.com/ArteusAI/DubbLM.git
 cd DubbLM
+python3.12 -m venv .venv
+source .venv/bin/activate
 uv pip install -r requirements.txt
 
 # Set up environment variables
