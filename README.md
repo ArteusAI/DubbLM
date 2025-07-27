@@ -67,6 +67,13 @@ The `refinement_persona` feature adapts translations for specific audiences:
 
 ### Setup
 ```bash
+# Install system dependencies
+# Ubuntu/Debian:
+sudo apt update && sudo apt install ffmpeg python3.12 python3.12-venv
+# macOS:
+brew install ffmpeg python@3.12
+# Windows: Download FFmpeg from https://ffmpeg.org/download.html
+
 # Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
@@ -205,6 +212,15 @@ The tool generates:
 - Enable `--remove_pauses` to optimize timing
 - Use GPU for faster processing when available
 - Consider `--start_time` and `--duration` for testing on video segments
+
+## Roadmap
+
+**Upcoming features and improvements:**
+
+- **🚀 Lightweight Setup** - Reduce installation size by making optional packages (NVIDIA CUBLAS, etc.) truly optional and installable only when needed
+- **📺 Smart Ad Removal** - Automatic detection and removal of native advertisements from video content during processing
+- **⏱️ Dialogue Pace Control** - Advanced controls for managing conversation tempo and speech timing across different speakers
+- **🔧 Code Refactoring** - Ongoing improvements to code structure, performance optimizations, and maintainability
 
 ## About us
 
