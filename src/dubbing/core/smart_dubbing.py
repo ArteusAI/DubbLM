@@ -248,9 +248,9 @@ class SmartDubbing:
             self.speaker_processor.save_translated_samples(translated_segments, audio_file)
             
             # Process background audio if needed
-            background_audio_path = self.audio_processor.process_background_audio(
-                audio_file, self.config.get('keep_background', False)
-            )
+            background_audio_path = None
+            if self.config.get('keep_background', False):
+                background_audio_path = self.audio_processor.process_background_audio(audio_file)
             
             # Generate final debug video if needed
             if self.config.get('debug_info', False):

@@ -58,6 +58,10 @@ The `refinement_persona` feature adapts translations for specific audiences:
 - **Manual**: Assign specific voices per speaker
 - **Note**: Voice cloning is not yet implemented
 
+### Background Audio Processing
+- **`keep_background: true`** - Preserves original background music and ambient sounds
+- **Memory Warning**: Background separation requires significant RAM usage. Avoid using this feature on long videos (>30 minutes) as it may cause memory issues on systems with limited RAM
+
 ## Installation
 
 ### Requirements
@@ -212,6 +216,7 @@ The tool generates:
 - Enable `--remove_pauses` to optimize timing
 - Use GPU for faster processing when available
 - Consider `--start_time` and `--duration` for testing on video segments
+- **Avoid `--keep_background` on long videos** - Background audio separation consumes significant RAM and may cause memory issues on videos longer than 30 minutes
 
 ## Roadmap
 
