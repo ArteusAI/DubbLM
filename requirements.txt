@@ -74,7 +74,6 @@ einx==0.3.0
 elevenlabs==1.57.0
 ema-pytorch==0.7.7
 encodec==0.1.1
--e file:///home/fpv/ADubb/f5_tts/F5-TTS
 fastapi==0.115.12
 faster-whisper==1.1.0
 ffmpeg-python==0.2.0
