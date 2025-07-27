@@ -1,0 +1,79 @@
+# Smart Dubbing Tool Configuration
+
+# Required parameters (input must be provided via CLI --input)
+source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
+target_language: "ru"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
+
+# Debug options
+debug_info: false  # Generate debug video with speaker labels and timing info
+debug_diarize_only: false  # Stop after diarization/transcription and generate debug video
+
+# Audio/Video processing
+whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
+keep_background: false  # Preserve background music/sounds in output
+no_cache: false  # Disable caching (slower but fresh processing)
+remove_pauses: true  # Automatically shorten long silence periods
+normalize_audio: true  # Normalize audio volume for consistent output
+use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
+
+# Text-to-Speech settings
+tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
+tts_prompt_prefix: ""  # Global voice instruction prefix for all speakers
+
+# Transcription settings
+transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
+
+# Translation engine configuration
+translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
+llm_provider: "gemini"  # AI provider: gemini, openrouter
+llm_model_name: "gemini-2.5-pro"  # Specific model for translation
+llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
+
+# Translation refinement settings
+refinement_llm_provider: "gemini"  # AI provider for style refinement
+refinement_model_name: "gemini-2.5-pro"  # Model for translation polishing
+refinement_temperature: 1.5  # Refinement creativity level
+refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
+
+# Subtitle generation
+save_original_subtitles: true  # Generate .srt file with original language
+save_translated_subtitles: true  # Generate .srt file with translated text
+
+# Voice configuration
+# voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
+voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
+
+# Advanced audio processing
+# Optional: Preserve original audio for specific time ranges
+#keep_original_audio_ranges:
+#    - "2:01:24-2:01:40"  # Format: HH:MM:SS-HH:MM:SS or MM:SS-MM:SS or SS-SS
+#    - "0:10:00-0:10:20"  # Keep original from 10min to 10min 20s
+#    - "1:05-1:15"        # Keep original from 1min 5s to 1min 15s
+#    - "30-45"            # Keep original from 30s to 45s
+
+# Per-speaker voice mapping
+#voice_name:
+#  SPEAKER_A: "puck"      # Assign specific voice to speaker A
+#  SPEAKER_B: "sadaltager" # Assign specific voice to speaker B
+
+# Per-speaker voice style instructions
+#voice_prompt:
+#  SPEAKER_01: "a drunk tired voice"     # Voice characteristics for speaker 1
+#  SPEAKER_02: "confident narrator tone" # Voice characteristics for speaker 2
+#  SPEAKER_03: "cheerful energetic voice" # Voice characteristics for speaker 3
+
+# Per-speaker TTS engine assignment
+#tts_system_mapping:
+#  SPEAKER_00: "openai"   # Use OpenAI TTS for speaker 00
+#  SPEAKER_01: "gemini"   # Use Gemini TTS for speaker 01
+#  SPEAKER_02: "gemini"   # Use Gemini TTS for speaker 02
+
+# Wildcard TTS mapping (alternative approach)
+#tts_system_mapping:
+#  SPEAKER_00: "gemini"   # Specific assignment for speaker 00
+#  "*": "openai"          # Default TTS for all other speakers
+
+# Translation consistency dictionary
+#glossary:
+#  "AI": "AiAi"           # Force specific term translations
+#  "machine learning": "машинное обучение" # Ensure consistent terminology
