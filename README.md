@@ -4,6 +4,10 @@
 
 An intelligent video dubbing system that uses AI to create natural, context-aware translations and high-quality speech synthesis for video content.
 
+## Important Notice
+
+**DubbLM is designed for high-quality, context-aware translation processing, not real-time applications.** This system prioritizes translation accuracy, context understanding, and content adaptation over processing speed. The AI thoroughly analyzes conversations, adapts content for specific audiences, and ensures natural speech patterns - processes that require significant computational time. Expect processing times that are considerably longer than the original video duration.
+
 ## How It Works
 
 The DubbLM process consists of several AI-powered stages:
@@ -67,14 +71,47 @@ The `refinement_persona` feature adapts translations for specific audiences:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install dependencies
-git clone <repository-url>
+git clone https://github.com/ArteusAI/DubbLM.git
 cd DubbLM
 uv pip install -r requirements.txt
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env with your API keys (OpenAI, Gemini, etc.)
+# Edit .env with your API keys (see API Keys section below)
 ```
+
+### API Keys Configuration
+
+Different features require different API keys. Add these to your `.env` file:
+
+**Required for basic functionality:**
+- `OPENAI_API_KEY` - For OpenAI TTS and transcription services
+- `GOOGLE_API_KEY` - For Gemini TTS and LLM translation services
+
+**Optional (depending on chosen services):**
+
+*For Transcription:*
+- `ASSEMBLYAI_API_KEY` - If using `transcription_system: "assemblyai"`
+- `OPENAI_API_KEY` - If using `transcription_system: "openai"`
+
+*For Translation:*
+- `GOOGLE_API_KEY` - If using `llm_provider: "gemini"` (default)
+- `OPENROUTER_API_KEY` - If using `llm_provider: "openrouter"`
+
+*For Text-to-Speech:*
+- `OPENAI_API_KEY` - If using `tts_system: "openai"`
+- `GOOGLE_API_KEY` - If using `tts_system: "gemini"`
+- No API key needed for `tts_system: "coqui"` (local TTS)
+
+**Example .env file:**
+```env
+OPENAI_API_KEY=sk-your-openai-key-here
+GOOGLE_API_KEY=your-google-api-key-here
+ASSEMBLYAI_API_KEY=your-assemblyai-key-here
+OPENROUTER_API_KEY=your-openrouter-key-here
+```
+
+**Minimum setup:** You need at least `GOOGLE_API_KEY` for default Gemini-based translation and TTS.
 
 ## Usage Examples
 
