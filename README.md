@@ -236,6 +236,10 @@ The tool generates:
 
 This project is open to use and fork for everyone and developed by IT engineers of [Arteus](https://arteus.io/) - a company specializing in adaptive AI systems for business automation, sales, and customer service.
 
+## You are talented
+
+Want to contribute, ask http://t.me/pavelfedortsov
+
 ## License
 
 MIT 
