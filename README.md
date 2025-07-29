@@ -54,8 +54,9 @@ The `refinement_persona` feature adapts translations for specific audiences:
 - **Best for**: Balanced quality/cost projects
 
 ### Voice Selection
-- **Automatic**: AI matches voices to speaker characteristics
+- **Automatic**: AI matches voices to speaker characteristics from existing TTS voice set
 - **Manual**: Assign specific voices per speaker from config
+
 **Note**: Voice cloning is not yet implemented
 
 ### Background Audio Processing
