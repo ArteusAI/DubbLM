@@ -748,23 +748,46 @@ class VideoProcessor:
             
             if has_complex_filters and use_two_pass_encoding:
                 logger.info("Disabling two-pass encoding due to complex filter operations")
+                logger.info("Will use enhanced single-pass encoding for maximum quality")
                 use_two_pass_encoding = False
             
             if (use_two_pass_encoding and original_bitrate and 
                 original_bitrate.isdigit() and int(original_bitrate) > 1000000):
                 command.extend(["-c:v", "libx264"])  # Placeholder, will be replaced in two-pass
             else:
-                # Use conservative high-quality settings
+                # Use high-quality single-pass settings
                 command.extend(["-c:v", "libx264"])
                 
-                # Try to maintain original bitrate first (best quality preservation)
-                if original_bitrate and original_bitrate.isdigit() and int(original_bitrate) > 1000000:  # > 1 Mbps
-                    command.extend(["-b:v", original_bitrate])
-                    logger.debug(f"Preserving original bitrate: {int(original_bitrate)//1000} kbps")
+                # Enhanced quality settings when two-pass is disabled due to complex filters
+                if has_complex_filters:
+                    logger.info("Using enhanced quality settings for complex filter operations")
+                    
+                    # For complex filters, use higher bitrate or better CRF to compensate
+                    if original_bitrate and original_bitrate.isdigit() and int(original_bitrate) > 1000000:
+                        # Use 20% higher bitrate than original for complex operations
+                        enhanced_bitrate = str(int(int(original_bitrate) * 1.2))
+                        command.extend(["-b:v", enhanced_bitrate])
+                        logger.debug(f"Enhanced bitrate for complex filters: {int(enhanced_bitrate)//1000} kbps (+20%)")
+                    else:
+                        # Use CRF 18 for excellent quality (lower = better)
+                        command.extend(["-crf", "18"])
+                        logger.debug("Using CRF 18 for maximum quality with complex filters")
+                    
+                    # Use slower preset for best quality
+                    command.extend(["-preset", "slow"])
+                    logger.debug("Using 'slow' preset for maximum quality")
                 else:
-                    # Use CRF 20 (conservative high quality, not as aggressive as 18)
-                    command.extend(["-crf", "20"])
-                    logger.debug("Using CRF 20 for high-quality re-encoding")
+                    # Standard high-quality settings for simple operations
+                    if original_bitrate and original_bitrate.isdigit() and int(original_bitrate) > 1000000:
+                        command.extend(["-b:v", original_bitrate])
+                        logger.debug(f"Preserving original bitrate: {int(original_bitrate)//1000} kbps")
+                    else:
+                        # Use CRF 19 for very high quality
+                        command.extend(["-crf", "19"])
+                        logger.debug("Using CRF 19 for high-quality re-encoding")
+                    
+                    # Use medium preset for good quality/speed balance
+                    command.extend(["-preset", "medium"])
                 
                 # Preserve original settings when possible
                 if video_info.get('video_profile') and video_info['video_profile'] in ['high', 'main', 'baseline']:
@@ -776,9 +799,6 @@ class VideoProcessor:
                     command.extend(["-pix_fmt", video_info['video_pix_fmt']])
                 else:
                     command.extend(["-pix_fmt", "yuv420p"])
-                
-                # Use medium preset for good quality/speed balance
-                command.extend(["-preset", "medium"])
 
         # Audio encoding (always needed since audio is being replaced)
         original_audio_codec = video_info.get('audio_codec', 'aac')

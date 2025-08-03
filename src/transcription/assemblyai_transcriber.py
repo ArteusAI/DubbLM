@@ -3,6 +3,8 @@ Implementation of transcription and diarization using AssemblyAI API.
 """
 import os
 import time
+import tempfile
+from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
 from transcription.transcription_interface import BaseTranscriber
@@ -23,6 +25,9 @@ class AssemblyAITranscriber(BaseTranscriber):
         device: Optional[str] = None,
         speech_model: str = "best",
         cache_manager: Optional['CacheManager'] = None,
+        convert_to_mp3: bool = True,
+        mp3_bitrate: str = "128k",
+        mp3_size_threshold_mb: int = 20,
         **kwargs
     ):
         """
@@ -33,11 +38,17 @@ class AssemblyAITranscriber(BaseTranscriber):
             device: Compute device (not used for API-based service)
             speech_model: AssemblyAI speech model to use ('best', 'nano')
             cache_manager: Cache manager instance for organized caching
+            convert_to_mp3: Whether to convert audio files to MP3 before upload
+            mp3_bitrate: MP3 bitrate for conversion (e.g., '128k', '192k', '256k')
+            mp3_size_threshold_mb: Only convert files larger than this size in MB
             **kwargs: Additional parameters
         """
         super().__init__(source_language, device, **kwargs)
         self.speech_model = speech_model
         self.cache_manager = cache_manager
+        self.convert_to_mp3 = convert_to_mp3
+        self.mp3_bitrate = mp3_bitrate
+        self.mp3_size_threshold_mb = mp3_size_threshold_mb
         
         # Get API key from environment
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -65,6 +76,99 @@ class AssemblyAITranscriber(BaseTranscriber):
     def name(self) -> str:
         """Return the name of the transcription service implementation."""
         return "AssemblyAI"
+    
+    def _convert_to_mp3(self, audio_file: str) -> str:
+        """
+        Convert audio file to MP3 format to reduce upload size.
+        Only converts files larger than the threshold size.
+        
+        Args:
+            audio_file: Path to the input audio file
+            
+        Returns:
+            Path to the converted MP3 file (temporary file) or original file
+        """
+        input_path = Path(audio_file)
+        
+        # Check if file exists
+        if not input_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_file}")
+        
+        # Get file size in MB
+        file_size_bytes = input_path.stat().st_size
+        file_size_mb = file_size_bytes / (1024 * 1024)
+        
+        # If file is smaller than threshold, return original
+        if file_size_mb < self.mp3_size_threshold_mb:
+            logger.debug(
+                f"File {audio_file} is {file_size_mb:.1f}MB, below {self.mp3_size_threshold_mb}MB threshold. "
+                "Skipping MP3 conversion."
+            )
+            return audio_file
+        
+        # If already MP3, return original file
+        if input_path.suffix.lower() == '.mp3':
+            logger.debug(f"File {audio_file} is already MP3 format ({file_size_mb:.1f}MB)")
+            return audio_file
+        
+        # Create temporary MP3 file
+        temp_mp3 = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+        temp_mp3_path = temp_mp3.name
+        temp_mp3.close()
+        
+        try:
+            import subprocess
+            
+            # Convert to MP3 using ffmpeg
+            cmd = [
+                'ffmpeg',
+                '-i', str(input_path),
+                '-codec:a', 'libmp3lame',
+                '-b:a', self.mp3_bitrate,
+                '-y',  # Overwrite output file
+                temp_mp3_path
+            ]
+            
+            logger.info(
+                f"Converting {audio_file} ({file_size_mb:.1f}MB) to MP3 with bitrate {self.mp3_bitrate}"
+            )
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            # Check if conversion was successful
+            if not Path(temp_mp3_path).exists() or Path(temp_mp3_path).stat().st_size == 0:
+                raise RuntimeError("MP3 conversion failed - output file is empty or missing")
+            
+            original_size = input_path.stat().st_size
+            converted_size = Path(temp_mp3_path).stat().st_size
+            compression_ratio = (1 - converted_size / original_size) * 100
+            converted_size_mb = converted_size / (1024 * 1024)
+            
+            logger.info(
+                f"Audio converted to MP3: {file_size_mb:.1f}MB → {converted_size_mb:.1f}MB "
+                f"({compression_ratio:.1f}% reduction)"
+            )
+            
+            return temp_mp3_path
+            
+        except subprocess.CalledProcessError as e:
+            # Clean up temp file on error
+            if Path(temp_mp3_path).exists():
+                Path(temp_mp3_path).unlink()
+            raise RuntimeError(f"FFmpeg conversion failed: {e.stderr}")
+        except FileNotFoundError:
+            # Clean up temp file on error
+            if Path(temp_mp3_path).exists():
+                Path(temp_mp3_path).unlink()
+            raise RuntimeError(
+                "FFmpeg not found. Please install FFmpeg to enable audio conversion: "
+                "https://ffmpeg.org/download.html"
+            )
     
     def diarize_and_transcribe(
         self,
@@ -105,6 +209,24 @@ class AssemblyAITranscriber(BaseTranscriber):
         logger.info(f"Running AssemblyAI transcription and diarization on {audio_file}...")
         logger.debug(f"Using speech model: {self.speech_model}")
         
+        # Convert to MP3 if enabled to reduce upload size
+        processed_audio_file = audio_file
+        temp_mp3_file = None
+        
+        # Only try MP3 conversion for local files (not URLs)
+        is_local_file = not audio_file.startswith(('http://', 'https://'))
+        
+        if self.convert_to_mp3 and is_local_file:
+            try:
+                processed_audio_file = self._convert_to_mp3(audio_file)
+                if processed_audio_file != audio_file:
+                    temp_mp3_file = processed_audio_file
+            except Exception as e:
+                logger.warning(f"MP3 conversion failed, using original file: {e}")
+                processed_audio_file = audio_file
+        elif not is_local_file:
+            logger.debug(f"Skipping MP3 conversion for URL: {audio_file}")
+        
         try:
             # Configure transcription settings
             config = self.aai.TranscriptionConfig(
@@ -117,7 +239,7 @@ class AssemblyAITranscriber(BaseTranscriber):
             
             # Create transcriber and submit job
             transcriber = self.aai.Transcriber(config=config)
-            transcript = transcriber.transcribe(audio_file)
+            transcript = transcriber.transcribe(processed_audio_file)
             
             # Check for transcription errors
             if transcript.status == "error":
@@ -152,6 +274,14 @@ class AssemblyAITranscriber(BaseTranscriber):
         except Exception as e:
             logger.error(f"AssemblyAI transcription failed: {e}")
             raise RuntimeError(f"AssemblyAI transcription failed: {e}")
+        finally:
+            # Clean up temporary MP3 file if created
+            if temp_mp3_file and Path(temp_mp3_file).exists():
+                try:
+                    Path(temp_mp3_file).unlink()
+                    logger.debug(f"Cleaned up temporary MP3 file: {temp_mp3_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary MP3 file {temp_mp3_file}: {e}")
         
     def _process_diarization_result(self, transcript) -> Dict[Tuple[float, float], str]:
         """

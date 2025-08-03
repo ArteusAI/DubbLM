@@ -98,3 +98,5 @@ artifacts/
 
 # Project specifics
 tmp/
+
+*.yml
