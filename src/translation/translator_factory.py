@@ -49,6 +49,9 @@ class TranslatorFactory:
             # Get glossary if provided
             glossary = kwargs.get("glossary")
             
+            # Get cache manager if provided
+            cache_manager = kwargs.get("cache_manager")
+            
             translator = LLMTranslator(
                 llm_provider=llm_provider,
                 model_name=model_name,
@@ -58,7 +61,8 @@ class TranslatorFactory:
                 refinement_model_name=refinement_model_name,
                 refinement_temperature=refinement_temperature,
                 refinement_max_tokens=refinement_max_tokens,
-                glossary=glossary
+                glossary=glossary,
+                cache_manager=cache_manager
             )
                 
             # Initialize the translator

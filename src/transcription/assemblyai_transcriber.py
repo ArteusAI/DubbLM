@@ -3,10 +3,13 @@ Implementation of transcription and diarization using AssemblyAI API.
 """
 import os
 import time
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
 from transcription.transcription_interface import BaseTranscriber
 from src.dubbing.core.log_config import get_logger
+
+if TYPE_CHECKING:
+    from src.dubbing.core.cache_manager import CacheManager
 
 logger = get_logger(__name__)
 
@@ -19,6 +22,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         source_language: str,
         device: Optional[str] = None,
         speech_model: str = "best",
+        cache_manager: Optional['CacheManager'] = None,
         **kwargs
     ):
         """
@@ -28,10 +32,12 @@ class AssemblyAITranscriber(BaseTranscriber):
             source_language: Source language code (e.g., 'en')
             device: Compute device (not used for API-based service)
             speech_model: AssemblyAI speech model to use ('best', 'nano')
+            cache_manager: Cache manager instance for organized caching
             **kwargs: Additional parameters
         """
         super().__init__(source_language, device, **kwargs)
         self.speech_model = speech_model
+        self.cache_manager = cache_manager
         
         # Get API key from environment
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -86,9 +92,9 @@ class AssemblyAITranscriber(BaseTranscriber):
         step_name = "assemblyai_diarization_transcription"
         
         # Check if results are cached
-        if use_cache and self._cache_exists(step_name, cache_key):
+        if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading AssemblyAI diarization and transcription from cache...")
-            cached_results = self._load_from_cache(step_name, cache_key)
+            cached_results = self.cache_manager.load_from_cache(step_name, cache_key)
             
             # Store for debug
             self.debug_data["diarization"] = cached_results["diarization"]
@@ -130,12 +136,12 @@ class AssemblyAITranscriber(BaseTranscriber):
             self.debug_data["transcription"] = transcription
             
             # Cache the results
-            if use_cache:
+            if use_cache and self.cache_manager:
                 results_to_cache = {
                     "diarization": speakers_rolls,
                     "transcription": transcription
                 }
-                self._save_to_cache(step_name, cache_key, results_to_cache)
+                self.cache_manager.save_to_cache(step_name, cache_key, results_to_cache)
             
             logger.info(f"AssemblyAI transcription completed successfully")
             logger.debug(f"Identified {len(set(speakers_rolls.values()))} speakers")

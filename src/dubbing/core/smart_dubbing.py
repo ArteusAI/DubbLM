@@ -152,7 +152,8 @@ class SmartDubbing:
                 refinement_temperature=self.config.get('refinement_temperature', 1.0),
                 refinement_max_tokens=self.config.get('refinement_max_tokens'),
                 refinement_persona=self.config.get('refinement_persona', 'normal'),
-                glossary=self.config.get('glossary')
+                glossary=self.config.get('glossary'),
+                cache_manager=self.cache_manager
             )
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
@@ -186,7 +187,8 @@ class SmartDubbing:
                 transcription_system=self.config.get('transcription_system', 'whisper'),
                 source_language=self.config.get('source_language'),
                 device=self.device,
-                whisper_model=self.config.get('whisper_model', 'large-v3')
+                whisper_model=self.config.get('whisper_model', 'large-v3'),
+                cache_manager=self.cache_manager
             )
             logger.debug(f"Initialized {self.transcriber.name} transcriber")
         except Exception as e:
@@ -226,12 +228,14 @@ class SmartDubbing:
             # Save debug TSV
             self.subtitle_manager.save_debug_tsv(translated_segments)
             
-            # Save subtitles if requested
-            if save_original_subtitles:
-                self.subtitle_manager.save_subtitles(translated_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('target_language')))
-            
-            if save_translated_subtitles:
-                self.subtitle_manager.save_subtitles(translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
+            # Save subtitles if requested (only if pause removal is disabled)
+            remove_pauses_enabled = self.config.get('remove_pauses', True)
+            if not remove_pauses_enabled:
+                if save_original_subtitles:
+                    self.subtitle_manager.save_subtitles(translated_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
+                
+                if save_translated_subtitles:
+                    self.subtitle_manager.save_subtitles(translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
             
             # Analyze emotions (if enabled)
             if self.config.get('enable_emotion_analysis', True):
@@ -288,21 +292,35 @@ class SmartDubbing:
             # Store pause adjustments for potential future use
             self.pause_adjustments = pause_adjustments
             
-            # Save adjusted subtitles if pause adjustments were made
-            if pause_adjustments and (save_original_subtitles or save_translated_subtitles):
-                logger.info("Adjusting subtitle timestamps based on pause modifications...")
-                
-                if save_original_subtitles:
-                    adjusted_original_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
-                    self.subtitle_manager.save_subtitles(adjusted_original_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('target_language'), True))
-                    adjusted_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('target_language'), True)
-                    logger.info(f"Saved adjusted original subtitles to {adjusted_path}")
-                
-                if save_translated_subtitles:
-                    adjusted_translated_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
-                    self.subtitle_manager.save_subtitles(adjusted_translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'), True))
-                    adjusted_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'), True)
-                    logger.info(f"Saved adjusted translated subtitles to {adjusted_path}")
+            # Save subtitles after pause processing if pause removal is enabled
+            if remove_pauses_enabled and (save_original_subtitles or save_translated_subtitles):
+                if pause_adjustments:
+                    logger.info("Adjusting subtitle timestamps based on pause modifications...")
+                    
+                    if save_original_subtitles:
+                        adjusted_original_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
+                        self.subtitle_manager.save_subtitles(adjusted_original_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
+                        adjusted_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language'))
+                        logger.info(f"Saved pause-corrected original subtitles to {adjusted_path}")
+                    
+                    if save_translated_subtitles:
+                        adjusted_translated_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
+                        self.subtitle_manager.save_subtitles(adjusted_translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
+                        adjusted_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'))
+                        logger.info(f"Saved pause-corrected translated subtitles to {adjusted_path}")
+                else:
+                    # No pause adjustments made, but pause removal was enabled - save original timestamps
+                    logger.info("No pause adjustments needed, saving subtitles with original timestamps...")
+                    
+                    if save_original_subtitles:
+                        self.subtitle_manager.save_subtitles(translated_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
+                        subtitle_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language'))
+                        logger.info(f"Saved original subtitles to {subtitle_path}")
+                    
+                    if save_translated_subtitles:
+                        self.subtitle_manager.save_subtitles(translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
+                        subtitle_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'))
+                        logger.info(f"Saved translated subtitles to {subtitle_path}")
             
             # Overall pipeline metrics
             total_elapsed = time.perf_counter() - pipeline_start_time
@@ -577,7 +595,6 @@ class SmartDubbing:
         # Define comfort ratio constants
         COMFORT_MIN_ADJUSTMENT_RATIO = 0.75
         COMFORT_MAX_ADJUSTMENT_RATIO = 1.15
-        MAX_DURATION_DEVIATION = 0.10
         
         # Group segments by TTS system for batch processing
         segments_by_tts_system = {}
@@ -840,14 +857,13 @@ class SmartDubbing:
                         actual_dur = segment_dict['synthesized_speech_len']
                         ratio = original_dur / actual_dur if actual_dur > 0 else 1.0
                         deviation = abs(original_dur - actual_dur) / original_dur if original_dur > 0 else 0.0
-                        if deviation > MAX_DURATION_DEVIATION or not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
+                        if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
                             logger.debug(f"Segment {metadata['index']+1}: duration mismatch after synthesis (ratio={ratio:.2f}, dev={deviation:.2%}). Trying alternatives...")
                             self._resynthesize_segment(
                                 metadata,
                                 tts_instance,
                                 COMFORT_MIN_ADJUSTMENT_RATIO,
                                 COMFORT_MAX_ADJUSTMENT_RATIO,
-                                MAX_DURATION_DEVIATION,
                                 current_ratio=ratio,
                             )
                     else:
@@ -895,14 +911,13 @@ class SmartDubbing:
                         actual_dur = segment_dict.get('synthesized_speech_len', 0)
                         ratio = original_dur / actual_dur if actual_dur > 0 else 1.0
                         deviation = abs(original_dur - actual_dur) / original_dur if original_dur > 0 else 0.0
-                        if deviation > MAX_DURATION_DEVIATION or not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
+                        if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
                             logger.info(f"Segment {metadata['index']+1}: duration mismatch after fallback synthesis (ratio={ratio:.2f}, dev={deviation:.2%}). Trying alternatives...")
                             self._resynthesize_segment(
                                 metadata,
                                 tts_instance,
                                 COMFORT_MIN_ADJUSTMENT_RATIO,
                                 COMFORT_MAX_ADJUSTMENT_RATIO,
-                                MAX_DURATION_DEVIATION,
                                 current_ratio=ratio,
                             )
                         
@@ -1054,7 +1069,6 @@ class SmartDubbing:
         tts_instance,
         min_ratio: float,
         max_ratio: float,
-        max_deviation: float,
         current_ratio: Optional[float] = None,
     ) -> None:
         """Attempt to resynthesize a segment using alternative translations,
@@ -1065,7 +1079,6 @@ class SmartDubbing:
             tts_instance: The TTS instance used for synthesis.
             min_ratio: Minimum acceptable ratio original/actual.
             max_ratio: Maximum acceptable ratio original/actual.
-            max_deviation: Maximum allowed percentage deviation.
             current_ratio: Current ratio to help prioritize alternatives.
         """
 
@@ -1428,21 +1441,19 @@ class SmartDubbing:
         
         return final_audio, real_segment_positions 
 
-    def _get_subtitle_path(self, subtitle_type: str, input_path: str, target_language: str, adjusted: bool = False) -> str:
-        """Generate subtitle path based on input file and target language.
+    def _get_subtitle_path(self, subtitle_type: str, input_path: str, language: str) -> str:
+        """Generate subtitle path based on input file and language.
         
         Args:
             subtitle_type: "original" or "translation"
             input_path: Path to the input video file
-            target_language: Target language code
-            adjusted: Whether this is an adjusted subtitle file
+            language: Language code (source for original, target for translation)
             
         Returns:
             Path for the subtitle file in current working directory
         """
         input_file = Path(input_path)
-        suffix = "_adjusted" if adjusted else ""
-        filename = f"{input_file.stem}_{target_language}{suffix}.srt"
+        filename = f"{input_file.stem}_{language}.srt"
         return filename  # Save in current working directory
 
     def adjust_subtitle_timestamps(self, segments: List[Dict], pause_adjustments: List[Dict[str, float]]) -> List[Dict]:

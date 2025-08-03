@@ -742,12 +742,16 @@ class VideoProcessor:
             logger.info("Video filters detected - using high-quality re-encoding")
             
             # Check if we should use two-pass encoding
+            # Disable two-pass encoding for complex filter operations that can cause frame count mismatches
+            has_complex_filters = any(part for part in all_filter_complex_parts if 
+                                    'overlay' in part or 'concat' in part or 'select' in part)
+            
+            if has_complex_filters and use_two_pass_encoding:
+                logger.info("Disabling two-pass encoding due to complex filter operations")
+                use_two_pass_encoding = False
+            
             if (use_two_pass_encoding and original_bitrate and 
                 original_bitrate.isdigit() and int(original_bitrate) > 1000000):
-                # For two-pass encoding, we need to handle it differently
-                # We'll use the existing command for building the filter complex,
-                # but handle encoding separately
-                logger.info("Will use two-pass encoding for combine operation")
                 command.extend(["-c:v", "libx264"])  # Placeholder, will be replaced in two-pass
             else:
                 # Use conservative high-quality settings
@@ -883,13 +887,40 @@ class VideoProcessor:
                 original_bitrate.isdigit() and int(original_bitrate) > 1000000):
                 # Use two-pass encoding for better quality
                 logger.info("Using two-pass encoding for combine operation")
-                # Remove output path from command and video codec settings for two-pass
+                # Remove output path from command and codec settings for two-pass
                 base_cmd = command[:-1]  # Remove output path
-                # Remove the placeholder video codec settings
+                
+                # Remove all video codec settings
                 while "-c:v" in base_cmd:
                     idx = base_cmd.index("-c:v")
                     base_cmd.pop(idx)  # Remove -c:v
                     base_cmd.pop(idx)  # Remove libx264
+                
+                # Remove audio codec settings to avoid duplicates
+                while "-c:a" in base_cmd:
+                    idx = base_cmd.index("-c:a")
+                    base_cmd.pop(idx)  # Remove -c:a
+                    base_cmd.pop(idx)  # Remove aac
+                
+                # Remove audio bitrate settings
+                while "-b:a" in base_cmd:
+                    idx = base_cmd.index("-b:a")
+                    base_cmd.pop(idx)  # Remove -b:a
+                    base_cmd.pop(idx)  # Remove bitrate value
+                
+                # Remove other video encoding parameters that will be set in two-pass
+                params_to_remove = ["-crf", "-b:v", "-profile:v", "-pix_fmt", "-preset"]
+                for param in params_to_remove:
+                    while param in base_cmd:
+                        idx = base_cmd.index(param)
+                        base_cmd.pop(idx)  # Remove parameter
+                        base_cmd.pop(idx)  # Remove value
+                
+                # Remove movflags as it will be added in second pass
+                while "-movflags" in base_cmd:
+                    idx = base_cmd.index("-movflags")
+                    base_cmd.pop(idx)  # Remove -movflags
+                    base_cmd.pop(idx)  # Remove value
                 
                 self._encode_with_two_pass(base_cmd, output_video_path, video_info)
             else:
@@ -935,7 +966,7 @@ class VideoProcessor:
         Args:
             base_cmd: Base FFmpeg command without codec settings
             pass_num: Pass number (1 or 2)
-            bitrate: Target bitrate (e.g., '5000k')
+            bitrate: Target bitrate in kbps (e.g., '5000')
             output_path: Final output path (for pass 2)
             video_info: Video information dictionary
             temp_dir: Temporary directory for pass log files
@@ -947,9 +978,12 @@ class VideoProcessor:
         
         # Two-pass encoding settings
         cmd.extend(["-c:v", "libx264"])
-        cmd.extend(["-b:v", bitrate])
+        cmd.extend(["-b:v", f"{bitrate}k"])  # Add 'k' suffix for FFmpeg
         cmd.extend(["-pass", str(pass_num)])
-        cmd.extend(["-passlogfile", os.path.join(temp_dir, "ffmpeg2pass")])
+        
+        # Use consistent passlogfile naming
+        passlogfile_prefix = os.path.join(temp_dir, "ffmpeg2pass")
+        cmd.extend(["-passlogfile", passlogfile_prefix])
         
         # Quality settings
         cmd.extend(["-preset", "slow"])  # Use slower preset for better quality
@@ -977,8 +1011,11 @@ class VideoProcessor:
             original_audio_codec = video_info.get('audio_codec', 'aac')
             original_audio_bitrate = video_info.get('audio_bitrate')
             
-            if original_audio_codec == 'aac' and original_audio_bitrate and int(original_audio_bitrate) >= 128000:
-                cmd.extend(["-c:a", "aac", "-b:a", original_audio_bitrate])
+            if (original_audio_codec == 'aac' and original_audio_bitrate and 
+                original_audio_bitrate.isdigit() and int(original_audio_bitrate) >= 128000):
+                # Convert bitrate to string with 'k' suffix if needed
+                audio_bitrate = f"{int(original_audio_bitrate) // 1000}k"
+                cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
             else:
                 cmd.extend(["-c:a", "aac", "-b:a", "192k"])
             
@@ -1001,13 +1038,14 @@ class VideoProcessor:
         # Determine target bitrate
         original_bitrate = video_info.get('video_bitrate')
         if use_original_bitrate and original_bitrate and original_bitrate.isdigit() and int(original_bitrate) > 1000000:
-            target_bitrate = original_bitrate
-            logger.info(f"Using original bitrate for two-pass encoding: {int(original_bitrate)//1000} kbps")
+            # Convert from bps to kbps and format as string
+            target_bitrate = str(int(original_bitrate) // 1000)
+            logger.info(f"Using original bitrate for two-pass encoding: {target_bitrate} kbps")
         else:
             # Calculate reasonable bitrate based on resolution and framerate
             # This is a fallback when original bitrate is not available or too low
-            target_bitrate = "5000k"  # Conservative default
-            logger.info(f"Using fallback bitrate for two-pass encoding: {target_bitrate}")
+            target_bitrate = "5000"  # Conservative default in kbps (no 'k' suffix for internal use)
+            logger.info(f"Using fallback bitrate for two-pass encoding: {target_bitrate} kbps")
         
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
@@ -1025,6 +1063,14 @@ class VideoProcessor:
                     stderr=subprocess.PIPE,
                     text=True
                 )
+                
+                # Check if pass log file was created successfully
+                passlogfile = os.path.join(temp_dir, "ffmpeg2pass-0.log")
+                passlogfile_alt = os.path.join(temp_dir, "ffmpeg2pass-0.log.mbtree")
+                if not (os.path.exists(passlogfile) or os.path.exists(passlogfile_alt)):
+                    logger.warning("First pass log file not found, two-pass encoding may fail")
+                else:
+                    logger.debug("First pass completed successfully, log files created")
                 
                 # Second pass
                 logger.info("Starting second pass of two-pass encoding...")
@@ -1045,7 +1091,19 @@ class VideoProcessor:
                 
             except subprocess.CalledProcessError as e:
                 error_output = e.stderr if e.stderr else "No error details available"
+                
+                # Check for specific error patterns
+                if "2nd pass has more frames than 1st pass" in error_output:
+                    logger.error("Frame count mismatch between passes detected")
+                    logger.error("This can happen when filter operations affect stream processing")
+                    logger.error("Consider disabling two-pass encoding for this content")
+                elif "SIGSEGV" in str(e.returncode) or e.returncode == -11:
+                    logger.error("FFmpeg segmentation fault detected")
+                    logger.error("This might be due to codec/filter incompatibility")
+                
                 logger.error(f"Two-pass encoding failed: {error_output}")
+                logger.error("FFmpeg command that failed:")
+                logger.error(f"  {' '.join(second_pass_cmd if 'second_pass_cmd' in locals() else first_pass_cmd)}")
                 raise
     
     def _create_final_audio_for_pause_analysis(self,

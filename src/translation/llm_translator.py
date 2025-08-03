@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Tuple, Set, Literal
+from typing import List, Dict, Any, Optional, Tuple, Set, Literal, TYPE_CHECKING
 import time
 import json
 import os
@@ -15,6 +15,9 @@ except ImportError:
 from translation.translation_interface import TranslationInterface
 from translation.prompts import REFINEMENT_PROMPTS
 from src.dubbing.core.log_config import get_logger
+
+if TYPE_CHECKING:
+    from src.dubbing.core.cache_manager import CacheManager
 
 # Import LLM-related dependencies, with error handling for missing packages
 try:
@@ -60,7 +63,8 @@ class LLMTranslator(TranslationInterface):
         cache_dir: Optional[str] = "cache/translation_cache",
         enable_cache: bool = True,
         glossary: Optional[Dict[str, str]] = None,
-        refinement_persona: str = "manager"
+        refinement_persona: str = "manager",
+        cache_manager: Optional['CacheManager'] = None
     ):
         """
         Initialize LLM translator.
@@ -77,10 +81,11 @@ class LLMTranslator(TranslationInterface):
             refinement_temperature: Temperature for refinement (defaults to 1.0)
             refinement_max_tokens: Maximum number of tokens for refinement (defaults to same as max_tokens)
             debug: Enable debug mode to write prompts and results to files
-            cache_dir: Directory to store translation cache
+            cache_dir: Directory to store translation cache (deprecated, use cache_manager instead)
             enable_cache: Whether to enable translation caching
             glossary: Dictionary mapping source terms to their desired translations
             refinement_persona: The persona to use for the refinement prompt ("manager", "child", "tractor_driver")
+            cache_manager: Cache manager instance for organized caching
         """
         self.llm_provider = llm_provider
         self.temperature = temperature
@@ -103,7 +108,8 @@ class LLMTranslator(TranslationInterface):
         
         # Initialize caching settings
         self.enable_cache = enable_cache
-        self.cache_dir = cache_dir
+        self.cache_manager = cache_manager
+        self.cache_dir = cache_dir  # Keep for backward compatibility when cache_manager is None
         self.translation_cache = {}  # In-memory cache
         
         # Initialize glossary
@@ -141,9 +147,14 @@ class LLMTranslator(TranslationInterface):
         )
         
         # Initialize cache directory if caching is enabled
-        if self.enable_cache and self.cache_dir:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            self._load_cache()
+        if self.enable_cache:
+            if self.cache_manager:
+                # Use organized cache structure through CacheManager
+                self._load_cache()
+            elif self.cache_dir:
+                # Fallback to legacy cache directory structure
+                os.makedirs(self.cache_dir, exist_ok=True)
+                self._load_cache()
             
     def _create_llm(
         self, 
@@ -215,11 +226,21 @@ class LLMTranslator(TranslationInterface):
             
     def _load_cache(self) -> None:
         """Load translation cache from disk if it exists."""
-        if not self.enable_cache or not self.cache_dir:
+        if not self.enable_cache:
+            return
+        
+        cache_file = None
+        if self.cache_manager:
+            # Use organized cache structure
+            cache_dir = self.cache_manager.get_cache_path("translation_cache")
+            cache_file = cache_dir / "translation_cache.json"
+        elif self.cache_dir:
+            # Fallback to legacy cache directory structure
+            cache_file = os.path.join(self.cache_dir, "translation_cache.json")
+        else:
             return
             
-        cache_file = os.path.join(self.cache_dir, "translation_cache.json")
-        if os.path.exists(cache_file):
+        if cache_file and os.path.exists(cache_file):
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     self.translation_cache = json.load(f)
@@ -230,16 +251,27 @@ class LLMTranslator(TranslationInterface):
                 
     def _save_cache(self) -> None:
         """Save translation cache to disk."""
-        if not self.enable_cache or not self.cache_dir or not self.translation_cache:
+        if not self.enable_cache or not self.translation_cache:
+            return
+        
+        cache_file = None
+        if self.cache_manager:
+            # Use organized cache structure
+            cache_dir = self.cache_manager.get_cache_path("translation_cache")
+            cache_file = cache_dir / "translation_cache.json"
+        elif self.cache_dir:
+            # Fallback to legacy cache directory structure
+            cache_file = os.path.join(self.cache_dir, "translation_cache.json")
+        else:
             return
             
-        cache_file = os.path.join(self.cache_dir, "translation_cache.json")
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.translation_cache, f, ensure_ascii=False, indent=2)
-            logger.debug(f"Saved translation cache with {len(self.translation_cache)} entries")
-        except Exception as e:
-            logger.error(f"Error saving translation cache: {e}")
+        if cache_file:
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(self.translation_cache, f, ensure_ascii=False, indent=2)
+                logger.debug(f"Saved translation cache with {len(self.translation_cache)} entries")
+            except Exception as e:
+                logger.error(f"Error saving translation cache: {e}")
     
     def _generate_cache_key(self, chunk_text: str, source_language: str, target_language: str) -> str:
         """

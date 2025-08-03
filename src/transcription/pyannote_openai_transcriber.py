@@ -10,7 +10,7 @@ import subprocess
 import re
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional, Union, Set
+from typing import Dict, List, Tuple, Any, Optional, Union, Set, TYPE_CHECKING
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
 import whisper
@@ -25,6 +25,9 @@ from src.utils.sent_split import greedy_sent_split
 from transcription.transcription_interface import BaseTranscriber
 from src.utils.audio_embedder import AudioEmbedder
 from src.dubbing.core.log_config import get_logger
+
+if TYPE_CHECKING:
+    from src.dubbing.core.cache_manager import CacheManager
 
 logger = get_logger(__name__)
 
@@ -42,6 +45,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         device: Optional[str] = None,
         whisper_model: str = "large-v3",
         transcription_system: str = "openai",
+        cache_manager: Optional['CacheManager'] = None,
         **kwargs
     ):
         """
@@ -52,11 +56,13 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             device: Compute device ('cuda' or 'cpu')
             whisper_model: Whisper model size to use for transcription
             transcription_system: System to use for transcription ('whisper' or 'openai')
+            cache_manager: Cache manager instance for organized caching
             **kwargs: Additional parameters
         """
         super().__init__(source_language, device, **kwargs)
         self.whisper_model = whisper_model
         self.transcription_system = transcription_system
+        self.cache_manager = cache_manager
         
         # Initialize OpenAI client if using OpenAI transcription
         if self.transcription_system == "openai":
@@ -105,9 +111,9 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         step_name = "chunked_processing"
         
         # Check if results are cached
-        if use_cache and self._cache_exists(step_name, cache_key):
+        if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading chunked processing results from cache...")
-            results = self._load_from_cache(step_name, cache_key)
+            results = self.cache_manager.load_from_cache(step_name, cache_key)
             return results[0], results[1]
         
         # Split audio into lesser chunks at silent points
@@ -178,8 +184,8 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             logger.debug(f"[{timestamp_start}-{timestamp_end}] {segment['speaker']}: '{truncated_text}'")
     
         # Save results to cache
-        if use_cache:
-            self._save_to_cache(step_name, cache_key, (all_speakers_rolls, all_transcriptions))
+        if use_cache and self.cache_manager:
+            self.cache_manager.save_to_cache(step_name, cache_key, (all_speakers_rolls, all_transcriptions))
         
         return all_speakers_rolls, all_transcriptions
     
@@ -204,9 +210,9 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         """
         # First, check if we have cached results
         step_name = "segment_transcription"
-        if use_cache and cache_key and self._cache_exists(step_name, cache_key):
+        if use_cache and cache_key and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading segment-based transcription from cache...")
-            return self._load_from_cache(step_name, cache_key)
+            return self.cache_manager.load_from_cache(step_name, cache_key)
             
         # Diarize the chunk to get speaker segments
         speakers_rolls = self._perform_diarization(chunk_path, cache_key, use_cache)
@@ -277,8 +283,8 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             logger.error(f"Error removing temporary directory: {e}")
         
         # Cache the results
-        if use_cache and cache_key:
-            self._save_to_cache(step_name, cache_key, (speakers_rolls, all_transcriptions))
+        if use_cache and cache_key and self.cache_manager:
+            self.cache_manager.save_to_cache(step_name, cache_key, (speakers_rolls, all_transcriptions))
         
         return speakers_rolls, all_transcriptions
     
@@ -508,9 +514,9 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         step_name = "diarization"
         
         # Check if results are cached
-        if use_cache and self._cache_exists(step_name, cache_key):
+        if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading speaker diarization from cache...")
-            speakers_rolls = self._load_from_cache(step_name, cache_key)
+            speakers_rolls = self.cache_manager.load_from_cache(step_name, cache_key)
             
             # Store for debug
             self.debug_data["diarization"] = speakers_rolls
@@ -563,8 +569,8 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         self.debug_data["diarization"] = speakers_rolls
         
         # Save results to cache
-        if use_cache:
-            self._save_to_cache(step_name, cache_key, speakers_rolls)
+        if use_cache and self.cache_manager:
+            self.cache_manager.save_to_cache(step_name, cache_key, speakers_rolls)
         
         return speakers_rolls
     
@@ -662,9 +668,9 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         step_name = "transcription"
         
         # Check if results are cached
-        if use_cache and self._cache_exists(step_name, cache_key):
+        if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading transcription from cache...")
-            return self._load_from_cache(step_name, cache_key)
+            return self.cache_manager.load_from_cache(step_name, cache_key)
         
         logger.info(f"Transcribing audio using {self.transcription_system}...")
         
@@ -749,8 +755,8 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             raise ValueError(f"Unsupported transcription system: {self.transcription_system}")
         
         # Save results to cache
-        if use_cache:
-            self._save_to_cache(step_name, cache_key, records)
+        if use_cache and self.cache_manager:
+            self.cache_manager.save_to_cache(step_name, cache_key, records)
         
         # Store for debug
         self.debug_data["transcription"] = records

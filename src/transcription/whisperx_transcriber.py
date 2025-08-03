@@ -3,10 +3,13 @@ Implementation of transcription and diarization using WhisperX.
 """
 import os
 import time
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
 from transcription.transcription_interface import BaseTranscriber
 from src.dubbing.core.log_config import get_logger
+
+if TYPE_CHECKING:
+    from src.dubbing.core.cache_manager import CacheManager
 
 logger = get_logger(__name__)
 
@@ -19,6 +22,7 @@ class WhisperXTranscriber(BaseTranscriber):
         source_language: str,
         device: Optional[str] = None,
         whisperx_model: str = "large-v3",
+        cache_manager: Optional['CacheManager'] = None,
         **kwargs
     ):
         """
@@ -28,10 +32,12 @@ class WhisperXTranscriber(BaseTranscriber):
             source_language: Source language code (e.g., 'en')
             device: Compute device ('cuda' or 'cpu')
             whisperx_model: WhisperX model size to use for transcription
+            cache_manager: Cache manager instance for organized caching
             **kwargs: Additional parameters
         """
         super().__init__(source_language, device, **kwargs)
         self.whisperx_model = whisperx_model
+        self.cache_manager = cache_manager
         
         # Lazy loading of whisperx to avoid initial import overhead
         self._whisperx = None
@@ -77,9 +83,9 @@ class WhisperXTranscriber(BaseTranscriber):
         step_name = "whisperx_diarization_transcription"
         
         # Check if results are cached
-        if use_cache and self._cache_exists(step_name, cache_key):
+        if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading WhisperX diarization and transcription from cache...")
-            cached_results = self._load_from_cache(step_name, cache_key)
+            cached_results = self.cache_manager.load_from_cache(step_name, cache_key)
             
             # Store for debug
             self.debug_data["diarization"] = cached_results["diarization"]
@@ -139,12 +145,12 @@ class WhisperXTranscriber(BaseTranscriber):
             self.debug_data["transcription"] = transcription
             
             # Save results to cache
-            if use_cache:
+            if use_cache and self.cache_manager:
                 cache_data = {
                     "diarization": speakers_rolls,
                     "transcription": transcription
                 }
-                self._save_to_cache(step_name, cache_key, cache_data)
+                self.cache_manager.save_to_cache(step_name, cache_key, cache_data)
             
             return speakers_rolls, transcription
             
