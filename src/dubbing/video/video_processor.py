@@ -804,13 +804,11 @@ class VideoProcessor:
         original_audio_codec = video_info.get('audio_codec', 'aac')
         original_audio_bitrate = video_info.get('audio_bitrate')
         
-        if original_audio_codec == 'aac' and original_audio_bitrate and int(original_audio_bitrate) >= 128000:
-            command.extend(["-c:a", "aac", "-b:a", original_audio_bitrate])
-            logger.debug(f"Preserving original audio: {original_audio_codec} @ {int(original_audio_bitrate)//1000} kbps")
-        else:
-            # High quality AAC fallback
-            command.extend(["-c:a", "aac", "-b:a", "192k"])
-            logger.debug("Using high-quality AAC encoding")
+        # Use safer audio settings to avoid AAC encoding issues
+        command.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        # Add error recovery flags
+        command.extend(["-err_detect", "ignore_err", "-ignore_unknown"])
+        logger.debug("Using safe AAC encoding with error recovery")
 
         # Set MOV flags
         command.extend(["-movflags", "+faststart"])
@@ -837,6 +835,7 @@ class VideoProcessor:
 
         # Handle pause removal if enabled
         pause_adjustments = []
+        temp_files_to_cleanup = []
         if remove_pauses:
             logger.info("Detecting and removing long pauses with smart quality preservation...")
             logger.info("Pause removal strategy:")
@@ -884,7 +883,7 @@ class VideoProcessor:
                         cuts_to_keep = self._calculate_video_cuts(removals, video_duration)
                         
                         # Modify the ffmpeg command to apply cuts to original video
-                        command = self._modify_command_for_cuts(
+                        command, temp_files_to_cleanup = self._modify_command_for_cuts(
                             command, video_path, cuts_to_keep, keyframes, 
                             use_two_pass_encoding, video_info
                         )
@@ -968,9 +967,37 @@ class VideoProcessor:
             logger.info(f"Output video saved to {output_video_path}")
         except subprocess.CalledProcessError as e:
             error_output = e.stderr if e.stderr else "No error details available"
-            logger.error(f"FFmpeg command failed: {error_output}")
+            
+            # Check for specific AAC/audio related errors
+            if "aac" in error_output.lower() or "audio" in error_output.lower():
+                logger.error("Audio processing error detected - this may be due to corrupted audio streams")
+                logger.error("Trying to identify problematic audio files...")
+                
+                # Log the command for debugging
+                logger.error("Problem may be with these input files:")
+                for i, arg in enumerate(command):
+                    if arg == "-i" and i + 1 < len(command):
+                        input_file = command[i + 1]
+                        logger.error(f"  Input: {input_file}")
+                        if os.path.exists(input_file):
+                            file_size = os.path.getsize(input_file)
+                            logger.error(f"    Size: {file_size} bytes")
+                        else:
+                            logger.error(f"    File does not exist!")
+            
+            logger.error(f"FFmpeg command failed with return code {e.returncode}")
+            logger.error(f"Error output: {error_output}")
             logger.error(f"Failed command: {' '.join(command)}")
             raise
+
+        # Clean up temporary files created during pause removal
+        for temp_file in temp_files_to_cleanup:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    logger.debug(f"Cleaned up temporary file: {temp_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary file {temp_file}: {e}")
 
         # End timing
         self.performance_tracker.end_timing("video_creation")
@@ -1031,13 +1058,10 @@ class VideoProcessor:
             original_audio_codec = video_info.get('audio_codec', 'aac')
             original_audio_bitrate = video_info.get('audio_bitrate')
             
-            if (original_audio_codec == 'aac' and original_audio_bitrate and 
-                original_audio_bitrate.isdigit() and int(original_audio_bitrate) >= 128000):
-                # Convert bitrate to string with 'k' suffix if needed
-                audio_bitrate = f"{int(original_audio_bitrate) // 1000}k"
-                cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate])
-            else:
-                cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            # Use consistent safe audio settings for two-pass encoding
+            cmd.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+            # Add error recovery flags for two-pass as well
+            cmd.extend(["-err_detect", "ignore_err", "-ignore_unknown"])
             
             cmd.extend(["-movflags", "+faststart"])
             cmd.append(output_path)
@@ -1279,7 +1303,7 @@ class VideoProcessor:
                                cuts_to_keep: List[Tuple[float, float]],
                                keyframes: List[float],
                                use_two_pass_encoding: bool,
-                               video_info: Dict) -> List[str]:
+                               video_info: Dict) -> Tuple[List[str], List[str]]:
         """Modify FFmpeg command to apply cuts to the original video.
         
         Args:
@@ -1291,11 +1315,11 @@ class VideoProcessor:
             video_info: Video information dictionary
             
         Returns:
-            Modified FFmpeg command for video with cuts
+            Tuple of (Modified FFmpeg command for video with cuts, List of temporary files to cleanup)
         """
         if len(cuts_to_keep) <= 1:
             # No cuts needed, return original command
-            return original_command
+            return original_command, []
         
         # Find the output path from the original command
         output_path = original_command[-1]
@@ -1319,7 +1343,7 @@ class VideoProcessor:
                                       original_command: List[str],
                                       video_path: str,
                                       cuts_to_keep: List[Tuple[float, float]],
-                                      output_path: str) -> List[str]:
+                                      output_path: str) -> Tuple[List[str], List[str]]:
         """Build FFmpeg command using stream copy for cuts."""
         # Use the existing _apply_video_cuts method logic but adapted for our case
         # For now, fall back to re-encoding approach since stream copy with audio mixing is complex
@@ -1333,16 +1357,14 @@ class VideoProcessor:
                                      cuts_to_keep: List[Tuple[float, float]],
                                      output_path: str,
                                      use_two_pass_encoding: bool,
-                                     video_info: Dict) -> List[str]:
+                                     video_info: Dict) -> Tuple[List[str], List[str]]:
         """Build FFmpeg command using re-encoding for cuts."""
-        # For complex pause removal with audio mixing, we'll use a simpler approach:
-        # 1. Apply cuts to video and create intermediate video without audio
-        # 2. Then use original combine logic to add the audio
+        logger.info("Applying pause removal to both video and audio")
         
-        # Create temporary video path
+        # Create temporary video with cuts (without audio)
         temp_video_path = "artifacts/temp_video_with_cuts.mp4"
         
-        # Create cuts command for video only (without audio)
+        # Create cuts command for video only
         cuts_cmd = ["ffmpeg", "-y"]
         
         # Add multiple video inputs for each cut
@@ -1362,23 +1384,134 @@ class VideoProcessor:
         cuts_cmd.extend(["-an"])  # No audio
         cuts_cmd.append(temp_video_path)
         
-        # Execute cuts command first
+        # Track temporary files for cleanup
+        temp_files_to_cleanup = [temp_video_path]
+        
+        # Execute video cuts command
         try:
             logger.debug(f"Creating video with cuts: {' '.join(cuts_cmd)}")
             subprocess.run(cuts_cmd, capture_output=True, text=True, check=True)
-            
-            # Now modify the original command to use the cut video
-            modified_command = []
-            for i, arg in enumerate(original_command):
-                if arg == video_path and i > 0 and original_command[i-1] == "-i":
-                    # Replace video path with temp video path
-                    modified_command.append(temp_video_path)
-                else:
-                    modified_command.append(arg)
-            
-            return modified_command
-            
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to create video cuts: {e.stderr}")
-            # Fallback to original command
-            return original_command
+            return original_command, []
+        
+        # Now create cut versions of all audio files used in the original command
+        cut_audio_files = {}  # Maps original audio file to cut version
+        
+        # Find all audio input files in the original command
+        i = 0
+        while i < len(original_command):
+            if original_command[i] == "-i" and i + 1 < len(original_command):
+                input_file = original_command[i + 1]
+                # Skip the video input
+                if input_file != video_path and os.path.exists(input_file):
+                    # Check if it's an audio file by trying to probe for audio streams
+                    try:
+                        probe_cmd = [
+                            'ffprobe', '-v', 'quiet', '-select_streams', 'a:0',
+                            '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_file
+                        ]
+                        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                        if 'audio' in result.stdout:
+                            # This is an audio file, create cut version
+                            cut_audio_path = self._create_cut_audio_file(input_file, cuts_to_keep)
+                            if cut_audio_path:
+                                cut_audio_files[input_file] = cut_audio_path
+                                temp_files_to_cleanup.append(cut_audio_path)
+                                logger.debug(f"Created cut audio file: {input_file} -> {cut_audio_path}")
+                    except subprocess.CalledProcessError:
+                        # Not an audio file or probe failed, skip
+                        pass
+            i += 1
+        
+        # Modify the original command to use cut video and cut audio files
+        modified_command = []
+        for i, arg in enumerate(original_command):
+            if arg == video_path and i > 0 and original_command[i-1] == "-i":
+                # Replace video path with temp video path
+                modified_command.append(temp_video_path)
+            elif arg in cut_audio_files:
+                # Replace audio file with cut version
+                modified_command.append(cut_audio_files[arg])
+            else:
+                modified_command.append(arg)
+        
+        logger.info(f"Applied cuts to video and {len(cut_audio_files)} audio files")
+        return modified_command, temp_files_to_cleanup
+    
+    def _create_cut_audio_file(self, audio_path: str, cuts_to_keep: List[Tuple[float, float]]) -> Optional[str]:
+        """Create a cut version of an audio file.
+        
+        Args:
+            audio_path: Path to the original audio file
+            cuts_to_keep: List of time segments to keep
+            
+        Returns:
+            Path to the cut audio file, or None if creation failed
+        """
+        if not cuts_to_keep:
+            return None
+        
+        # Generate cut audio file path (use WAV for better compatibility)
+        audio_dir = os.path.dirname(audio_path)
+        audio_name = os.path.basename(audio_path)
+        name, ext = os.path.splitext(audio_name)
+        cut_audio_path = os.path.join(audio_dir, f"{name}_cut.wav")
+        
+        try:
+            # First, probe the audio file to get its properties
+            probe_cmd = [
+                'ffprobe', '-v', 'quiet', '-print_format', 'json',
+                '-show_streams', '-select_streams', 'a:0', audio_path
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            audio_info = json.loads(probe_result.stdout)
+            
+            # Get audio stream properties
+            audio_stream = audio_info.get('streams', [{}])[0] if audio_info.get('streams') else {}
+            sample_rate = audio_stream.get('sample_rate', '48000')
+            channels = min(int(audio_stream.get('channels', '2')), 2)  # Limit to stereo max
+            
+            logger.debug(f"Source audio: {sample_rate}Hz, {channels} channels")
+            
+            # Build FFmpeg command to cut audio
+            cmd = ["ffmpeg", "-y"]
+            
+            # Add inputs for each cut segment
+            for start, end in cuts_to_keep:
+                cmd.extend(["-ss", str(start), "-t", str(end - start), "-i", audio_path])
+            
+            # Build concat filter for audio
+            if len(cuts_to_keep) > 1:
+                audio_streams = []
+                for i in range(len(cuts_to_keep)):
+                    audio_streams.append(f"[{i}:a:0]")
+                
+                concat_filter = f"{''.join(audio_streams)}concat=n={len(cuts_to_keep)}:v=0:a=1[outa]"
+                cmd.extend(["-filter_complex", concat_filter])
+                cmd.extend(["-map", "[outa]"])
+            else:
+                # Single segment, no need for concat
+                cmd.extend(["-map", "0:a:0"])
+            
+            # Audio encoding settings - use PCM WAV for better compatibility
+            cmd.extend(["-c:a", "pcm_s16le", "-ar", str(sample_rate), "-ac", str(channels)])
+            cmd.append(cut_audio_path)
+            
+            logger.debug(f"Creating cut audio: {' '.join(cmd)}")
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            
+            # Verify the created file is valid
+            if os.path.exists(cut_audio_path) and os.path.getsize(cut_audio_path) > 0:
+                logger.debug(f"Successfully created cut audio file: {cut_audio_path}")
+                return cut_audio_path
+            else:
+                logger.error(f"Created audio file is empty or missing: {cut_audio_path}")
+                return None
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to create cut audio file {audio_path}: {e.stderr}")
+            return None
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to probe audio file {audio_path}: {e}")
+            return None
