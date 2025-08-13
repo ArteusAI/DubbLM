@@ -241,6 +241,26 @@ This project is open to use and fork for everyone and developed by IT engineers 
 
 Want to contribute, ask http://t.me/pavelfedortsov
 
+## Give us a star, plz
+<picture>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="
+      https://api.star-history.com/svg?repos=ArteusAI/DubbLM&type=Date&theme=dark
+    "
+  />
+  <source
+    media="(prefers-color-scheme: light)"
+    srcset="
+      https://api.star-history.com/svg?repos=ArteusAI/DubbLM&type=Date
+    "
+  />
+  <img
+    alt="Star History Chart"
+    src="https://api.star-history.com/svg?repos=ArteusAI/DubbLM&type=Date"
+  />
+</picture>
+
 ## License
 
 MIT 
