@@ -76,7 +76,9 @@ class TTSFactory:
             "voice_prompt_mapping": voice_prompt,
             "prompt_prefix": prompt_prefix,
         }
-        config_args.update(kwargs) # Pass through other kwargs like model
+        # Provider-specific kwargs filtering
+        filtered_kwargs = dict(kwargs)
+        config_args.update(filtered_kwargs) # Pass through other kwargs like model
 
         if isinstance(voice_config, str):
             config_args["default_voice"] = voice_config

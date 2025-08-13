@@ -171,7 +171,8 @@ class SmartDubbing:
                 voice_config=self.config.get('voice_name'),
                 voice_prompt=self.config.get('voice_prompt', {}),
                 prompt_prefix=self.config.get('tts_prompt_prefix'),
-                enable_voice_matching=self.config.get('voice_auto_selection', True)
+                enable_voice_matching=self.config.get('voice_auto_selection', True),
+                debug_tts=self.config.get('debug_tts', False)
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance

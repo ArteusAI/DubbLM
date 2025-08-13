@@ -48,6 +48,7 @@ class DubbingConfig:
             'refinement_persona': 'normal',
             'voice_name': None,
             'debug_info': False,
+            'debug_tts': False,
             'debug_diarize_only': False,
             'save_original_subtitles': False,
             'save_translated_subtitles': False,
@@ -223,6 +224,7 @@ class DubbingConfig:
         parser.add_argument('--refinement_persona', type=str, choices=['normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
         parser.add_argument('--voice_name', type=str, help='Voice to use for TTS')
         parser.add_argument('--debug_info', action='store_true', default=argparse.SUPPRESS, help='Generate a debug video with speaker labels')
+        parser.add_argument('--debug_tts', action='store_true', default=argparse.SUPPRESS, help='Enable TTS debugging (e.g., save rejected/silent attempts)')
         parser.add_argument('--save_original_subtitles', action='store_true', default=argparse.SUPPRESS, help='Save original language subtitles')
         parser.add_argument('--save_translated_subtitles', action='store_true', default=argparse.SUPPRESS, help='Save translated language subtitles')
         parser.add_argument('--reference_audio', type=str, help='Path to a reference audio file for f5_tts system')

@@ -100,7 +100,8 @@ class F5TTSWrapper(TTSInterface):
         config_path: str = "F5_tts/configs/base.json", 
         model_path: str = "F5_tts/logs/base/pretrained_base.pth", 
         device: str = "cuda",
-        whisper_model_name: str = "medium" # For transcribing reference audio if text not provided
+        whisper_model_name: str = "medium", # For transcribing reference audio if text not provided
+        **kwargs: Any
     ):
         if not F5TTS_AVAILABLE:
             raise ImportError("F5 TTS package not found. Ensure it's installed and in PYTHONPATH.")

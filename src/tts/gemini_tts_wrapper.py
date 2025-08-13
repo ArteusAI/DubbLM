@@ -135,16 +135,16 @@ class AudioValidator:
                             silence_threshold_db: float = -40.0,
                             max_silence_ratio: float = 0.03) -> tuple[bool, str, float]:
         """
-        Validate if an audio sample is completely filled with sound and doesn't have empty spaces.
+        Validate audio by checking only trailing silence at the end of the segment.
         
         Args:
             audio_path: Path to the audio file
             expected_min_duration: Minimum expected duration in seconds
             silence_threshold_db: Threshold below which audio is considered silence (in dB)
-            max_silence_ratio: Maximum allowed ratio of silence in the audio (0.1 = 10%)
+            max_silence_ratio: Maximum allowed ratio of trailing silence vs total duration (0.1 = 10%)
             
         Returns:
-            Tuple of (is_valid, reason, silence_ratio) where is_valid is True if audio is good
+            Tuple of (is_valid, reason, trailing_silence_ratio)
         """
         try:
             audio_path = Path(audio_path)
@@ -216,20 +216,28 @@ class AudioValidator:
                 # Use threshold relative to the dynamic range
                 adaptive_threshold = max(silence_threshold_db, np.min(rms_db) + dynamic_range * 0.1)
             
-            # Count silent frames
-            silent_frames = np.sum(rms_db < adaptive_threshold)
+            # Compute trailing silence ratio only
             total_frames = len(rms_db)
-            silence_ratio = silent_frames / total_frames
+            if total_frames == 0:
+                return False, "Audio contains no analyzable frames", 1.0
+            silence_mask = rms_db < adaptive_threshold
+            non_silent_indices = np.where(~silence_mask)[0]
+            if non_silent_indices.size == 0:
+                trailing_silence_ratio = 1.0
+            else:
+                last_non_silent = int(non_silent_indices[-1])
+                trailing_silent_frames = max(0, total_frames - (last_non_silent + 1))
+                trailing_silence_ratio = trailing_silent_frames / total_frames
             
             # Debug info
             logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                         f"Adaptive threshold: {adaptive_threshold:.1f}dB, "
-                        f"Silence ratio: {silence_ratio:.2%}")
+                        f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
             
-            if silence_ratio > max_silence_ratio:
-                return False, f"Too much silence ({silence_ratio:.2%} > {max_silence_ratio:.2%}, threshold: {adaptive_threshold:.1f}dB)", silence_ratio
+            if trailing_silence_ratio > max_silence_ratio:
+                return False, f"Too much trailing silence ({trailing_silence_ratio:.2%} > {max_silence_ratio:.2%}, threshold: {adaptive_threshold:.1f}dB)", trailing_silence_ratio
             
-            return True, f"Audio validation passed (silence: {silence_ratio:.2%}, dynamic range: {dynamic_range:.1f}dB)", silence_ratio
+            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%}, dynamic range: {dynamic_range:.1f}dB)", trailing_silence_ratio
             
         except Exception as e:
             return False, f"Librosa validation error: {str(e)}", 1.0
@@ -290,19 +298,25 @@ class AudioValidator:
                 # Use threshold relative to the dynamic range
                 adaptive_threshold = max(silence_threshold_db, torch.min(chunk_db_values).item() + dynamic_range * 0.1)
             
-            # Count silent chunks
-            silent_chunks = torch.sum(chunk_db_values < adaptive_threshold).item()
-            silence_ratio = silent_chunks / num_chunks
+            # Compute trailing silence ratio only
+            silence_mask = (chunk_db_values < adaptive_threshold)
+            non_silent_indices = torch.nonzero(~silence_mask, as_tuple=False).flatten()
+            if non_silent_indices.numel() == 0:
+                trailing_silence_ratio = 1.0
+            else:
+                last_non_silent = int(non_silent_indices[-1].item())
+                trailing_silent_chunks = max(0, num_chunks - (last_non_silent + 1))
+                trailing_silence_ratio = trailing_silent_chunks / num_chunks
             
             # Debug info
             logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                         f"Adaptive threshold: {adaptive_threshold:.1f}dB, "
-                        f"Silence ratio: {silence_ratio:.2%}")
+                        f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
             
-            if silence_ratio > max_silence_ratio:
-                return False, f"Too much silence ({silence_ratio:.2%} > {max_silence_ratio:.2%}, threshold: {adaptive_threshold:.1f}dB)", silence_ratio
+            if trailing_silence_ratio > max_silence_ratio:
+                return False, f"Too much trailing silence ({trailing_silence_ratio:.2%} > {max_silence_ratio:.2%}, threshold: {adaptive_threshold:.1f}dB)", trailing_silence_ratio
             
-            return True, f"Audio validation passed (silence: {silence_ratio:.2%}, dynamic range: {dynamic_range:.1f}dB)", silence_ratio
+            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%}, dynamic range: {dynamic_range:.1f}dB)", trailing_silence_ratio
             
         except Exception as e:
             return False, f"PyTorch validation error: {str(e)}", 1.0
@@ -750,6 +764,7 @@ class GeminiTTSWrapper(TTSInterface):
         enable_voice_matching: bool = True,
         enable_audio_validation: bool = True,
         prompt_prefix: Optional[str] = None,
+        debug_tts: bool = False,
     ):
         """Initialize Gemini TTS wrapper."""
         if not GEMINI_AVAILABLE:
@@ -763,6 +778,8 @@ class GeminiTTSWrapper(TTSInterface):
             enable_audio_validation=enable_audio_validation,
             prompt_prefix=prompt_prefix or ""
         )
+        # Save rejected/silent attempts when debugging is enabled
+        self.debug_save_rejected: bool = debug_tts
         
         # Initialize components
         self.api_client = GeminiAPIClient(self.config)
@@ -1081,7 +1098,7 @@ class GeminiTTSWrapper(TTSInterface):
         if self.api_client.switch_to_fallback_model():
             logger.info(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
             success, fallback_silence, fallback_best_path = self._attempt_segment_synthesis(
-                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.4
+                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.2
             )
             self.api_client.reset_to_original_model()
 
@@ -1181,6 +1198,23 @@ class GeminiTTSWrapper(TTSInterface):
                         temp_attempt_path, 
                         max_silence_ratio=max_silence_ratio
                     )
+
+                    # If invalid due to silence and debug saving enabled, persist rejected attempt
+                    if (not is_valid) and self.debug_save_rejected:
+                        try:
+                            reason_lower = (reason or "").lower()
+                            if ("silence" in reason_lower) or ("no energy" in reason_lower) or ("flat/constant" in reason_lower):
+                                base_path_for_debug = Path(segment_data.output_path) if getattr(segment_data, "output_path", None) else Path(temp_attempt_path)
+                                debug_dir = base_path_for_debug.parent
+                                debug_dir.mkdir(parents=True, exist_ok=True)
+                                # Convert silence ratio to integer percent for postfix
+                                silence_percent = int(round(max(0.0, min(1.0, silence_ratio)) * 100))
+                                debug_name = f"{base_path_for_debug.stem}_attempt{attempt}_{self.api_client.current_model}_silence_{silence_percent}.wav"
+                                debug_path = debug_dir / debug_name
+                                shutil.copy(temp_attempt_path, debug_path)
+                                logger.debug(f"Saved rejected silent attempt to {debug_path}")
+                        except Exception as save_exc:
+                            logger.warning(f"Could not save rejected silent attempt: {save_exc}")
 
                     if silence_ratio < best_silence_ratio:
                         if best_attempt_path and os.path.exists(best_attempt_path):
