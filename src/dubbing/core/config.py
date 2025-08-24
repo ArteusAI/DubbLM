@@ -68,7 +68,8 @@ class DubbingConfig:
             'remove_pauses': False,
             'min_pause_duration': 3,
             'use_two_pass_encoding': True,
-            'keyframe_buffer': 0.2
+            'keyframe_buffer': 0.2,
+            'dubbed_volume': 1.0
         }
         
         # Required parameters that must come from CLI
@@ -246,6 +247,7 @@ class DubbingConfig:
         parser.add_argument('--min_pause_duration', default=3, type=float, help='Minimum pause duration to consider for removal (seconds)')
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
+        parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')
         
         return parser
 

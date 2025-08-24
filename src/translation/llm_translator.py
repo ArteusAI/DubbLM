@@ -13,7 +13,7 @@ except ImportError:
     json_repair = None
 
 from translation.translation_interface import TranslationInterface
-from translation.prompts import REFINEMENT_PROMPTS
+from translation.prompts import REFINEMENT_PROMPTS, LENGTH_ADJUST_PROMPT
 from src.dubbing.core.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -1754,6 +1754,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         f.write(f"Line {item['line_num']}:\n")
                         f.write(f"  Original ({item['original']['speaker']}): {item['original']['text']}\n")
                         f.write(f"  Refined ({item['refined']['speaker']}): {item['refined']['text']}\n")
+                        if "very_short" in item['refined']:
+                            f.write(f"  Very short: {item['refined']['very_short']}\n")
                         if "short" in item['refined']:
                             f.write(f"  Short: {item['refined']['short']}\n")
                         if "long" in item['refined']:
@@ -1858,3 +1860,89 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             
         except Exception as e:
             logger.error(f"Error writing timecodes report: {e}")
+
+    def adjust_segment_text_length(
+        self,
+        original_text: str,
+        source_language: str,
+        target_language: str,
+        desired_ratio: float,
+        target_char_count: Optional[int] = None,
+        context_info: Optional[Dict[str, Any]] = None,
+        max_attempts: int = 3,
+    ) -> str:
+        """Adjust a segment's text length using the refinement LLM.
+
+        The method preserves meaning and tone while lengthening or shortening the
+        text approximately by the provided ratio for dubbing alignment.
+
+        Args:
+            original_text: Text to rewrite in target language.
+            source_language: Source language code.
+            target_language: Target language code.
+            desired_ratio: Desired relative length factor compared to input text.
+            target_char_count: Optional target character count hint.
+            context_info: Optional context with 'domain' and 'tone'.
+            max_attempts: Number of retries on transient failures.
+
+        Returns:
+            Rewritten text in target language. Falls back to original_text on failure.
+        """
+        if not self.is_available():
+            return original_text
+
+        # Clamp ratio to reasonable bounds to avoid extreme prompts
+        safe_ratio = max(0.2, min(desired_ratio, 2.0))
+        approx_target_chars = target_char_count if target_char_count is not None else max(1, int(len(original_text) * safe_ratio))
+
+        # Build glossary section if available
+        glossary_section = ""
+        if self.glossary:
+            glossary_entries = "\n".join([f"- \"{term}\" → \"{translation}\"" for term, translation in self.glossary.items()])
+            glossary_section = f"""
+# Translation glossary (MUST be followed. Adapt for grammar):
+<glossary>
+{glossary_entries}
+</glossary>
+
+CRITICAL: You MUST use the translations from the glossary for all listed terms.
+IMPORTANT: The glossary provides base forms of translations. When using a term from the glossary, you MUST adapt it to fit the grammatical context (e.g., case, gender, number, verb conjugation) of the sentence in the target language \"{target_language}\".
+"""
+
+        domain = (context_info or {}).get("domain", "general")
+        tone = (context_info or {}).get("tone", "neutral")
+
+        prompt = LENGTH_ADJUST_PROMPT.format(
+            source_language=source_language,
+            target_language=target_language,
+            desired_ratio=safe_ratio,
+            target_char_count=approx_target_chars,
+            glossary_section=glossary_section,
+            domain=domain,
+            tone=tone,
+            original_text=original_text,
+        )
+
+        response_text = ""
+        for attempt in range(max_attempts):
+            try:
+                response = self.refinement_llm.complete(prompt)
+                response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
+                if not response_text:
+                    continue
+
+                try:
+                    repaired = json_repair.loads(response_text)
+                    adjusted = repaired.get("text") if isinstance(repaired, dict) else None
+                    if adjusted and isinstance(adjusted, str) and adjusted.strip():
+                        return adjusted.strip()
+                except Exception:
+                    # Try a naive fallback: if response looks like raw text without JSON
+                    if response_text and response_text.lstrip().startswith("{") is False:
+                        return response_text
+            except Exception:
+                # Retry on transient issues
+                continue
+
+        # Fallback
+        return original_text

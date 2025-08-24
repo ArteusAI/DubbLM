@@ -287,7 +287,8 @@ class SmartDubbing:
                 min_pause_duration=self.config.get('min_pause_duration', 3),
                 preserve_pause_duration=self.config.get('preserve_pause_duration', 1.5),
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
-                ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50)
+                ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
+                dubbed_volume=self.config.get('dubbed_volume', 1.0)
             )
             
             # Store pause adjustments for potential future use
@@ -723,12 +724,16 @@ class SmartDubbing:
                     logger.warning(f"Segment {i+1}: Duration estimation failed for normal translation, using it directly.")
                 else:
                     ratio_normal = original_duration / estimated_duration_normal
-                    deviation_normal = self._calculate_percentage_deviation(ratio_normal,
-                                                                          COMFORT_MIN_ADJUSTMENT_RATIO,
-                                                                          COMFORT_MAX_ADJUSTMENT_RATIO)
+                    deviation_normal = self._calculate_percentage_deviation(
+                        ratio_normal,
+                        COMFORT_MIN_ADJUSTMENT_RATIO,
+                        COMFORT_MAX_ADJUSTMENT_RATIO,
+                    )
                     best_ratio = ratio_normal
                     best_deviation = deviation_normal
-                    logger.debug(f"Segment {i+1} ({tts_system}): Normal translation - Estimated duration: {estimated_duration_normal:.2f}s, Ratio: {ratio_normal:.2f}, Deviation: {deviation_normal:.2%}")
+                    logger.debug(
+                        f"Segment {i+1} ({tts_system}): Normal translation - Estimated duration: {estimated_duration_normal:.2f}s, Ratio: {ratio_normal:.2f}, Deviation: {deviation_normal:.2%}"
+                    )
                     
                     # If normal is perfect, no need to check alternatives
                     if deviation_normal == 0.0:
@@ -751,6 +756,12 @@ class SmartDubbing:
                         if alternatives:
                             logger.debug(f"  Normal translation is outside comfort. Estimating {len(alternatives)} alternative(s)...")
                         
+                        # Preference: when remove_pauses enabled and non-zero deviation remains, prefer negative deviation (shorter) in tie
+                        prefer_shorter = self.config.get('remove_pauses', True)
+                        def deviation_key(dev: float) -> tuple:
+                            # Primary: minimal absolute deviation; Secondary: prefer negative when enabled
+                            return (abs(dev), 0 if (prefer_shorter and dev < 0) else 1)
+
                         for alt_key, alt_text_content in alternatives:
                             alt_segment_data_args = {**tts_segment_data_args, "text": alt_text_content}
                             alt_segment_data_model = TTSSegmentData(**alt_segment_data_args)
@@ -764,29 +775,25 @@ class SmartDubbing:
                                 continue
                             
                             ratio_alt = original_duration / estimated_duration_alt
-                            deviation_alt = self._calculate_percentage_deviation(ratio_alt,
-                                                                               COMFORT_MIN_ADJUSTMENT_RATIO,
-                                                                               COMFORT_MAX_ADJUSTMENT_RATIO)
+                            deviation_alt = self._calculate_percentage_deviation(
+                                ratio_alt,
+                                COMFORT_MIN_ADJUSTMENT_RATIO,
+                                COMFORT_MAX_ADJUSTMENT_RATIO,
+                            )
                             logger.debug(f"    {alt_key.replace('_', ' ').title()} - Estimated duration: {estimated_duration_alt:.2f}s, Ratio: {ratio_alt:.2f}, Deviation: {deviation_alt:.2%}")
                             
-                            # Update if this alternative has smaller deviation
-                            if deviation_alt < best_deviation:
+                            # Update if this alternative is better per deviation_key
+                            if deviation_key(deviation_alt) < deviation_key(best_deviation):
                                 best_deviation = deviation_alt
                                 best_ratio = ratio_alt
                                 best_text = alt_text_content
                                 best_estimated_duration = estimated_duration_alt
                                 best_track_type = alt_key  # Track the selected variant
-                                logger.debug(f"      New best: {alt_key.replace('_', ' ').title()} (Deviation: {best_deviation:.2%})")
-                                if deviation_alt == 0.0:
+                                logger.debug(
+                                    f"      New best: {alt_key.replace('_', ' ').title()} (Deviation: {best_deviation:.2%})"
+                                )
+                                if best_deviation == 0.0:
                                     break
-                            elif deviation_alt == best_deviation:
-                                if deviation_alt == 0.0:
-                                    if abs(ratio_alt - 1.0) < abs(best_ratio - 1.0):
-                                        best_ratio = ratio_alt
-                                        best_text = alt_text_content
-                                        best_estimated_duration = estimated_duration_alt
-                                        best_track_type = alt_key  # Track the selected variant
-                                        logger.debug(f"      Tie (0% dev): {alt_key.replace('_', ' ').title()} closer to 1.0 (Ratio: {best_ratio:.2f})")
                 
                 logger.debug(f"  Selected for synthesis: '{best_text[:50]}...' (Ratio: {best_ratio:.2f}, Deviation: {best_deviation:.2%})")
                 
@@ -1042,7 +1049,7 @@ class SmartDubbing:
     
     def _calculate_percentage_deviation(self, ratio: float, min_ratio_comfort: float, max_ratio_comfort: float) -> float:
         """
-        Calculates the percentage deviation of a given ratio from the comfort zone.
+        Calculates the signed percentage deviation of a given ratio from the comfort zone.
         
         Args:
             ratio: The speech ratio (original_duration / synthesized_duration).
@@ -1051,18 +1058,21 @@ class SmartDubbing:
             
         Returns:
             0.0 if the ratio is within the comfort zone.
-            Otherwise, the positive percentage deviation from the closest boundary.
+            Positive value if the synthesized segment is longer than comfortable (ratio < min).
+            Negative value if the synthesized segment is shorter than comfortable (ratio > max).
         """
         if ratio >= min_ratio_comfort and ratio <= max_ratio_comfort:
             return 0.0
         elif ratio < min_ratio_comfort:
-            if min_ratio_comfort == 0: 
+            if min_ratio_comfort == 0:
                 return float('inf')  # Avoid division by zero
+            # Synthesized audio is longer than original → ratio is too small → positive deviation
             return (min_ratio_comfort - ratio) / min_ratio_comfort
         else:  # ratio > max_ratio_comfort
-            if max_ratio_comfort == 0: 
+            if max_ratio_comfort == 0:
                 return float('inf')  # Avoid division by zero
-            return (ratio - max_ratio_comfort) / max_ratio_comfort
+            # Synthesized audio is shorter than original → ratio is too large → negative deviation
+            return -((ratio - max_ratio_comfort) / max_ratio_comfort)
 
     def _resynthesize_segment(
         self,
@@ -1120,6 +1130,12 @@ class SmartDubbing:
         best_ratio = None
         best_key = None
 
+        # Preference for shorter audio when pause removal is enabled
+        prefer_shorter = self.config.get('remove_pauses', True)
+        def deviation_key(dev: float) -> tuple:
+            # Primary: minimal absolute deviation; Secondary: prefer negative when enabled
+            return (abs(dev), 0 if (prefer_shorter and dev < 0) else 1)
+
         # Keep track of already tried texts to avoid duplicate synthesis
         tried_texts = {metadata["chosen_text"]}
 
@@ -1163,8 +1179,8 @@ class SmartDubbing:
                 
                 logger.debug(f"Alternative '{key}': ratio={ratio:.2f}, deviation_from_range={deviation_from_range:.2%}")
 
-                # Check if this is the best alternative so far
-                if deviation_from_range < best_deviation_from_range:
+                # Check if this is the best alternative so far (consider signed deviation preference)
+                if deviation_key(deviation_from_range) < deviation_key(best_deviation_from_range):
                     # Clean up previous best alternative if exists
                     if best_alternative and os.path.exists(best_alternative):
                         os.remove(best_alternative)
@@ -1184,8 +1200,76 @@ class SmartDubbing:
                 if os.path.exists(temp_output_path):
                     os.remove(temp_output_path)
 
+        # If deviation remains large (>15%), try LLM-based text length adjustment
+        try:
+            LLM_DEVIATION_THRESHOLD = 0.15
+            # Compute absolute deviation key for comparison
+            if self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
+                baseline_text = metadata.get("chosen_text") or segment_dict.get("translation", "")
+                if baseline_text:
+                    # Aim for center of comfort zone (prefer near 1.0), compute duration factor
+                    target_ratio = 1.0
+                    actual_duration = segment_dict.get("synthesized_speech_len", 0) or 1e-6
+                    desired_duration = original_duration / max(target_ratio, 1e-6)
+                    duration_factor = max(0.2, min(2.0, desired_duration / max(actual_duration, 1e-6)))
+
+                    # Ask LLM to adjust text length
+                    adjusted_text = self.translator.adjust_segment_text_length(
+                        original_text=baseline_text,
+                        source_language=self.config.get('source_language'),
+                        target_language=self.config.get('target_language'),
+                        desired_ratio=duration_factor,
+                        target_char_count=int(len(baseline_text) * duration_factor),
+                        context_info=None,
+                        max_attempts=2,
+                    )
+
+                    if adjusted_text and adjusted_text.strip() and adjusted_text.strip() != baseline_text.strip():
+                        # Estimate duration and synthesize to temp file
+                        temp_output_path = f"{output_path}.temp_llm_adjusted"
+                        from tts.models import TTSSegmentData
+                        new_segment_data = TTSSegmentData(**{**base_args, "text": adjusted_text, "output_path": temp_output_path})
+
+                        try:
+                            tts_instance.synthesize(
+                                segments_data=[new_segment_data],
+                                language=self.config.get('target_language')
+                            )
+
+                            if os.path.exists(temp_output_path):
+                                audio_info = AudioSegment.from_file(temp_output_path)
+                                actual_duration_llm = len(audio_info) / 1000.0
+                                if actual_duration_llm > 0:
+                                    ratio_llm = original_duration / actual_duration_llm
+                                    deviation_llm = self._calculate_percentage_deviation(ratio_llm, min_ratio, max_ratio)
+                                    logger.info(f"LLM-adjusted alternative: ratio={ratio_llm:.2f}, deviation_from_range={deviation_llm:.2%}")
+
+                                    if deviation_key(deviation_llm) < deviation_key(best_deviation_from_range):
+                                        # Clean up previous best alternative if exists
+                                        if best_alternative and os.path.exists(best_alternative):
+                                            os.remove(best_alternative)
+
+                                        best_alternative = temp_output_path
+                                        best_deviation_from_range = deviation_llm
+                                        best_ratio = ratio_llm
+                                        best_key = "llm_adjusted"
+                                        # Also update chosen text on success path later
+                                        metadata["_llm_adjusted_text"] = adjusted_text
+                                    else:
+                                        # Not better; remove temp
+                                        os.remove(temp_output_path)
+                        except Exception as e:
+                            logger.error(f"LLM-adjusted synthesis failed for segment {metadata['index']+1}: {e}")
+                            if os.path.exists(temp_output_path):
+                                try:
+                                    os.remove(temp_output_path)
+                                except Exception:
+                                    pass
+        except Exception as e:
+            logger.warning(f"LLM adjustment step encountered an error: {e}")
+
         # Use the best alternative found only if it's actually better than current
-        if best_alternative and os.path.exists(best_alternative) and best_deviation_from_range < current_deviation:
+        if best_alternative and os.path.exists(best_alternative) and deviation_key(best_deviation_from_range) < deviation_key(current_deviation):
             # Move the best alternative to the final output path
             if os.path.exists(output_path):
                 os.remove(output_path)
@@ -1195,7 +1279,12 @@ class SmartDubbing:
             audio_info = AudioSegment.from_file(output_path)
             segment_dict["synthesized_speech_len"] = len(audio_info) / 1000.0
             segment_dict["synthesized_speech_file"] = output_path
-            metadata["chosen_text"] = segment_dict[best_key]
+            if best_key == "llm_adjusted":
+                # Persist the adjusted text
+                segment_dict["translation"] = metadata.get("_llm_adjusted_text", segment_dict.get("translation"))
+                metadata["chosen_text"] = segment_dict["translation"]
+            else:
+                metadata["chosen_text"] = segment_dict[best_key]
             metadata["selected_track_type"] = best_key  # Update the selected track type
 
             # Update cache if needed

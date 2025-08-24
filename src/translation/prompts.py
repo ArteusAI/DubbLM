@@ -25,6 +25,7 @@ Review the following translated conversation from '{source_language}' to '{targe
 11. **Reference the Original:** Constantly refer to the original text to ensure no details, examples, numbers, or specific information are omitted in your refined translation.
 12. **Completeness Verification:** For technical discussions, verify that all technical details, steps, component names, and processes are fully preserved.
 13. **Capture Core Message:** Understand the underlying meaning of the dialogue and ensure it is preserved with absolute fidelity. You may rephrase for better natural flow ONLY if you guarantee every specific detail and nuance is maintained.
+14. **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Alternative Versions Requirements:
 In addition to the primary refined translation, provide three alternative versions for each line:
@@ -86,6 +87,7 @@ Your goal is to take the provided technical conversation and make it understanda
 5.  **Maintain Conversational Flow:** The output should still feel like a natural conversation, not a dry report. Keep the speaker attributions.
 6.  **Preserve Key Information:** While simplifying, ensure the most critical information, conclusions, and decisions are accurately conveyed. You are changing the language, not the essential message.
 7.  **Structure Preservation:** Preserve the original structure of the conversation, number of lines, and number of speakers.
+8.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Output Requirements:
 For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
@@ -163,6 +165,7 @@ You are a kind and patient storyteller, brilliant at explaining big, complex ide
 5.  **Keep the Characters:** Maintain the different speakers as characters in your story.
 6.  **Find the Core Idea:** What is the one single thing the child should remember from the story?
 7.  **Preserve the Structure:** Keep the original conversation's structure, number of lines, and speakers.
+8.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # What You Need to Create:
 For each line of the conversation, provide four different versions in the JSON output, using these keys:
@@ -242,6 +245,7 @@ Your goal is to take technical conversations and make them relatable and practic
 5.  **Address Real Concerns:** Consider privacy, safety, cost, and time-saving aspects that matter to families.
 6.  **Preserve Key Information:** While simplifying, ensure important conclusions and practical applications are clearly conveyed.
 7.  **Structure Preservation:** Preserve the original structure of the conversation, number of lines, and number of speakers.
+8.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Output Requirements:
 For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
@@ -321,6 +325,7 @@ Your goal is to take a potentially dense or technical conversation and transform
 4.  **Maintain an Engaging Tone:** The output should be enthusiastic, curious, and conversational. It should sound like someone passionately explaining a cool topic to a friend.
 5.  **Preserve Core Facts:** While simplifying the language, ensure the fundamental scientific facts, conclusions, and key data are accurately represented.
 6.  **Structure Preservation:** Preserve the original structure of the conversation, number of lines, and number of speakers.
+7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Output Requirements:
 For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
@@ -399,6 +404,7 @@ Your goal is to make the conversation sound natural for IT professionals who are
 4.  **Preserve Technical Accuracy:** While keeping the tone casual, ensure all technical details and concepts are accurately conveyed in the target language.
 5.  **Natural Flow:** The conversation should sound like a real chat between developers during a code review or technical discussion.
 6.  **Structure Preservation:** Preserve the original structure of the conversation, number of lines, and number of speakers.
+7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Output Requirements:
 For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
@@ -478,6 +484,7 @@ Your goal is to make the conversation sound natural for AI professionals while k
 4.  **Focus on Meaning:** Ensure technical concepts are accurately conveyed while being easy to understand
 5.  **Natural Conversation:** Make it sound like a real discussion between colleagues, not a technical paper
 6.  **Structure Preservation:** Keep the original conversation structure, number of lines, and speakers
+7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 
 # Non translatable terms:
 - predict / prediction
@@ -542,4 +549,121 @@ Example JSON output:
     ]
 }}
 """
-} 
+,
+    "ai_visioner": """
+You are an AI strategist who clarifies the bigger picture. Your task is to rephrase a translated conversation from '{source_language}' to '{target_language}' to illuminate the strategic importance of the technical details, while preserving their original meaning with absolute fidelity.
+
+Your goal is to add a layer of visionary context, explaining *why* the technical details matter in the grand scheme, without abstracting away the details themselves. You're a mentor who connects the 'what' to the 'so what'.
+
+# Dialogue Summary:
+<summary>
+{dialogue_summary}
+</summary>
+
+{glossary_section}
+
+# Refinement Goals:
+1.  **CRITICAL: Preserve Concrete Meaning:** Your primary goal is absolute fidelity to the original message. Do not replace concrete information (like technical terms, numbers, or specific processes) with high-level abstractions. The original meaning must be perfectly clear.
+2.  **Add Strategic Context:** Use the concrete details to illustrate their strategic importance. Explain the 'why' behind the technical 'what'. For example, instead of just saying "we're improving accuracy," explain *what that improved accuracy unlocks* for the business or the field.
+3.  **Ground Insights in Reality:** Your visionary perspective must be directly tied to the technical facts being discussed. Avoid generic or clichéd statements about 'the future'. Every insight should be a direct consequence of the information at hand.
+4.  **Clarity Above All:** Use clear, powerful language. The goal is to make the implications *more* understandable, not more complex.
+5.  **Keep Core AI Terms:** Retain standard AI terminology untranslated.
+6.  **Structure Preservation:** Keep the original conversation structure, number of lines, and speakers.
+7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics.
+
+# Output Requirements:
+For each line, provide four versions:
+- "text": The primary visionary translation that frames the idea in a broader context (100% length of the original text).
+- "very_short": A highly condensed, impactful statement of the core vision (40-50% length of the original text).
+- "short": A concise version of the visionary point (50-70% length of the original text).
+- "long": A more detailed version elaborating on the future implications and philosophical shift (110-130% length of the original text).
+
+These versions should:
+- Keep the same speaker speaking in first person
+- Use clear, accessible language for AI practitioners
+- Sound natural and professional
+- Never refer to the speaker in the third person
+
+# Context:
+- Domain: {domain} (explain AI concepts clearly)
+- Tone: Convert from '{tone}' to visionary, insightful, and inspiring
+- Key themes: Explain these themes simply: {themes}
+- Technical terms: Use essential terms sparingly: {terminology}
+
+{previous_chunk_context}
+
+# Original conversation:
+{original_conversation_text}
+
+{next_chunk_context}
+
+# Here is the technical conversation to simplify:
+<conversation>
+{translated_conversation_text}
+</conversation>
+
+REMINDER: Your primary mission is to preserve the exact meaning while adding a layer of strategic insight. DO NOT replace specifics with abstractions.
+
+CRITICAL: Keep the same number of lines and speaker names. The visionary framing must not obscure or alter the core technical facts.
+
+IMPORTANT: Respond with the conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys.
+
+Example JSON output:
+{{
+    "translations": [
+        {{
+            "speaker": "SPEAKER_00",
+            "text": "By moving our search from simple keyword matching to understanding intent, we're not just improving a feature; we're building the foundation for a system that can anticipate user needs.",
+            "very_short": "We're moving from matching to anticipating.",
+            "short": "Our search now understands intent, which lets us anticipate needs.",
+            "long": "By evolving our search from a mechanical keyword-matching tool to one that genuinely understands user intent, we are fundamentally building the groundwork for a proactive system capable of anticipating user needs before they're even articulated."
+        }},
+        {{
+            "speaker": "SPEAKER_01",
+            "text": "So by analyzing feedback this way, we're not just fixing bugs, we're identifying the underlying user problems that cause them.",
+            "very_short": "We're not just fixing bugs, we're finding root problems.",
+            "short": "So we're analyzing feedback to find root user problems, not just bugs.",
+            "long": "So the strategic shift here is that this feedback analysis allows us to move past surface-level bug fixing and start identifying the core, often unstated, user problems that are the true source of friction in our product."
+        }},
+        ...
+    ]
+}}
+"""
+}
+# Prompt used to adjust a single segment's text length while preserving meaning.
+# The LLM should rewrite the text in the target language so that the spoken length
+# approximately follows the requested ratio relative to the original text.
+LENGTH_ADJUST_PROMPT = """
+You are an expert dialogue editor optimizing text for audio dubbing. Rewrite the given line from '{source_language}' into '{target_language}' while preserving meaning, tone, and speaker voice, but adjust its speaking length.
+
+# Goal
+- Adjust the speaking length to approximately match the requested relative length factor.
+- Relative length factor: {desired_ratio:.2f}× of the original text length.
+- Target character count (approximate): {target_char_count} characters.
+
+If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts.
+If shortening: remove redundancy, filler, hedging, and minor asides without losing essential information.
+
+# Constraints
+- Preserve all critical facts, numbers, names, and technical terms.
+- Convert digits and dates to spoken-form appropriate for '{target_language}'.
+- Maintain the original speaker’s intent, tone, and register.
+- Keep it natural for dubbing (flowing speech, not robotic).
+- Do not add new claims or technical details.
+- Prefer correct orthography and diacritics for the target language.
+{glossary_section}
+
+# Context (optional)
+- Domain: {domain}
+- Tone: {tone}
+
+# Original text
+<original>
+{original_text}
+</original>
+
+# Output strictly as JSON with a single key "text"
+{{
+  "text": "...rewritten line in {target_language}..."
+}}
+"""

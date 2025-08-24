@@ -282,6 +282,17 @@ class VideoProcessor:
                 logger.debug(f"Allowing pause removal: {pause_start:.2f}s-{pause_end:.2f}s")
         
         return filtered_pauses
+
+    def _format_filter_input_label(self, label: str) -> str:
+        """Return a filter_complex input label bracketed exactly once.
+
+        This ensures we can accept either raw stream specs like "1:a:0" or
+        already-bracketed labels like "[dub_mixed_with_bg]" without producing
+        invalid double-bracketed tokens inside filter graphs.
+        """
+        if label.startswith("[") and label.endswith("]"):
+            return label
+        return f"[{label}]"
     
     def _run_ffmpeg_concat(self, input_path: str, cuts_batch: List[Tuple[float, float]], batch_output_path: str, 
                           video_info: Optional[Dict] = None, keyframes: Optional[List[float]] = None,
@@ -531,7 +542,8 @@ class VideoProcessor:
                                 min_pause_duration: float = 3,
                                 preserve_pause_duration: float = 1.5,
                                 keyframe_buffer: float = 0.2,
-                                ffmpeg_batch_size: int = 50) -> Tuple[str, List[Dict[str, float]]]:
+                                ffmpeg_batch_size: int = 50,
+                                dubbed_volume: float = 1.0) -> Tuple[str, List[Dict[str, float]]]:
         """Combine the translated audio with the original video, optionally adding a watermark and removing pauses.
 
         Args:
@@ -554,6 +566,7 @@ class VideoProcessor:
             preserve_pause_duration: The duration of pause to keep after shortening (seconds)
             keyframe_buffer: Buffer around keyframes to preserve (seconds)
             ffmpeg_batch_size: Number of cuts to process in a single ffmpeg command
+            dubbed_volume: Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
 
         Returns:
             Tuple of (Path to the output video file, List of pause adjustments for subtitle timing)
@@ -595,6 +608,11 @@ class VideoProcessor:
 
         # Use list-based approach to build command to avoid quoting issues
         command = ["ffmpeg", "-y"]
+
+        # Validate dubbed volume (must be positive)
+        if dubbed_volume <= 0:
+            logger.warning(f"Invalid dubbed_volume {dubbed_volume}, defaulting to 1.0")
+            dubbed_volume = 1.0
 
         # Add start time if specified
         if start_time is not None:
@@ -676,6 +694,13 @@ class VideoProcessor:
         else:
             processed_dubbed_audio_stream_label = dubbed_audio_source_stream
 
+        # Apply user-specified gain to the translated track (after optional bg mix)
+        if abs(dubbed_volume - 1.0) > 1e-6:
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume={dubbed_volume}[dubbed_vol_adj]"
+            )
+            processed_dubbed_audio_stream_label = "[dubbed_vol_adj]"
+
         # Main audio track selection logic
         if keep_original_audio_ranges and len(keep_original_audio_ranges) > 0:
             logger.debug(f"Keeping original audio for ranges: {keep_original_audio_ranges}")
@@ -693,7 +718,7 @@ class VideoProcessor:
                     f"[0:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]"
                 )
                 all_filter_complex_parts.append(
-                    f"[{processed_dubbed_audio_stream_label}]volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]"
+                    f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]"
                 )
                 all_filter_complex_parts.append(
                     f"[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_mixed_audio]"
@@ -849,7 +874,8 @@ class VideoProcessor:
                 background_audio_path,
                 background_audio_ffmpeg_idx_str,
                 keep_original_audio_ranges,
-                video_path
+                video_path,
+                dubbed_volume
             )
             
             # Detect pauses in final audio
@@ -1155,7 +1181,8 @@ class VideoProcessor:
                                              background_audio_path: Optional[str],
                                              background_audio_idx: Optional[str],
                                              keep_original_audio_ranges: Optional[List[Tuple[float, float]]],
-                                             video_path: str) -> str:
+                                             video_path: str,
+                                             dubbed_volume: float = 1.0) -> str:
         """Create the final audio mix for pause analysis.
         
         Args:
@@ -1195,11 +1222,17 @@ class VideoProcessor:
             
             # Start with translated audio
             current_audio_label = "0:a:0"
+
+            # Apply dubbed_volume if not 1.0
+            if abs(dubbed_volume - 1.0) > 1e-6:
+                filter_parts.append(f"[0:a:0]volume={dubbed_volume}[dubbed_gained]")
+                current_audio_label = "[dubbed_gained]"
             
             # Mix with background if needed
             if background_audio_path:
                 filter_parts.append("[1:a:0]volume=0.562341[bg_reduced]")
-                filter_parts.append(f"[{current_audio_label}][bg_reduced]amix=inputs=2:duration=longest[mixed_with_bg]")
+                left = self._format_filter_input_label(current_audio_label)
+                filter_parts.append(f"{left}[bg_reduced]amix=inputs=2:duration=longest[mixed_with_bg]")
                 current_audio_label = "[mixed_with_bg]"
             
             # Handle original audio ranges if needed
@@ -1210,7 +1243,7 @@ class VideoProcessor:
                     dubbed_volume_expr = f"if({keep_conditions},0,1)"
                     
                     filter_parts.append(f"[{original_audio_input_idx}:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]")
-                    filter_parts.append(f"[{current_audio_label}]volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]")
+                    filter_parts.append(f"{self._format_filter_input_label(current_audio_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]")
                     filter_parts.append("[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_audio]")
                     current_audio_label = "[final_audio]"
             
@@ -1435,6 +1468,45 @@ class VideoProcessor:
                 modified_command.append(cut_audio_files[arg])
             else:
                 modified_command.append(arg)
+
+        # If the filter graph references [0:a:0] (original audio), but input 0 is now video-without-audio,
+        # inject a cut version of the original video's audio as a new input before -filter_complex
+        try:
+            if "-filter_complex" in modified_command:
+                fc_idx = modified_command.index("-filter_complex")
+                fc_str = modified_command[fc_idx + 1]
+
+                if "[0:a:0]" in fc_str:
+                    # Count inputs before filter_complex to determine new input index
+                    inputs_before_fc = sum(1 for j in range(fc_idx) if modified_command[j] == "-i")
+
+                    # Create cut audio from original video audio track
+                    cut_orig_audio = self._create_cut_audio_file(video_path, cuts_to_keep)
+                    if cut_orig_audio:
+                        # Insert new input before -filter_complex
+                        modified_command.insert(fc_idx, "-i")
+                        modified_command.insert(fc_idx + 1, cut_orig_audio)
+                        temp_files_to_cleanup.append(cut_orig_audio)
+
+                        # After insertion, -filter_complex moved by +2
+                        fc_token_idx = fc_idx + 2
+                        fc_value_idx = fc_token_idx + 1
+
+                        # Replace occurrences of [0:a:0] with the new input index
+                        new_input_index = inputs_before_fc  # zero-based
+                        fc_str_updated = fc_str.replace("[0:a:0]", f"[{new_input_index}:a:0]")
+                        modified_command[fc_value_idx] = fc_str_updated
+
+                        # Also fix any explicit mapping of 0:a:0 if present
+                        k = 0
+                        while k < len(modified_command) - 1:
+                            if modified_command[k] == "-map" and modified_command[k + 1] == "0:a:0":
+                                modified_command[k + 1] = f"{new_input_index}:a:0"
+                            k += 2 if modified_command[k] == "-map" else 1
+                    else:
+                        logger.warning("Could not create cut original audio; original ranges may fail.")
+        except Exception as e:
+            logger.warning(f"Failed to adjust original audio input for filter graph: {e}")
         
         logger.info(f"Applied cuts to video and {len(cut_audio_files)} audio files")
         return modified_command, temp_files_to_cleanup

@@ -94,7 +94,8 @@ def main():
                     duration=config.get('duration'),
                     keep_original_audio_ranges=config.get('keep_original_audio_ranges'),
                     source_language=config.get('source_language'),
-                    target_language=config.get('target_language')
+                    target_language=config.get('target_language'),
+                    dubbed_volume=config.get('dubbed_volume', 1.0)
                 )
                 logger.info(f"Video combination complete. Output saved to: {output_video_path}")
             except Exception as e:
