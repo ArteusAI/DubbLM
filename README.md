@@ -1,4 +1,4 @@
-# DubbLM (formerly AIBorch)
+# DubbLM
 
 ![DubbLM Logo](logo.png)
 
