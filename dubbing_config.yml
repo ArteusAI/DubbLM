@@ -1,19 +1,23 @@
 # Smart Dubbing Tool Configuration
 
+watermark_path: logo.png
+
 # Required parameters (input must be provided via CLI --input)
 source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
-target_language: "fr"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
+target_language: "ru"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
 
 # Debug options
 debug_info: false  # Generate debug video with speaker labels and timing info
 debug_diarize_only: false  # Stop after diarization/transcription and generate debug video
+debug_tts: true  # Save rejected/silent attempts for TTS
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: false  # Preserve background music/sounds in output
+keep_background: true  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
+dubbed_volume: 2.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
 use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
 
 # Text-to-Speech settings
@@ -32,7 +36,7 @@ llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
 # Translation refinement settings
 refinement_llm_provider: "gemini"  # AI provider for style refinement
 refinement_model_name: "gemini-2.5-pro"  # Model for translation polishing
-refinement_temperature: 1.5  # Refinement creativity level
+refinement_temperature: 1.8  # Refinement creativity level
 refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
 
 # Subtitle generation
@@ -41,26 +45,29 @@ save_translated_subtitles: true  # Generate .srt file with translated text
 
 # Voice configuration
 # voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
-voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
+voice_auto_selection: false  # Auto-match voices to speakers based on audio characteristics
 
 # Advanced audio processing
 # Optional: Preserve original audio for specific time ranges
-#keep_original_audio_ranges:
-#    - "2:01:24-2:01:40"  # Format: HH:MM:SS-HH:MM:SS or MM:SS-MM:SS or SS-SS
+# keep_original_audio_ranges:
+#     - "00:00:00-00:00:40"  # Format: HH:MM:SS-HH:MM:SS or MM:SS-MM:SS or SS-SS
+#     - "00:01:18-00:01:30.500"
+#     - "00:01:38-00:01:48"
+#     - "00:03:49-00:04:35"
 #    - "0:10:00-0:10:20"  # Keep original from 10min to 10min 20s
 #    - "1:05-1:15"        # Keep original from 1min 5s to 1min 15s
 #    - "30-45"            # Keep original from 30s to 45s
 
 # Per-speaker voice mapping
-#voice_name:
-#  SPEAKER_A: "puck"      # Assign specific voice to speaker A
-#  SPEAKER_B: "sadaltager" # Assign specific voice to speaker B
+voice_name:
+  SPEAKER_A: "puck"
+  SPEAKER_B: "iapetus"      # Assign specific voice to speaker A
 
 # Per-speaker voice style instructions
 #voice_prompt:
-#  SPEAKER_01: "a drunk tired voice"     # Voice characteristics for speaker 1
-#  SPEAKER_02: "confident narrator tone" # Voice characteristics for speaker 2
-#  SPEAKER_03: "cheerful energetic voice" # Voice characteristics for speaker 3
+#  SPEAKER_A: ""     # Voice characteristics for speaker 1
+#  SPEAKER_B: "Read aloud with the energy of a coach and the vision of a leader:"
+#  SPEAKER_C: "Read aloud in a warm and friendly tone:" # Voice characteristics for speaker 3
 
 # Per-speaker TTS engine assignment
 #tts_system_mapping:
@@ -74,6 +81,16 @@ voice_auto_selection: true  # Auto-match voices to speakers based on audio chara
 #  "*": "openai"          # Default TTS for all other speakers
 
 # Translation consistency dictionary
-#glossary:
-#  "AI": "AiAi"           # Force specific term translations
-#  "machine learning": "машинное обучение" # Ensure consistent terminology
+glossary:
+  "AI": "ИИ"
+  "Lex Fridman": "Алексей Федотов"
+  "Linus Torvalds": "Линус Торвальдсов"
+  "embedding": "эмбеддинг"
+  "AGI": "ЭйДжиАй"
+  "ASI": "ЭйСиАй"
+  "GPU": "GPU"
+  "mixture of experts": "группа экспертов"
+  "dense model": "монолитная модель"
+  "sparse model": "разряженная модель"
+  "mental model": "понимание"
+  "Andrej Karpathy": "Андрей Капаты"
