@@ -38,7 +38,7 @@ class TranslatorFactory:
             # Get translation model configuration parameters
             model_name = kwargs.get("model_name")
             temperature = kwargs.get("temperature", 0.5)
-            max_tokens = kwargs.get("max_tokens", 1024)
+            max_tokens = kwargs.get("max_tokens", 16384)
             
             # Get refinement model configuration parameters
             refinement_llm_provider = kwargs.get("refinement_llm_provider")
@@ -48,6 +48,12 @@ class TranslatorFactory:
             
             # Get glossary if provided
             glossary = kwargs.get("glossary")
+
+            # Persona used during refinement
+            refinement_persona = kwargs.get("refinement_persona")
+
+            # Optional additional prompt prefix for translation prompts
+            translation_prompt_prefix = kwargs.get("translation_prompt_prefix")
             
             # Get cache manager if provided
             cache_manager = kwargs.get("cache_manager")
@@ -62,6 +68,8 @@ class TranslatorFactory:
                 refinement_temperature=refinement_temperature,
                 refinement_max_tokens=refinement_max_tokens,
                 glossary=glossary,
+                refinement_persona=refinement_persona,
+                prompt_prefix=translation_prompt_prefix,
                 cache_manager=cache_manager
             )
                 

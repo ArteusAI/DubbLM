@@ -46,6 +46,7 @@ class DubbingConfig:
             'refinement_temperature': 1.0,
             'refinement_max_tokens': None,
             'refinement_persona': 'normal',
+            'translation_prompt_prefix': None,
             'voice_name': None,
             'debug_info': False,
             'debug_tts': False,
@@ -223,6 +224,7 @@ class DubbingConfig:
         parser.add_argument('--refinement_temperature', type=float, help='Temperature for refinement')
         parser.add_argument('--refinement_max_tokens', type=int, help='Maximum tokens for OpenRouter refinement')
         parser.add_argument('--refinement_persona', type=str, choices=['normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
+        parser.add_argument('--translation_prompt_prefix', type=str, help='Additional context to prepend to LLM translation prompts')
         parser.add_argument('--voice_name', type=str, help='Voice to use for TTS')
         parser.add_argument('--debug_info', action='store_true', default=argparse.SUPPRESS, help='Generate a debug video with speaker labels')
         parser.add_argument('--debug_tts', action='store_true', default=argparse.SUPPRESS, help='Enable TTS debugging (e.g., save rejected/silent attempts)')

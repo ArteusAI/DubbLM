@@ -64,7 +64,8 @@ class LLMTranslator(TranslationInterface):
         enable_cache: bool = True,
         glossary: Optional[Dict[str, str]] = None,
         refinement_persona: str = "manager",
-        cache_manager: Optional['CacheManager'] = None
+        cache_manager: Optional['CacheManager'] = None,
+        prompt_prefix: Optional[str] = None,
     ):
         """
         Initialize LLM translator.
@@ -117,6 +118,9 @@ class LLMTranslator(TranslationInterface):
         
         # Set refinement persona
         self.refinement_persona = refinement_persona
+        
+        # Optional custom prompt prefix to inject additional context
+        self.prompt_prefix = (prompt_prefix or "").strip() or None
         
         self.llm = None
         self.refinement_llm = None
@@ -286,7 +290,8 @@ class LLMTranslator(TranslationInterface):
             A unique hash string to use as cache key
         """
         # Combine the parameters that fully define a translation
-        cache_data = f"{chunk_text}|{source_language}|{target_language}|{self.llm_provider}|{self.model_name}|{self.temperature}"
+        # Include prompt prefix in the key so cache varies when extra context changes
+        cache_data = f"{chunk_text}|{source_language}|{target_language}|{self.llm_provider}|{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}"
         # Create a hash of this data
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
     
@@ -342,6 +347,12 @@ CRITICAL: You MUST use the translations from the glossary for all listed terms.
 IMPORTANT: The glossary provides base forms of translations. When using a term from the glossary, you MUST adapt it to fit the grammatical context (e.g., case, gender, number, verb conjugation) of the sentence in the target language "{target_language}". For example, if the glossary says "cat" -> "кошка", and the sentence requires the genitive case, you should use "кошки", not "кошка". Do not just insert the glossary term verbatim if it violates grammatical rules.
 """
         
+        # Optional additional context section
+        additional_context_section = f"""
+# Additional context (optional):
+{self.prompt_prefix}
+""" if self.prompt_prefix else ""
+
         # Combine context analysis and initial summarization in one prompt
         combined_prompt = f"""
 Analyze the following transcript in "{source_language}" language and provide:
@@ -360,6 +371,7 @@ Analyze the following transcript in "{source_language}" language and provide:
    - Write a comprehensive overall summary (3-5 sentences) describing the main topics and flow of the content, suitable for use as a video description.
 
 {glossary_section}
+{additional_context_section}
 
 IMPORTANT: Create the summary in "{target_language}" language.
 
@@ -904,6 +916,12 @@ CRITICAL: You MUST use the translations from the glossary for all listed terms.
 IMPORTANT: The glossary provides base forms of translations. When using a term from the glossary, you MUST adapt it to fit the grammatical context (e.g., case, gender, number, verb conjugation) of the sentence in the target language "{target_language}". For example, if the glossary says "cat" -> "кошка", and the sentence requires the genitive case, you should use "кошки", not "кошка". Do not just insert the glossary term verbatim if it violates grammatical rules.
 """
         
+        # Optional additional context section for translation prompt
+        custom_section = f"""
+# Additional context (optional):
+{self.prompt_prefix}
+""" if self.prompt_prefix else ""
+
         # Build prompt with context information
         prompt = f"""
 You are a professional translator specializing in {context_info['domain']} content.
@@ -925,6 +943,7 @@ Preserve the meaning, tone, and style of the original.
 10. Preserve the original structure of the conversation, number of lines, and number of speakers.
 
 {glossary_section}
+{custom_section}
 
 # Special handling for filler words and conciseness:
 1. Remove any filler words (e.g., 'um', 'uh', 'like', 'you know', 'Итак...' etc.) from the translation to make it sound more fluent and professional. 
@@ -1473,14 +1492,19 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             batch_start_time = time.perf_counter()
 
             # Call LLM for refinement
-            max_attempts = 3
+            max_attempts = 5
             refined_pairs = None
             llm_response_text = ""
             refinement_success = False  # Track if refinement succeeded
 
             for attempt in range(max_attempts):
                 try:
-                    refinement_response = self.refinement_llm.complete(refinement_prompt)
+                    # Prepend custom context if provided
+                    effective_refinement_prompt = (
+                        f"# Additional context (optional):\n{self.prompt_prefix}\n\n{refinement_prompt}"
+                        if self.prompt_prefix else refinement_prompt
+                    )
+                    refinement_response = self.refinement_llm.complete(effective_refinement_prompt)
                     if hasattr(refinement_response, "text"):
                         llm_response_text = refinement_response.text.strip()
                     else: # openrouter

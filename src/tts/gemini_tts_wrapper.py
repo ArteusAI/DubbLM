@@ -505,13 +505,13 @@ class SampleManager:
         original_model = self.api_client.current_model
         
         # Try with original model
-        success = self._attempt_sample_generation(voice_name, sample_file_path, max_retries_per_model, max_silence_ratio=0.2)
+        success = self._attempt_sample_generation(voice_name, sample_file_path, max_retries_per_model, max_silence_ratio=0.1)
         
         if not success:
             # Switch to fallback model and try again
             if self.api_client.switch_to_fallback_model():
                 logger.info(f"Attempting sample generation for {voice_name} with fallback model")
-                success = self._attempt_sample_generation(voice_name, sample_file_path, max_retries_per_model, max_silence_ratio=0.4)
+                success = self._attempt_sample_generation(voice_name, sample_file_path, max_retries_per_model, max_silence_ratio=0.2)
                 
                 # Reset to original model after attempts
                 self.api_client.reset_to_original_model()
@@ -519,7 +519,7 @@ class SampleManager:
         return success
 
     def _attempt_sample_generation(self, voice_name: str, sample_file_path: Path,
-                                 max_retries: int, max_silence_ratio: float = 0.2) -> bool:
+                                 max_retries: int, max_silence_ratio: float = 0.1) -> bool:
         """
         Attempt sample generation with the current model.
         
@@ -1085,7 +1085,7 @@ class GeminiTTSWrapper(TTSInterface):
 
         # Try with original model
         success, primary_silence, primary_best_path = self._attempt_segment_synthesis(
-            segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.1
+            segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.01
         )
 
         if success:
@@ -1098,7 +1098,7 @@ class GeminiTTSWrapper(TTSInterface):
         if self.api_client.switch_to_fallback_model():
             logger.info(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
             success, fallback_silence, fallback_best_path = self._attempt_segment_synthesis(
-                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.2
+                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05
             )
             self.api_client.reset_to_original_model()
 
@@ -1134,7 +1134,7 @@ class GeminiTTSWrapper(TTSInterface):
         raise RuntimeError(f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts.")
 
     def _attempt_segment_synthesis(self, segment_data: TTSSegmentData, temp_output_path: str,
-                                 language: str, max_retries: int, max_silence_ratio: float = 0.1) -> Tuple[bool, float, Optional[str]]:
+                                 language: str, max_retries: int, max_silence_ratio: float = 0.01) -> Tuple[bool, float, Optional[str]]:
         """
         Attempt segment synthesis with the current model.
         Returns a tuple of (success, silence_ratio, best_attempt_path).

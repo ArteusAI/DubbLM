@@ -67,6 +67,16 @@ class SmartDubbing:
         self.tts_system_mapping = self.config.get('tts_system_mapping') or {}
         self.voice_prompt = self.config.get('voice_prompt') or {}
         
+        # Speakers to mute (remove entirely from output)
+        self.muted_speakers = set()
+        mute_cfg = self.config.get('mute_speakers')
+        if isinstance(mute_cfg, str) and mute_cfg.strip():
+            self.muted_speakers = {mute_cfg.strip()}
+        elif isinstance(mute_cfg, (list, tuple, set)):
+            self.muted_speakers = {str(s).strip() for s in mute_cfg if isinstance(s, (str,)) and str(s).strip()}
+        if self.muted_speakers:
+            logger.info(f"Muted speakers: {sorted(self.muted_speakers)}")
+
         # Initialize core components
         self.cache_manager = CacheManager(
             use_cache=not config.get('no_cache', False),
@@ -137,6 +147,16 @@ class SmartDubbing:
         if device_str is None:
             device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
         return torch.device(device_str)
+
+    def _apply_speaker_filter(self, segments: List[Dict]) -> List[Dict]:
+        """Return segments with muted speakers removed (if configured)."""
+        if not segments or not self.muted_speakers:
+            return segments
+        filtered = [s for s in segments if s.get("speaker") not in self.muted_speakers]
+        if self.config.get('debug_info', False):
+            removed = len(segments) - len(filtered)
+            logger.debug(f"Speaker filter applied: muted={sorted(self.muted_speakers)} removed={removed} kept={len(filtered)}")
+        return filtered
     
     def _initialize_translator(self) -> None:
         """Initialize translator based on configuration."""
@@ -152,6 +172,7 @@ class SmartDubbing:
                 refinement_temperature=self.config.get('refinement_temperature', 1.0),
                 refinement_max_tokens=self.config.get('refinement_max_tokens'),
                 refinement_persona=self.config.get('refinement_persona', 'normal'),
+                translation_prompt_prefix=self.config.get('translation_prompt_prefix'),
                 glossary=self.config.get('glossary'),
                 cache_manager=self.cache_manager
             )
@@ -225,32 +246,44 @@ class SmartDubbing:
             
             # Translate segments
             translated_segments = self.translate_segments(transcription, audio_file)
+
+            # Apply optional speaker mute filter for downstream steps
+            segments_for_output = self._apply_speaker_filter(translated_segments)
             
             # Save debug TSV
-            self.subtitle_manager.save_debug_tsv(translated_segments)
+            self.subtitle_manager.save_debug_tsv(segments_for_output)
             
             # Save subtitles if requested (only if pause removal is disabled)
             remove_pauses_enabled = self.config.get('remove_pauses', True)
             if not remove_pauses_enabled:
                 if save_original_subtitles:
-                    self.subtitle_manager.save_subtitles(translated_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
+                    self.subtitle_manager.save_subtitles(segments_for_output, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                 
                 if save_translated_subtitles:
-                    self.subtitle_manager.save_subtitles(translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
+                    self.subtitle_manager.save_subtitles(segments_for_output, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
             
             # Analyze emotions (if enabled)
             if self.config.get('enable_emotion_analysis', True):
-                translated_segments = self.analyze_emotions(translated_segments, audio_file)
+                segments_for_output = self.analyze_emotions(segments_for_output, audio_file)
             else:
                 logger.debug("Emotion analysis disabled")
-                for segment in translated_segments:
+                for segment in segments_for_output:
                     segment["emotion"] = "Neutral"
             
-            # Synthesize speech
-            translated_audio_path = self.synthesize_speech(translated_segments, speakers_rolls, audio_file)
+            # Synthesize speech or generate silence if no segments remain after muting
+            if segments_for_output and len(segments_for_output) > 0:
+                translated_audio_path = self.synthesize_speech(segments_for_output, speakers_rolls, audio_file)
+            else:
+                logger.info("All segments filtered by mute_speakers; generating silent audio track...")
+                total_duration_sec = self.audio_processor.get_total_duration() or 0
+                silent_ms = int(max(0, total_duration_sec) * 1000)
+                silent_audio = AudioSegment.silent(duration=silent_ms)
+                os.makedirs("artifacts/audio", exist_ok=True)
+                translated_audio_path = "artifacts/audio/output.wav"
+                silent_audio.export(translated_audio_path, format="wav")
             
             # Save translated samples
-            self.speaker_processor.save_translated_samples(translated_segments, audio_file)
+            self.speaker_processor.save_translated_samples(segments_for_output, audio_file)
             
             # Process background audio if needed
             background_audio_path = None
@@ -267,6 +300,20 @@ class SmartDubbing:
                     self.audio_processor.get_total_duration()
                 )
             
+            # Determine original audio keep ranges when including original audio and muting speakers
+            keep_original_audio_ranges = self.config.get('keep_original_audio_ranges')
+            if keep_original_audio_ranges is None and self.config.get('include_original_audio', False) and self.muted_speakers:
+                try:
+                    # Keep only ranges where non-muted speakers talk
+                    keep_original_audio_ranges = [
+                        (start, end) for (start, end), spk in (speakers_rolls or {}).items() if spk not in self.muted_speakers
+                    ]
+                    if keep_original_audio_ranges:
+                        logger.info(f"Computed keep_original_audio_ranges excluding muted speakers ({len(keep_original_audio_ranges)} ranges)")
+                except Exception:
+                    # Fallback silently if structure is unexpected
+                    keep_original_audio_ranges = self.config.get('keep_original_audio_ranges')
+
             # Combine with video (includes pause removal if enabled)
             output_video_path, pause_adjustments = self.video_processor.combine_audio_with_video(
                 video_path=self.config.get('input'),
@@ -278,7 +325,7 @@ class SmartDubbing:
                 output_file=self.config.get('output'),
                 start_time=self.config.get('start_time'),
                 duration=self.config.get('duration'),
-                keep_original_audio_ranges=self.config.get('keep_original_audio_ranges'),
+                keep_original_audio_ranges=keep_original_audio_ranges,
                 source_language=self.config.get('source_language'),
                 target_language=self.config.get('target_language'),
                 normalize_audio=self.config.get('normalize_audio', True),
@@ -300,13 +347,13 @@ class SmartDubbing:
                     logger.info("Adjusting subtitle timestamps based on pause modifications...")
                     
                     if save_original_subtitles:
-                        adjusted_original_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
+                        adjusted_original_segments = self.adjust_subtitle_timestamps(segments_for_output, pause_adjustments)
                         self.subtitle_manager.save_subtitles(adjusted_original_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                         adjusted_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language'))
                         logger.info(f"Saved pause-corrected original subtitles to {adjusted_path}")
                     
                     if save_translated_subtitles:
-                        adjusted_translated_segments = self.adjust_subtitle_timestamps(translated_segments, pause_adjustments)
+                        adjusted_translated_segments = self.adjust_subtitle_timestamps(segments_for_output, pause_adjustments)
                         self.subtitle_manager.save_subtitles(adjusted_translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
                         adjusted_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'))
                         logger.info(f"Saved pause-corrected translated subtitles to {adjusted_path}")
@@ -315,12 +362,12 @@ class SmartDubbing:
                     logger.info("No pause adjustments needed, saving subtitles with original timestamps...")
                     
                     if save_original_subtitles:
-                        self.subtitle_manager.save_subtitles(translated_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
+                        self.subtitle_manager.save_subtitles(segments_for_output, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                         subtitle_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language'))
                         logger.info(f"Saved original subtitles to {subtitle_path}")
                     
                     if save_translated_subtitles:
-                        self.subtitle_manager.save_subtitles(translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
+                        self.subtitle_manager.save_subtitles(segments_for_output, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
                         subtitle_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'))
                         logger.info(f"Saved translated subtitles to {subtitle_path}")
             

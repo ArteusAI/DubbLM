@@ -405,6 +405,8 @@ Your goal is to make the conversation sound natural for IT professionals who are
 5.  **Natural Flow:** The conversation should sound like a real chat between developers during a code review or technical discussion.
 6.  **Structure Preservation:** Preserve the original structure of the conversation, number of lines, and number of speakers.
 7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
+8.  **Respectful Language Only:** Do not use profanity, insults, slurs, vulgar or aggressive expressions. Keep the tone friendly and professional.
+9.  **Neutralize Source Profanity:** If the original contains rude or explicit language, paraphrase it into neutral, non-offensive wording while preserving the intended meaning and speaker intent.
 
 # Output Requirements:
 For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
@@ -485,6 +487,8 @@ Your goal is to make the conversation sound natural for AI professionals while k
 5.  **Natural Conversation:** Make it sound like a real discussion between colleagues, not a technical paper
 6.  **Structure Preservation:** Keep the original conversation structure, number of lines, and speakers
 7.  **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
+8.  **Respectful Language Only:** Do not use profanity, insults, slurs, vulgar or aggressive expressions. Maintain a neutral, professional tone at all times.
+9.  **Neutralize Source Profanity:** If the original contains rude or explicit language, rewrite it into neutral, non-offensive phrasing while preserving meaning and intent.
 
 # Non translatable terms:
 - predict / prediction
