@@ -1,6 +1,6 @@
 # Smart Dubbing Tool Configuration
 
-watermark_path: logo.png
+#watermark_path: logo.png
 
 # Required parameters (input must be provided via CLI --input)
 source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
@@ -45,7 +45,7 @@ save_translated_subtitles: true  # Generate .srt file with translated text
 
 # Voice configuration
 # voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
-voice_auto_selection: false  # Auto-match voices to speakers based on audio characteristics
+voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
 
 # Advanced audio processing
 # Optional: Preserve original audio for specific time ranges
@@ -59,9 +59,9 @@ voice_auto_selection: false  # Auto-match voices to speakers based on audio char
 #    - "30-45"            # Keep original from 30s to 45s
 
 # Per-speaker voice mapping
-voice_name:
-  SPEAKER_A: "puck"
-  SPEAKER_B: "iapetus"      # Assign specific voice to speaker A
+#voice_name:
+#  SPEAKER_A: "puck"
+#  SPEAKER_B: "iapetus"      # Assign specific voice to speaker A
 
 # Per-speaker voice style instructions
 #voice_prompt:
@@ -81,16 +81,16 @@ voice_name:
 #  "*": "openai"          # Default TTS for all other speakers
 
 # Translation consistency dictionary
-glossary:
-  "AI": "ИИ"
-  "Lex Fridman": "Алексей Федотов"
-  "Linus Torvalds": "Линус Торвальдсов"
-  "embedding": "эмбеддинг"
-  "AGI": "ЭйДжиАй"
-  "ASI": "ЭйСиАй"
-  "GPU": "GPU"
-  "mixture of experts": "группа экспертов"
-  "dense model": "монолитная модель"
-  "sparse model": "разряженная модель"
-  "mental model": "понимание"
-  "Andrej Karpathy": "Андрей Капаты"
+#glossary:
+#  "AI": "ИИ"
+#  "Lex Fridman": "Алексей Федотов"
+#  "Linus Torvalds": "Линус Торвальдсов"
+#  "embedding": "эмбеддинг"
+#  "AGI": "ЭйДжиАй"
+# "ASI": "ЭйСиАй"
+#  "GPU": "GPU"
+#  "mixture of experts": "группа экспертов"
+#  "dense model": "монолитная модель"
+#  "sparse model": "разряженная модель"
+#  "mental model": "понимание"
+#  "Andrej Karpathy": "Андрей Капаты"
