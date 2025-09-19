@@ -36,6 +36,8 @@ class DubbingConfig:
             'duration': None,
             'no_cache': False,
             'tts_system': 'coqui',
+            'tts_model': None,
+            'tts_fallback_model': None,
             'transcription_system': 'whisper',
             'translator_type': 'llm',
             'llm_provider': 'gemini',
@@ -70,7 +72,9 @@ class DubbingConfig:
             'min_pause_duration': 3,
             'use_two_pass_encoding': True,
             'keyframe_buffer': 0.2,
-            'dubbed_volume': 1.0
+            'dubbed_volume': 1.0,
+            'background_volume': 0.562341,
+            'group_overflow_tolerance': 1.0
         }
         
         # Required parameters that must come from CLI
@@ -187,6 +191,18 @@ class DubbingConfig:
             logger.info(f"Using TTS system mapping from config: {tts_system_mapping}")
         else:
             self.config['tts_system_mapping'] = None
+
+        # Clamp group_overflow_tolerance to [0.0, 1.0]
+        tol = self.config.get('group_overflow_tolerance')
+        try:
+            tol_f = float(1.0 if tol is None else tol)
+            if tol_f < 0.0 or tol_f > 1.0:
+                logger.warning("Warning: group_overflow_tolerance must be between 0 and 1. Clamping to valid range.")
+            tol_f = max(0.0, min(1.0, tol_f))
+            self.config['group_overflow_tolerance'] = tol_f
+        except Exception:
+            logger.warning("Warning: Invalid group_overflow_tolerance value. Falling back to 1.0.")
+            self.config['group_overflow_tolerance'] = 1.0
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
@@ -214,6 +230,8 @@ class DubbingConfig:
         parser.add_argument('--duration', type=float, help='Duration in seconds to process')
         parser.add_argument('--no_cache', action='store_true', default=argparse.SUPPRESS, help='Disable caching of pipeline steps')
         parser.add_argument('--tts_system', type=str, choices=['coqui', 'openai', 'f5_tts', 'gemini'], help='Text-to-speech system to use')
+        parser.add_argument('--tts_model', type=str, help='Model name for the selected TTS provider')
+        parser.add_argument('--tts_fallback_model', type=str, help='Fallback model name for the TTS provider (used by Gemini)')
         parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx'], help='Transcription system to use')
         parser.add_argument('--translator_type', type=str, choices=['llm'], help='Translator type to use')
         parser.add_argument('--llm_provider', type=str, choices=['gemini', 'openrouter'], help='LLM provider to use')
@@ -250,6 +268,8 @@ class DubbingConfig:
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')
+        parser.add_argument('--background_volume', type=float, help='Gain multiplier for background track when keep_background=true (e.g., 0.56 ≈ -5 dB)')
+        parser.add_argument('--group_overflow_tolerance', type=float, help='Allowed overflow beyond group timeframe when combining segments (0..1, default 1.0)')
         
         return parser
 

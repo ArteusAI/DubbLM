@@ -95,7 +95,10 @@ def main():
                     keep_original_audio_ranges=config.get('keep_original_audio_ranges'),
                     source_language=config.get('source_language'),
                     target_language=config.get('target_language'),
-                    dubbed_volume=config.get('dubbed_volume', 1.0)
+                    dubbed_volume=config.get('dubbed_volume', 1.0),
+                    background_volume=config.get('background_volume', 0.562341),
+                    upscale_factor=config.get('upscale_factor', 1.0),
+                    upscale_sharpen=config.get('upscale_sharpen', True)
                 )
                 logger.info(f"Video combination complete. Output saved to: {output_video_path}")
             except Exception as e:

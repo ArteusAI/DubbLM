@@ -108,6 +108,7 @@ Different features require different API keys. Add these to your `.env` file:
 *For Transcription:*
 - `ASSEMBLYAI_API_KEY` - If using `transcription_system: "assemblyai"`
 - `OPENAI_API_KEY` - If using `transcription_system: "openai"`
+- `HF_TOKEN` - Required for PyAnnote diarization when `transcription_system` is `"openai"` (aka `"pyannote_openai"`). Create an access token in your Hugging Face account and set it as `HF_TOKEN`.
 
 *For Translation:*
 - `GOOGLE_API_KEY` - If using `llm_provider: "gemini"` (default)
@@ -124,9 +125,12 @@ OPENAI_API_KEY=sk-your-openai-key-here
 GOOGLE_API_KEY=your-google-api-key-here
 ASSEMBLYAI_API_KEY=your-assemblyai-key-here
 OPENROUTER_API_KEY=your-openrouter-key-here
+HF_TOKEN=your-huggingface-token-here
 ```
 
 **Minimum setup:** You need at least `GOOGLE_API_KEY` for default Gemini-based translation and TTS.
+
+If you enable OpenAI transcription (`--transcription_system openai` or `pyannote_openai`), you must also set `HF_TOKEN` to allow loading the PyAnnote diarization pipeline.
 
 ## Usage Examples
 

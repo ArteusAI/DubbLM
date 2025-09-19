@@ -85,6 +85,7 @@ SAMPLE_RATE = 24000
 class GeminiTTSConfig(BaseModel):
     """Configuration for Gemini TTS."""
     model: str = "gemini-2.5-pro-preview-tts"
+    fallback_model: str = "gemini-2.5-flash-preview-tts"
     default_voice: str = "Enceladus"
     embedding_model_device: Optional[str] = None
     enable_voice_matching: bool = True
@@ -377,7 +378,7 @@ class GeminiAPIClient:
         self.config = config
         self.client: Optional[genai.Client] = None
         self.current_model = config.model
-        self.fallback_model = "gemini-2.5-flash-preview-tts"
+        self.fallback_model = config.fallback_model
         # Indicates whether we've permanently switched to the fallback model due to quota limits
         self.permanent_fallback = False
 
@@ -759,6 +760,7 @@ class GeminiTTSWrapper(TTSInterface):
     def __init__(
         self,
         model: str = "gemini-2.5-pro-preview-tts",
+        fallback_model: str = "gemini-2.5-flash-preview-tts",
         default_voice: str = "Kore",
         embedding_model_device: Optional[str] = None,
         enable_voice_matching: bool = True,
@@ -772,6 +774,7 @@ class GeminiTTSWrapper(TTSInterface):
 
         self.config = GeminiTTSConfig(
             model=model,
+            fallback_model=fallback_model,
             default_voice=default_voice,
             embedding_model_device=embedding_model_device,
             enable_voice_matching=enable_voice_matching,

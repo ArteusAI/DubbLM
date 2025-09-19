@@ -543,7 +543,10 @@ class VideoProcessor:
                                 preserve_pause_duration: float = 1.5,
                                 keyframe_buffer: float = 0.2,
                                 ffmpeg_batch_size: int = 50,
-                                dubbed_volume: float = 1.0) -> Tuple[str, List[Dict[str, float]]]:
+                                dubbed_volume: float = 1.0,
+                                background_volume: float = 0.562341,
+                                upscale_factor: float = 1.0,
+                                upscale_sharpen: bool = True) -> Tuple[str, List[Dict[str, float]]]:
         """Combine the translated audio with the original video, optionally adding a watermark and removing pauses.
 
         Args:
@@ -567,6 +570,8 @@ class VideoProcessor:
             keyframe_buffer: Buffer around keyframes to preserve (seconds)
             ffmpeg_batch_size: Number of cuts to process in a single ffmpeg command
             dubbed_volume: Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
+            upscale_factor: Video scale factor (>1.0 to upscale; default 1.0 disables)
+            upscale_sharpen: Apply mild sharpening after scaling
 
         Returns:
             Tuple of (Path to the output video file, List of pause adjustments for subtitle timing)
@@ -655,17 +660,45 @@ class VideoProcessor:
         all_filter_complex_parts = []
         video_map_option = "0:v"  # Default to original video stream (Input 0)
 
+        # Optional upscaling and quality enhancement (applied before overlays/text)
+        current_video_label = "0:v"
+        try:
+            if upscale_factor and float(upscale_factor) > 1.0:
+                # Clamp factor to a reasonable range
+                factor = max(1.0, min(float(upscale_factor), 4.0))
+                scale_filter = (
+                    f"[{current_video_label}]"
+                    f"scale=ceil(iw*{factor}/2)*2:ceil(ih*{factor}/2)*2:flags=lanczos+accurate_rnd+full_chroma_int"
+                    f"[vid_scaled]"
+                )
+                all_filter_complex_parts.append(scale_filter)
+                current_video_label = "[vid_scaled]"
+
+                if upscale_sharpen:
+                    # Mild sharpening to enhance details post-upscale
+                    unsharp_filter = (
+                        f"{self._format_filter_input_label(current_video_label)}"
+                        f"unsharp=5:5:0.6:5:5:0.0[vid_sharp]"
+                    )
+                    all_filter_complex_parts.append(unsharp_filter)
+                    current_video_label = "[vid_sharp]"
+
+                video_map_option = current_video_label
+        except Exception as _:
+            # Fail-safe: ignore invalid upscale params
+            current_video_label = "0:v"
+
         # Watermark and text overlay filters (applied to video stream)
         if watermark_path and os.path.exists(watermark_path) or watermark_text:
             margin = 10
-            temp_video_input_label = "0:v"  # Video from Input 0
+            temp_video_input_label = current_video_label if current_video_label != "0:v" else "0:v"
 
             if watermark_text:
                 logger.debug(f"Adding text caption: '{watermark_text}'")
                 effective_logo_width_for_text = logo_width if watermark_path and os.path.exists(watermark_path) else 0
                 
                 drawtext_filter = (
-                    f"[{temp_video_input_label}]drawtext=text='{watermark_text}':"
+                    f"{self._format_filter_input_label(temp_video_input_label)}drawtext=text='{watermark_text}':"
                     "fontsize=16:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=5:"
                     f"x=W-{(effective_logo_width_for_text or 0)+190}:y=H-50[withtext]"
                 )
@@ -674,7 +707,7 @@ class VideoProcessor:
             
             if watermark_path and os.path.exists(watermark_path) and watermark_ffmpeg_idx_str:
                 logger.debug(f"Adding watermark from {watermark_path}")
-                overlay_filter = f"[{temp_video_input_label}][{watermark_ffmpeg_idx_str}:v]overlay=W-w-{margin}:H-h-{margin}[outv]"
+                overlay_filter = f"{self._format_filter_input_label(temp_video_input_label)}[{watermark_ffmpeg_idx_str}:v]overlay=W-w-{margin}:H-h-{margin}[outv]"
                 all_filter_complex_parts.append(overlay_filter)
                 video_map_option = "[outv]"
             elif temp_video_input_label == "[withtext]": 
@@ -682,24 +715,26 @@ class VideoProcessor:
 
         # Determine the dubbed audio stream before selective mixing
         dubbed_audio_source_stream = "1:a:0"  # Normalized translated audio from Input 1
-        
-        if background_audio_path and background_audio_ffmpeg_idx_str:
-            all_filter_complex_parts.append(
-                f"[{background_audio_ffmpeg_idx_str}:a:0]volume=0.562341[bg_audio_reduced]"
-            )
-            all_filter_complex_parts.append(
-                f"[{dubbed_audio_source_stream}][bg_audio_reduced]amix=inputs=2:duration=longest[dub_mixed_with_bg]"
-            )
-            processed_dubbed_audio_stream_label = "[dub_mixed_with_bg]"
-        else:
-            processed_dubbed_audio_stream_label = dubbed_audio_source_stream
+        processed_dubbed_audio_stream_label = dubbed_audio_source_stream
 
-        # Apply user-specified gain to the translated track (after optional bg mix)
+        # Apply user-specified gain to the translated track (before optional bg mix)
         if abs(dubbed_volume - 1.0) > 1e-6:
             all_filter_complex_parts.append(
-                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume={dubbed_volume}[dubbed_vol_adj]"
+                f"[{dubbed_audio_source_stream}]volume={dubbed_volume}[dubbed_vol_adj]"
             )
             processed_dubbed_audio_stream_label = "[dubbed_vol_adj]"
+
+        # Optionally mix with background after speech gain
+        if background_audio_path and background_audio_ffmpeg_idx_str:
+            # Apply user-specified background volume (default ≈ -5 dB)
+            bg_vol = background_volume if background_volume and background_volume > 0 else 0.562341
+            all_filter_complex_parts.append(
+                f"[{background_audio_ffmpeg_idx_str}:a:0]volume={bg_vol}[bg_audio_reduced]"
+            )
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}[bg_audio_reduced]amix=inputs=2:duration=longest[dub_mixed_with_bg]"
+            )
+            processed_dubbed_audio_stream_label = "[dub_mixed_with_bg]"
 
         # Main audio track selection logic
         if keep_original_audio_ranges and len(keep_original_audio_ranges) > 0:
@@ -740,7 +775,11 @@ class VideoProcessor:
             command.extend(["-map", "0:a:0"])
 
         # Determine if video needs re-encoding (filters/watermarks applied)
-        need_video_reencode = video_map_option != "0:v" or any(part for part in all_filter_complex_parts if '[outv]' in part or 'drawtext' in part or 'overlay' in part)
+        need_video_reencode = video_map_option != "0:v" or any(
+            part for part in all_filter_complex_parts if (
+                '[outv]' in part or 'drawtext' in part or 'overlay' in part or 'scale=' in part or 'zscale=' in part or 'unsharp' in part
+            )
+        )
         
         # Check if trimming prevents stream copy due to keyframe alignment
         if (start_time is not None or duration is not None) and not need_video_reencode:
@@ -875,7 +914,8 @@ class VideoProcessor:
                 background_audio_ffmpeg_idx_str,
                 keep_original_audio_ranges,
                 video_path,
-                dubbed_volume
+                dubbed_volume,
+                background_volume
             )
             
             # Detect pauses in final audio
@@ -1182,7 +1222,8 @@ class VideoProcessor:
                                              background_audio_idx: Optional[str],
                                              keep_original_audio_ranges: Optional[List[Tuple[float, float]]],
                                              video_path: str,
-                                             dubbed_volume: float = 1.0) -> str:
+                                             dubbed_volume: float = 1.0,
+                                             background_volume: float = 0.562341) -> str:
         """Create the final audio mix for pause analysis.
         
         Args:
@@ -1230,7 +1271,8 @@ class VideoProcessor:
             
             # Mix with background if needed
             if background_audio_path:
-                filter_parts.append("[1:a:0]volume=0.562341[bg_reduced]")
+                bg_vol = background_volume if background_volume and background_volume > 0 else 0.562341
+                filter_parts.append(f"[1:a:0]volume={bg_vol}[bg_reduced]")
                 left = self._format_filter_input_label(current_audio_label)
                 filter_parts.append(f"{left}[bg_reduced]amix=inputs=2:duration=longest[mixed_with_bg]")
                 current_audio_label = "[mixed_with_bg]"

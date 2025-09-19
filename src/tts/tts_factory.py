@@ -127,9 +127,14 @@ class TTSFactory:
         if config.default_voice is not None:
             init_args["default_voice"] = config.default_voice
         
-        # Add prompt_prefix for Gemini TTS
-        if provider_name_lower == "gemini" and config.prompt_prefix is not None:
-            init_args["prompt_prefix"] = config.prompt_prefix
+        # Add provider-specific args
+        if provider_name_lower == "gemini":
+            if config.prompt_prefix is not None:
+                init_args["prompt_prefix"] = config.prompt_prefix
+            # Allow passing fallback_model specifically for Gemini
+            fallback = config.kwargs.get("fallback_model") if isinstance(config.kwargs, dict) else None
+            if fallback is not None:
+                init_args["fallback_model"] = fallback
         
         # Pass through any additional kwargs from TTSConfig (like 'device' for Coqui/F5)
         init_args.update(config.kwargs)

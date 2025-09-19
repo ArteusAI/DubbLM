@@ -193,7 +193,9 @@ class SmartDubbing:
                 voice_prompt=self.config.get('voice_prompt', {}),
                 prompt_prefix=self.config.get('tts_prompt_prefix'),
                 enable_voice_matching=self.config.get('voice_auto_selection', True),
-                debug_tts=self.config.get('debug_tts', False)
+                debug_tts=self.config.get('debug_tts', False),
+                model=self.config.get('tts_model'),
+                fallback_model=self.config.get('tts_fallback_model')
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance
@@ -335,7 +337,10 @@ class SmartDubbing:
                 preserve_pause_duration=self.config.get('preserve_pause_duration', 1.5),
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
                 ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
-                dubbed_volume=self.config.get('dubbed_volume', 1.0)
+                dubbed_volume=self.config.get('dubbed_volume', 1.0),
+                background_volume=self.config.get('background_volume', 0.562341),
+                upscale_factor=self.config.get('upscale_factor', 1.0),
+                upscale_sharpen=self.config.get('upscale_sharpen', True)
             )
             
             # Store pause adjustments for potential future use
@@ -1513,6 +1518,21 @@ class SmartDubbing:
                     except Exception as exc:
                         logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
                 
+                # Enforce allowed overflow beyond the group's original timeframe
+                try:
+                    overflow_tolerance = float(self.config.get('group_overflow_tolerance', 1.0))
+                except Exception:
+                    overflow_tolerance = 1.0
+                overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
+
+                original_group_span_ms = target_duration_ms
+                adjusted_len_ms = len(adjusted_group_audio)
+                if adjusted_len_ms > original_group_span_ms:
+                    overflow_ms = adjusted_len_ms - original_group_span_ms
+                    allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
+                    if adjusted_len_ms > allowed_len_ms:
+                        adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
+                
                 # Calculate real segment positions after speed adjustment
                 final_group_duration_ms = len(adjusted_group_audio)
                 position_ms = int(group_start_time_ms)
@@ -1521,6 +1541,12 @@ class SmartDubbing:
                     # Apply speed ratio to get actual positions in final audio
                     real_start_ms = position_ms + (seg_pos["start_in_group_ms"] * ratio_clamped)
                     real_end_ms = position_ms + (seg_pos["end_in_group_ms"] * ratio_clamped)
+                    # Clamp to the trimmed group end if overflow was restricted
+                    group_final_end_ms = position_ms + final_group_duration_ms
+                    if real_end_ms > group_final_end_ms:
+                        real_end_ms = group_final_end_ms
+                    if real_start_ms > group_final_end_ms:
+                        real_start_ms = group_final_end_ms
                     
                     real_segment_positions.append({
                         "start": real_start_ms / 1000.0,
@@ -1590,8 +1616,21 @@ class SmartDubbing:
             Path for the subtitle file in current working directory
         """
         input_file = Path(input_path)
-        filename = f"{input_file.stem}_{language}.srt"
-        return filename  # Save in current working directory
+        # Base filenames for source and target
+        source_lang = self.config.get('source_language')
+        target_lang = self.config.get('target_language')
+        source_name = f"{input_file.stem}_{source_lang}.srt"
+        target_name = f"{input_file.stem}_{target_lang}.srt"
+
+        # If names coincide, disambiguate with explicit prefixes
+        if source_name == target_name:
+            if subtitle_type == "original":
+                return f"source_{source_name}"
+            else:
+                return f"target_{target_name}"
+
+        # Default: use requested language-specific filename
+        return f"{input_file.stem}_{language}.srt"
 
     def adjust_subtitle_timestamps(self, segments: List[Dict], pause_adjustments: List[Dict[str, float]]) -> List[Dict]:
         """Adjust subtitle timestamps based on pause adjustments from video processing.

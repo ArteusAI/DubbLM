@@ -100,3 +100,9 @@ artifacts/
 tmp/
 
 *.yml
+
+# Ignore Gemini voice stats file
+tts/samples/gemini/gemini_voice_stats.json
+
+# Ignore dubbing configuration file
+dubbing_config.yml

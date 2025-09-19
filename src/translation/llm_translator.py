@@ -3,6 +3,7 @@ import time
 import json
 import os
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import math
@@ -867,6 +868,31 @@ Example JSON output:
         chunk_text = chunk["text"]
         original_speaker_texts = chunk["original_speaker_texts"]
         
+        # Short-circuit: if source and target languages are the same, skip LLM translation
+        # and pass through original text while still allowing later refinement.
+        if source_language == target_language:
+            chunk_start_time = time.perf_counter()
+            translated_pairs = [
+                {"speaker": pair["speaker"], "text": pair["text"]}
+                for pair in original_speaker_texts
+            ]
+            chunk["translated_pairs"] = translated_pairs
+            chunk["translation"] = "\n".join(
+                [f"{pair['speaker']}: {pair['text']}" for pair in translated_pairs]
+            )
+            chunk_end_time = time.perf_counter()
+            chunk["execution_time"] = chunk_end_time - chunk_start_time
+
+            if enable_cache:
+                cache_key = self._generate_cache_key(chunk_text, source_language, target_language)
+                self.translation_cache[cache_key] = {
+                    "translated_pairs": translated_pairs,
+                    "translation": chunk["translation"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._save_cache()
+            return
+
         # Check cache first if enabled
         if enable_cache:
             cache_key = self._generate_cache_key(chunk_text, source_language, target_language)
@@ -1378,9 +1404,7 @@ IMPORTANT: Respond in JSON format with an array of objects containing speaker an
 
             logger.debug(f"Refinement Debug mode enabled. Writing debug info to {session_dir}")
 
-        # For very small inputs, just return the original to avoid unnecessary processing
-        if len(translated_chunks) <= 1:
-            return translated_chunks
+        # Always perform refinement, even for a single chunk
             
         # Start timer for total refinement process
         total_start_time = time.perf_counter()
@@ -1893,6 +1917,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         desired_ratio: float,
         target_char_count: Optional[int] = None,
         context_info: Optional[Dict[str, Any]] = None,
+        refinement_persona: Optional[str] = None,
         max_attempts: int = 3,
     ) -> str:
         """Adjust a segment's text length using the refinement LLM.
@@ -1907,6 +1932,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             desired_ratio: Desired relative length factor compared to input text.
             target_char_count: Optional target character count hint.
             context_info: Optional context with 'domain' and 'tone'.
+            refinement_persona: Optional persona to use (overrides instance setting).
             max_attempts: Number of retries on transient failures.
 
         Returns:
@@ -1914,6 +1940,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         """
         if not self.is_available():
             return original_text
+
+        # Determine which persona to use
+        persona = refinement_persona or self.refinement_persona
+        if persona not in REFINEMENT_PROMPTS:
+            logger.warning(f"Warning: Persona '{persona}' not found. Defaulting to 'normal'.")
+            persona = "normal"
 
         # Clamp ratio to reasonable bounds to avoid extreme prompts
         safe_ratio = max(0.2, min(desired_ratio, 2.0))
@@ -1935,6 +1967,17 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 
         domain = (context_info or {}).get("domain", "general")
         tone = (context_info or {}).get("tone", "neutral")
+        themes = ', '.join((context_info or {}).get("themes", []))
+        terminology = ', '.join((context_info or {}).get("terminology", []))
+
+        # Extract persona-specific requirements from the refinement prompt
+        persona_requirements = ""
+        if persona in REFINEMENT_PROMPTS:
+            base_prompt = REFINEMENT_PROMPTS[persona]
+            # Extract the persona-specific requirements section
+            goals_match = re.search(r'# Persona-Specific Requirements:\s*(.*?)(?=\n# |$)', base_prompt, re.DOTALL)
+            if goals_match:
+                persona_requirements = f"# Persona-specific constraints:\n{goals_match.group(1).strip()}"
 
         prompt = LENGTH_ADJUST_PROMPT.format(
             source_language=source_language,
@@ -1944,6 +1987,9 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             glossary_section=glossary_section,
             domain=domain,
             tone=tone,
+            themes=themes,
+            terminology=terminology,
+            persona_requirements=persona_requirements,
             original_text=original_text,
         )
 
