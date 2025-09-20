@@ -76,9 +76,9 @@ class TTSFactory:
             "voice_prompt_mapping": voice_prompt,
             "prompt_prefix": prompt_prefix,
         }
-        # Provider-specific kwargs filtering
-        filtered_kwargs = dict(kwargs)
-        config_args.update(filtered_kwargs) # Pass through other kwargs like model
+        # Provider-specific kwargs filtering (drop None values)
+        filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None}
+        config_args.update(filtered_kwargs)  # Pass through other kwargs like model
 
         if isinstance(voice_config, str):
             config_args["default_voice"] = voice_config
@@ -136,8 +136,9 @@ class TTSFactory:
             if fallback is not None:
                 init_args["fallback_model"] = fallback
         
-        # Pass through any additional kwargs from TTSConfig (like 'device' for Coqui/F5)
-        init_args.update(config.kwargs)
+        # Pass through any additional kwargs from TTSConfig (drop None values)
+        if isinstance(config.kwargs, dict):
+            init_args.update({k: v for k, v in config.kwargs.items() if v is not None})
         
         try:
             tts_client = provider_class(**init_args)
