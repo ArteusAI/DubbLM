@@ -46,6 +46,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         whisper_model: str = "large-v3",
         transcription_system: str = "openai",
         cache_manager: Optional['CacheManager'] = None,
+        cost_tracker: Optional[Any] = None,
         **kwargs
     ):
         """
@@ -63,6 +64,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         self.whisper_model = whisper_model
         self.transcription_system = transcription_system
         self.cache_manager = cache_manager
+        self.cost_tracker = cost_tracker
         
         # Initialize OpenAI client if using OpenAI transcription
         if self.transcription_system == "openai":
@@ -699,6 +701,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             
             # Create a temporary filename for the converted audio
             temp_mp3_path = temp_dir / f"temp_whisper_{os.path.basename(audio_file)}.mp3"
+            converted_duration = None
             
             try:
                 # Load the audio file with pydub
@@ -706,6 +709,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
                 
                 # Convert to mono 16kHz 
                 audio_segment = audio_segment.set_frame_rate(16000).set_channels(1)
+                converted_duration = audio_segment.duration_seconds
                 
                 # Export as MP3 with 64kbit bitrate
                 audio_segment.export(
@@ -750,6 +754,8 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             
             # Convert OpenAI's format to our internal format
             records = self._process_transcript(transcript)
+            if self.cost_tracker and converted_duration:
+                self.cost_tracker.add_transcription_actual("openai", float(converted_duration))
         
         else:
             raise ValueError(f"Unsupported transcription system: {self.transcription_system}")
@@ -1120,4 +1126,3 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         whole_seconds = int(seconds % 60)
         milliseconds = int((seconds % 1) * 1000)
         return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
-

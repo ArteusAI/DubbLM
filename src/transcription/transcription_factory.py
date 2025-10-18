@@ -33,23 +33,29 @@ class TranscriptionFactory:
         Raises:
             ValueError: If the specified transcription system is not supported
         """
+        cost_tracker = kwargs.pop("cost_tracker", None)
+        transcriber_kwargs = dict(kwargs)
         if transcription_system == "whisperx":
             return WhisperXTranscriber(
                 source_language=source_language,
                 device=device,
-                **kwargs
+                **transcriber_kwargs
             )
         elif transcription_system == "pyannote_openai" or transcription_system == "openai":
+            if cost_tracker is not None:
+                transcriber_kwargs["cost_tracker"] = cost_tracker
             return PyAnnoteOpenAITranscriber(
                 source_language=source_language,
                 device=device,
-                **kwargs
+                **transcriber_kwargs
             )
         elif transcription_system == "assemblyai":
+            if cost_tracker is not None:
+                transcriber_kwargs["cost_tracker"] = cost_tracker
             return AssemblyAITranscriber(
                 source_language=source_language,
                 device=device,
-                **kwargs
+                **transcriber_kwargs
             )
         else:
             raise ValueError(f"Unsupported transcription system: {transcription_system}")

@@ -29,6 +29,13 @@ try:
 except ImportError:
     PYDUB_AVAILABLE = False
 
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    tiktoken = None
+    TIKTOKEN_AVAILABLE = False
+
 logger = get_logger(__name__)
 
 # Constants
@@ -67,6 +74,7 @@ class OpenAITTSWrapper(TTSInterface):
         default_voice: str = "alloy", # OpenAI voices: alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer
         embedding_model_device: Optional[str] = None,
         enable_voice_matching: bool = True,
+        cost_tracker: Optional[Any] = None,
         **kwargs: Any
     ):
         if not OPENAI_AVAILABLE:
@@ -82,12 +90,56 @@ class OpenAITTSWrapper(TTSInterface):
                                                        # Emotion can be hinted in the input text if model supports it implicitly.
         self._audio_cache: Dict[str, tuple[str, float]] = {}  # Maps cache_key to (file_path, duration)
         self._cache_dir = None
-        
+        self.cost_tracker = cost_tracker
+
         # Voice matching components
         self.enable_voice_matching = enable_voice_matching
         self.embedding_model_device = embedding_model_device
         self.audio_embedder: Optional[AudioEmbedder] = None
         self.voice_matcher: Optional[VoiceMatcher] = None
+
+    def _register_usage(
+        self,
+        usage_tracker: Optional[Dict[str, Any]],
+        model_name: str,
+        input_tokens: float = 0.0,
+        audio_seconds: float = 0.0,
+        output_tokens: float = 0.0
+    ) -> None:
+        """Accumulate token/audio usage in a simple dictionary tracker."""
+        if usage_tracker is None or not model_name:
+            return
+
+        models_map = usage_tracker.setdefault("models", {})
+        model_usage = models_map.setdefault(model_name, {})
+
+        if input_tokens:
+            model_usage["input_tokens"] = model_usage.get("input_tokens", 0.0) + float(input_tokens)
+        if output_tokens:
+            model_usage["output_tokens"] = model_usage.get("output_tokens", 0.0) + float(output_tokens)
+        if audio_seconds:
+            model_usage["audio_seconds"] = model_usage.get("audio_seconds", 0.0) + float(audio_seconds)
+
+    def _count_tokens(self, text: Optional[str]) -> int:
+        """Count tokens for billing using tiktoken."""
+        if not text:
+            return 0
+
+        if not (TIKTOKEN_AVAILABLE and tiktoken is not None):
+            raise RuntimeError("tiktoken is required for OpenAI TTS token counting. Install the 'tiktoken' package.")
+
+        encoding = None
+        try:
+            encoding = tiktoken.encoding_for_model(self.model)
+        except Exception:
+            encoding = None
+        if encoding is None:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        try:
+            return len(encoding.encode(text))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to tokenize text for model '{self.model}': {exc}")
 
     def set_voice_mapping(self, mapping: Dict[str, str]) -> None:
         self.voice_mapping = mapping
@@ -308,7 +360,8 @@ class OpenAITTSWrapper(TTSInterface):
         self,
         segment_data: TTSSegmentData,
         temp_output_path: str,
-        language: str # OpenAI generally auto-detects language from input text
+        language: str, # OpenAI generally auto-detects language from input text
+        usage_tracker: Optional[Dict[str, Any]] = None
     ) -> None:
         """Synthesizes a single segment and saves it to a temporary path."""
         if not self.client:
@@ -372,6 +425,8 @@ class OpenAITTSWrapper(TTSInterface):
                             # speed=segment_data.speed # OpenAI tts-1 supports speed from 0.25 to 4.0
                         )
                         response.write_to_file(chunk_file_path)
+                        token_count = self._count_tokens(chunk_text)
+                        self._register_usage(usage_tracker, self.model, input_tokens=token_count)
                         segment_audio_files.append(chunk_file_path)
                         if len(text_chunks_for_openai) > 1:
                             logger.debug(f"    OpenAI: Synthesized chunk {i+1}/{len(text_chunks_for_openai)} for {speaker_id}")
@@ -435,6 +490,7 @@ class OpenAITTSWrapper(TTSInterface):
 
         temp_dir = tempfile.mkdtemp(prefix="openai_segments_")
         alignments = []
+        usage_tracker: Dict[str, Any] = {"models": {}}
 
         try:
             for i, segment in enumerate(segments_data):
@@ -472,11 +528,12 @@ class OpenAITTSWrapper(TTSInterface):
                 # If not cached, synthesize normally
                 logger.info(f"OpenAI: Synthesizing segment {i+1}/{len(segments_data)} for speaker '{segment.speaker}'")
                 try:
-                    self._synthesize_single_segment(segment, segment_file_path, language)
+                    self._synthesize_single_segment(segment, segment_file_path, language, usage_tracker=usage_tracker)
                     
                     # Get duration of the synthesized audio
                     audio_segment = AudioSegment.from_mp3(segment_file_path)
                     duration = len(audio_segment) / 1000.0  # Convert to seconds
+                    self._register_usage(usage_tracker, self.model, audio_seconds=duration)
                     
                     # Cache the generated audio
                     if self._cache_dir:
@@ -511,6 +568,20 @@ class OpenAITTSWrapper(TTSInterface):
                     # Continue with other segments
             
             logger.info(f"OpenAI: Synthesized {len(alignments)} segments successfully")
+            if self.cost_tracker:
+                models_usage = usage_tracker.get("models", {}) if usage_tracker else {}
+                for model_name, metrics in models_usage.items():
+                    input_tok = metrics.get("input_tokens", 0.0)
+                    output_tok = metrics.get("output_tokens", 0.0)
+                    audio_sec = metrics.get("audio_seconds", 0.0)
+                    if input_tok or output_tok or audio_sec:
+                        self.cost_tracker.add_tts_actual(
+                            "openai",
+                            model=model_name,
+                            input_tokens=input_tok,
+                            output_tokens=output_tok,
+                            audio_seconds=audio_sec
+                        )
             return alignments
 
         finally:
@@ -598,11 +669,27 @@ class OpenAITTSWrapper(TTSInterface):
                 temp_path = tmp_file.name
             
             logger.debug(f"OpenAI: Generating audio to estimate duration for speaker {segment_data.speaker}")
-            self._synthesize_single_segment(segment_data, temp_path, language)
+            usage_tracker: Dict[str, Any] = {"models": {}}
+            self._synthesize_single_segment(segment_data, temp_path, language, usage_tracker=usage_tracker)
             
             # Get actual duration
             audio_segment = AudioSegment.from_mp3(temp_path)
             duration = len(audio_segment) / 1000.0  # Convert to seconds
+            self._register_usage(usage_tracker, self.model, audio_seconds=duration)
+
+            if self.cost_tracker:
+                for model_name, metrics in usage_tracker.get("models", {}).items():
+                    input_tok = metrics.get("input_tokens", 0.0)
+                    output_tok = metrics.get("output_tokens", 0.0)
+                    audio_sec = metrics.get("audio_seconds", 0.0)
+                    if input_tok or output_tok or audio_sec:
+                        self.cost_tracker.add_tts_actual(
+                            "openai",
+                            model=model_name,
+                            input_tokens=input_tok,
+                            output_tokens=output_tok,
+                            audio_seconds=audio_sec
+                        )
             
             # Cache the generated audio
             if self._cache_dir:

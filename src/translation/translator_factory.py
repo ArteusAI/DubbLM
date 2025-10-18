@@ -34,6 +34,7 @@ class TranslatorFactory:
         if translator_type == "llm":
             # Get LLM provider (gemini or openrouter)
             llm_provider = kwargs.get("llm_provider", "gemini")
+            cost_tracker = kwargs.get("cost_tracker")
             
             # Get translation model configuration parameters
             model_name = kwargs.get("model_name")
@@ -70,7 +71,8 @@ class TranslatorFactory:
                 glossary=glossary,
                 refinement_persona=refinement_persona,
                 prompt_prefix=translation_prompt_prefix,
-                cache_manager=cache_manager
+                cache_manager=cache_manager,
+                cost_tracker=cost_tracker
             )
                 
             # Initialize the translator

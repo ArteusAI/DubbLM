@@ -27,6 +27,8 @@ class PerformanceTracker:
             "video_creation": 0.0,
             "total": 0.0
         }
+        # Track associated monetary costs for each step (default to zero)
+        self.costs = {key: 0.0 for key in self.metrics}
         self._start_times = {}
     
     def start_timing(self, step_name: str) -> None:
@@ -61,6 +63,39 @@ class PerformanceTracker:
             duration: Duration in seconds
         """
         self.metrics[step_name] = duration
+
+    def add_cost(self, step_name: str, amount: float) -> None:
+        """Accumulate monetary cost for a pipeline step.
+
+        Args:
+            step_name: Name of the step
+            amount: Cost amount to add
+        """
+        if amount == 0:
+            return
+        if step_name not in self.costs:
+            self.costs[step_name] = 0.0
+        self.costs[step_name] += amount
+        if step_name != "total":
+            self.costs["total"] += amount
+
+    def set_cost(self, step_name: str, amount: float) -> None:
+        """Set monetary cost for a specific step (overwrites existing value)."""
+        if step_name not in self.costs:
+            self.costs[step_name] = 0.0
+        delta = amount - self.costs[step_name]
+        self.costs[step_name] = amount
+        if step_name != "total":
+            self.costs["total"] += delta
+
+    def set_costs(self, step_costs: Dict[str, float]) -> None:
+        """Replace multiple step costs in one call."""
+        for step_name, amount in (step_costs or {}).items():
+            if step_name == "total":
+                continue
+            self.set_cost(step_name, float(amount))
+        if "total" in (step_costs or {}):
+            self.costs["total"] = float(step_costs["total"])
     
     def get_metric(self, step_name: str) -> float:
         """Get a metric value.
@@ -86,8 +121,8 @@ class PerformanceTracker:
         
         # Display all recorded metrics
         summary_lines = []
-        summary_lines.append(f"{'Step':<25} {'Time (sec)':<15} {'Time (min)':<15} {'Percentage':<10}")
-        summary_lines.append("-" * 65)
+        summary_lines.append(f"{'Step':<25} {'Time (sec)':<15} {'Time (min)':<15} {'Cost ($)':<12} {'Percentage':<10}")
+        summary_lines.append("-" * 82)
         
         # Sort metrics: First key processing steps in pipeline order, then total at end
         step_order = [
@@ -100,11 +135,25 @@ class PerformanceTracker:
             time_sec = self.metrics.get(step, 0)
             time_min = time_sec / 60
             percentage = (time_sec / total_elapsed * 100) if total_elapsed > 0 else 0
-            summary_lines.append(f"{step.replace('_', ' ').title():<25} {time_sec:<15.2f} {time_min:<15.2f} {percentage:<10.1f}%")
+            cost_value = self.costs.get(step, 0.0)
+            summary_lines.append(
+                f"{step.replace('_', ' ').title():<25} "
+                f"{time_sec:<15.2f} "
+                f"{time_min:<15.2f} "
+                f"{cost_value:<12.4f} "
+                f"{percentage:<10.1f}%"
+            )
         
         # Add a separator before total
-        summary_lines.append("-" * 65)
-        summary_lines.append(f"{'Total Pipeline':<25} {total_elapsed:<15.2f} {total_elapsed/60:<15.2f} {100:<10.1f}%")
+        summary_lines.append("-" * 82)
+        total_cost = self.costs.get("total", sum(v for k, v in self.costs.items() if k != "total"))
+        summary_lines.append(
+            f"{'Total Pipeline':<25} "
+            f"{total_elapsed:<15.2f} "
+            f"{(total_elapsed/60):<15.2f} "
+            f"{total_cost:<12.4f} "
+            f"{100:<10.1f}%"
+        )
         
         # Calculate and display the processing speed relative to video duration
         if total_duration and total_duration > 0:
@@ -176,4 +225,6 @@ class PerformanceTracker:
         """Reset all metrics to zero."""
         for key in self.metrics:
             self.metrics[key] = 0.0
-        self._start_times.clear() 
+        for key in self.costs:
+            self.costs[key] = 0.0
+        self._start_times.clear()

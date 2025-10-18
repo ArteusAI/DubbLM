@@ -74,7 +74,12 @@ class DubbingConfig:
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
             'background_volume': 0.562341,
-            'group_overflow_tolerance': 1.0
+            'group_overflow_tolerance': 1.0,
+            'enable_emotion_enrichment': False,
+            'emotion_enrichment_model': 'gemini-2.5-pro',
+            'emotion_enrichment_temperature': 0.7,
+            'max_workers': 4,
+            'estimate_cost': False
         }
         
         # Required parameters that must come from CLI
@@ -261,6 +266,8 @@ class DubbingConfig:
         parser.add_argument('--include_original_audio', action='store_true', default=argparse.SUPPRESS, help='Include the original audio track in the final video')
         parser.add_argument('--output', type=str, help='Path to the output video file (default: input_name + target_language + extension in current directory)')
         parser.add_argument('--generate_speaker_report', action='store_true', default=argparse.SUPPRESS, help='Generate a report of identified speakers and their voice samples, then exit.')
+        parser.add_argument('--estimate_cost', action='store_true', default=argparse.SUPPRESS,
+                            help='Estimate pipeline cost using configured pricing and exit without running dubbing.')
         parser.add_argument('--tts_system_mapping', type=str, help='JSON string mapping speakers to TTS systems')
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
         parser.add_argument('--remove_pauses', type=lambda x: (str(x).lower() == 'true'), help='Remove small pauses from video while preserving keyframes (True/False)')

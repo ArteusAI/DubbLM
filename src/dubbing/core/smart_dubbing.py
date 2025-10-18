@@ -15,10 +15,13 @@ import torch
 import warnings
 import shutil
 import subprocess
+import random
 from typing import Dict, List, Tuple, Optional, Any, Literal, Union
 from pathlib import Path
 from dotenv import load_dotenv
 from pydub import AudioSegment
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Disable all warnings for a cleaner output.
 warnings.filterwarnings("ignore")
@@ -32,6 +35,7 @@ from ..video.video_processor import VideoProcessor
 from ..debug.performance_tracker import PerformanceTracker
 from ..debug.debug_generator import DebugGenerator
 from ..debug.reporter import SpeakerReporter
+from ..debug.cost_tracker import CostTracker
 from ..utils.subtitle_utils import SubtitleManager
 from .log_config import get_logger
 
@@ -83,6 +87,7 @@ class SmartDubbing:
             input_file=config.get('input')
         )
         self.performance_tracker = PerformanceTracker()
+        self.cost_tracker = CostTracker(config)
         
         # Initialize processors
         self.audio_processor = AudioProcessor(self.cache_manager, self.performance_tracker)
@@ -174,7 +179,8 @@ class SmartDubbing:
                 refinement_persona=self.config.get('refinement_persona', 'normal'),
                 translation_prompt_prefix=self.config.get('translation_prompt_prefix'),
                 glossary=self.config.get('glossary'),
-                cache_manager=self.cache_manager
+                cache_manager=self.cache_manager,
+                cost_tracker=self.cost_tracker
             )
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
@@ -195,7 +201,12 @@ class SmartDubbing:
                 enable_voice_matching=self.config.get('voice_auto_selection', True),
                 debug_tts=self.config.get('debug_tts', False),
                 model=self.config.get('tts_model'),
-                fallback_model=self.config.get('tts_fallback_model')
+                fallback_model=self.config.get('tts_fallback_model'),
+                enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                emotion_enrichment_model=self.config.get('emotion_enrichment_model'),
+                emotion_enrichment_temperature=self.config.get('emotion_enrichment_temperature'),
+                max_workers=self.config.get('max_workers', 4),
+                cost_tracker=self.cost_tracker
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance
@@ -212,7 +223,8 @@ class SmartDubbing:
                 source_language=self.config.get('source_language'),
                 device=self.device,
                 whisper_model=self.config.get('whisper_model', 'large-v3'),
-                cache_manager=self.cache_manager
+                cache_manager=self.cache_manager,
+                cost_tracker=self.cost_tracker
             )
             logger.debug(f"Initialized {self.transcriber.name} transcriber")
         except Exception as e:
@@ -233,6 +245,7 @@ class SmartDubbing:
                 self.config.get('start_time'),
                 self.config.get('duration')
             )
+            self.cost_tracker.set_audio_duration(self.audio_processor.get_total_duration())
             
             # Perform speaker diarization and transcription
             speakers_rolls, transcription = self.diarize_and_transcribe(audio_file)
@@ -380,9 +393,11 @@ class SmartDubbing:
             total_elapsed = time.perf_counter() - pipeline_start_time
             logger.info("Dubbing process completed!")
             self.performance_tracker.record_metric("total", total_elapsed)
+            self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
             
             # Write performance summary
             self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
+            self.cost_tracker.write_cost_summary()
             
         except Exception as e:
             logger.error(f"Error in dubbing pipeline: {e}", exc_info=True)
@@ -425,7 +440,9 @@ class SmartDubbing:
         
         # Write partial performance summary
         self.performance_tracker.record_metric("total", time.perf_counter() - self.performance_tracker._start_times.get("total", 0))
+        self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
         self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
+        self.cost_tracker.write_cost_summary()
         
         return debug_video_path
     
@@ -440,6 +457,7 @@ class SmartDubbing:
             self.config.get('start_time'),
             self.config.get('duration')
         )
+        self.cost_tracker.set_audio_duration(self.audio_processor.get_total_duration())
 
         # Perform speaker diarization and transcription
         speakers_rolls, transcription = self.diarize_and_transcribe(audio_file)
@@ -459,6 +477,7 @@ class SmartDubbing:
         # Write performance summary for this specific operation
         self.performance_tracker.record_metric("total_report_generation", time.perf_counter() - report_start_time)
         self.performance_tracker.record_metric("video_duration", self.audio_processor.get_total_duration() or 0)
+        self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
         self.performance_tracker.write_performance_summary_for_report()
         
         return report_file_path, samples_dir_path
@@ -852,6 +871,17 @@ class SmartDubbing:
                 # Prepare segment for synthesis with chosen text
                 final_segment_data = TTSSegmentData(**{**tts_segment_data_args, "text": best_text, "output_path": current_segment_output_path})
                 segments_to_synthesize_by_tts[tts_system].append(final_segment_data)
+
+                # Collect context from previous segments for emotion enrichment
+                previous_texts = []
+                if self.config.get('enable_emotion_enrichment', False):
+                    # Get up to 5 previous segments' texts
+                    for j in range(max(0, i - 5), i):
+                        prev_segment = segments[j]
+                        prev_text = prev_segment.get('translation', '')
+                        if prev_text:
+                            previous_texts.append(prev_text)
+
                 segments_metadata.append({
                     "index": i,
                     "segment_dict": segment_dict,
@@ -861,7 +891,8 @@ class SmartDubbing:
                     "estimated_ratio": best_ratio,
                     "tts_system": tts_system,
                     "segment_data_args": tts_segment_data_args,
-                    "selected_track_type": best_track_type  # Store the selected track type
+                    "selected_track_type": best_track_type,  # Store the selected track type
+                    "previous_context": previous_texts  # Add context for emotion enrichment
                 })
         
         # Second pass: Batch synthesize all segments by TTS system
@@ -1204,14 +1235,16 @@ class SmartDubbing:
             # Add this text to tried set
             tried_texts.add(alt_text)
 
-            # Create temporary output path for this alternative
-            temp_output_path = f"{output_path}.temp_{key}"
+            # Create temporary output path for this alternative with unique identifier
+            unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+            temp_output_path = f"{output_path}.temp_{key}_{unique_id}"
             new_segment_data = TTSSegmentData(**{**base_args, "text": alt_text, "output_path": temp_output_path})
 
             try:
                 tts_instance.synthesize(
                     segments_data=[new_segment_data],
-                    language=self.config.get('target_language')
+                    language=self.config.get('target_language'),
+                    previous_context=metadata.get('previous_context', [])
                 )
 
                 if not os.path.exists(temp_output_path):
@@ -1277,15 +1310,17 @@ class SmartDubbing:
                     )
 
                     if adjusted_text and adjusted_text.strip() and adjusted_text.strip() != baseline_text.strip():
-                        # Estimate duration and synthesize to temp file
-                        temp_output_path = f"{output_path}.temp_llm_adjusted"
+                        # Estimate duration and synthesize to temp file with unique identifier
+                        unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+                        temp_output_path = f"{output_path}.temp_llm_adjusted_{unique_id}"
                         from tts.models import TTSSegmentData
                         new_segment_data = TTSSegmentData(**{**base_args, "text": adjusted_text, "output_path": temp_output_path})
 
                         try:
                             tts_instance.synthesize(
                                 segments_data=[new_segment_data],
-                                language=self.config.get('target_language')
+                                language=self.config.get('target_language'),
+                                previous_context=metadata.get('previous_context', [])
                             )
 
                             if os.path.exists(temp_output_path):

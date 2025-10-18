@@ -28,17 +28,50 @@ class VoiceDurationStats(BaseModel):
     total_characters: int = Field(default=0, description="Total characters in all samples")
     total_duration_seconds: float = Field(default=0.0, description="Total duration of all samples in seconds")
     
-    def update_stats(self, words: int, characters: int, duration: float) -> None:
-        """Update statistics with new sample data."""
+    def update_stats(
+        self,
+        words: int,
+        characters: int,
+        duration: float,
+        smoothing_alpha: Optional[float] = None
+    ) -> None:
+        """Update statistics with new sample data.
+
+        Args:
+            words: Number of words in the new sample
+            characters: Number of characters in the new sample
+            duration: Duration of the new sample in seconds
+            smoothing_alpha: Optional smoothing factor (0-1). When provided,
+                applies exponential smoothing to derived rates instead of a pure average.
+        """
         self.total_samples += 1
         self.total_words += words
         self.total_characters += characters
         self.total_duration_seconds += duration
         
-        # Recalculate averages
-        if self.total_duration_seconds > 0:
-            self.words_per_minute = (self.total_words / self.total_duration_seconds) * 60
-            self.characters_per_second = self.total_characters / self.total_duration_seconds
+        if duration <= 0:
+            return
+
+        sample_words_per_minute = (words / duration) * 60 if duration > 0 else 0.0
+        sample_characters_per_second = characters / duration if duration > 0 else 0.0
+
+        use_smoothing = smoothing_alpha is not None and smoothing_alpha > 0
+        if use_smoothing and self.total_samples > 1:
+            alpha = max(0.0, min(1.0, smoothing_alpha))
+            # Apply exponential smoothing to derived rates
+            self.words_per_minute = (
+                (1 - alpha) * self.words_per_minute + alpha * sample_words_per_minute
+            )
+            self.characters_per_second = (
+                (1 - alpha) * self.characters_per_second + alpha * sample_characters_per_second
+            )
+        else:
+            if self.total_duration_seconds > 0:
+                self.words_per_minute = (self.total_words / self.total_duration_seconds) * 60
+                self.characters_per_second = self.total_characters / self.total_duration_seconds
+            else:
+                self.words_per_minute = sample_words_per_minute
+                self.characters_per_second = sample_characters_per_second
 
 
 class VoiceDurationDatabase(BaseModel):
@@ -55,10 +88,17 @@ class VoiceDurationDatabase(BaseModel):
             )
         return self.voice_stats[voice_name]
     
-    def update_voice_stats(self, voice_name: str, words: int, characters: int, duration: float) -> None:
+    def update_voice_stats(
+        self,
+        voice_name: str,
+        words: int,
+        characters: int,
+        duration: float,
+        smoothing_alpha: Optional[float] = None
+    ) -> None:
         """Update statistics for a voice with new sample data."""
         stats = self.get_or_create_stats(voice_name)
-        stats.update_stats(words, characters, duration)
+        stats.update_stats(words, characters, duration, smoothing_alpha=smoothing_alpha)
 
 
 class DiarizationSegment(BaseModel):
@@ -80,4 +120,3 @@ class SegmentAlignment(BaseModel):
     original_segment: TTSSegmentData = Field(..., description="Original segment from input")
     diarized_segment: DiarizationSegment = Field(..., description="Corresponding diarized segment")
     alignment_confidence: float = Field(..., description="Confidence of this alignment")
-

@@ -23,6 +23,7 @@ class TTSConfig:
         voice_mapping: Optional[Dict[str, str]] = None,
         voice_prompt_mapping: Optional[Dict[str, str]] = None,
         prompt_prefix: Optional[str] = None,
+        cost_tracker: Optional[Any] = None,
         **kwargs: Any
     ):
         self.provider = provider
@@ -31,6 +32,7 @@ class TTSConfig:
         self.voice_mapping = voice_mapping if voice_mapping is not None else {}
         self.voice_prompt_mapping = voice_prompt_mapping if voice_prompt_mapping is not None else {}
         self.prompt_prefix = prompt_prefix
+        self.cost_tracker = cost_tracker
         self.kwargs = kwargs # Store any additional provider-specific args
 
 class TTSFactory:
@@ -77,8 +79,9 @@ class TTSFactory:
             "prompt_prefix": prompt_prefix,
         }
         # Provider-specific kwargs filtering (drop None values)
-        filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None}
+        filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None and k != "cost_tracker"}
         config_args.update(filtered_kwargs)  # Pass through other kwargs like model
+        config_args["cost_tracker"] = kwargs.get("cost_tracker")
 
         if isinstance(voice_config, str):
             config_args["default_voice"] = voice_config
@@ -126,6 +129,8 @@ class TTSFactory:
             init_args["model"] = config.model
         if config.default_voice is not None:
             init_args["default_voice"] = config.default_voice
+        if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini"):
+            init_args["cost_tracker"] = config.cost_tracker
         
         # Add provider-specific args
         if provider_name_lower == "gemini":

@@ -14,7 +14,12 @@ except ImportError:
     json_repair = None
 
 from translation.translation_interface import TranslationInterface
-from translation.prompts import REFINEMENT_PROMPTS, LENGTH_ADJUST_PROMPT
+from translation.prompts import (
+    REFINEMENT_PROMPTS,
+    LENGTH_ADJUST_PROMPT,
+    CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
+    TRANSLATION_PROMPT_TEMPLATE,
+)
 from src.dubbing.core.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -40,6 +45,14 @@ try:
     JSON_REPAIR_AVAILABLE = True
 except ImportError:
     JSON_REPAIR_AVAILABLE = False
+
+# Token counting for billing calculations
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    tiktoken = None
+    TIKTOKEN_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -67,6 +80,7 @@ class LLMTranslator(TranslationInterface):
         refinement_persona: str = "manager",
         cache_manager: Optional['CacheManager'] = None,
         prompt_prefix: Optional[str] = None,
+        cost_tracker: Optional[Any] = None,
     ):
         """
         Initialize LLM translator.
@@ -88,6 +102,7 @@ class LLMTranslator(TranslationInterface):
             glossary: Dictionary mapping source terms to their desired translations
             refinement_persona: The persona to use for the refinement prompt ("manager", "child", "tractor_driver")
             cache_manager: Cache manager instance for organized caching
+            cost_tracker: Optional cost tracker for recording LLM usage
         """
         self.llm_provider = llm_provider
         self.temperature = temperature
@@ -125,6 +140,7 @@ class LLMTranslator(TranslationInterface):
         
         self.llm = None
         self.refinement_llm = None
+        self.cost_tracker = cost_tracker
         
     def initialize(self) -> None:
         """Initialize the LLM translation system."""
@@ -228,6 +244,49 @@ class LLMTranslator(TranslationInterface):
                 raise RuntimeError(f"Failed to initialize OpenRouter LLM for {purpose}: {str(e)}")
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}. Use 'gemini' or 'openrouter'.")
+
+    def _count_tokens(self, model_name: Optional[str], text: Optional[str]) -> int:
+        """Count tokens for usage billing, leveraging tiktoken when available."""
+        if not text:
+            return 0
+
+        if not (TIKTOKEN_AVAILABLE and tiktoken is not None):
+            raise RuntimeError("tiktoken is required for token counting. Install the 'tiktoken' package.")
+
+        encoding = None
+        if model_name:
+            try:
+                encoding = tiktoken.encoding_for_model(model_name)
+            except KeyError:
+                encoding = None
+        if encoding is None:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        try:
+            return len(encoding.encode(text))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to tokenize text for model '{model_name}': {exc}")
+
+    def _record_llm_cost(
+        self,
+        provider: str,
+        model_name: Optional[str],
+        prompt_text: Optional[str],
+        response_text: Optional[str]
+    ) -> None:
+        """Record usage metrics for a single LLM call via the cost tracker."""
+        if not self.cost_tracker:
+            return
+
+        input_tokens = self._count_tokens(model_name, prompt_text)
+        output_tokens = self._count_tokens(model_name, response_text)
+        if input_tokens == 0 and output_tokens == 0:
+            return
+
+        try:
+            self.cost_tracker.add_translation_actual(provider, model_name, input_tokens, output_tokens)
+        except Exception as exc:
+            logger.warning(f"Failed to record translation cost for provider {provider}: {exc}")
             
     def _load_cache(self) -> None:
         """Load translation cache from disk if it exists."""
@@ -355,65 +414,13 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 """ if self.prompt_prefix else ""
 
         # Combine context analysis and initial summarization in one prompt
-        combined_prompt = f"""
-Analyze the following transcript in "{source_language}" language and provide:
-
-1. Context Analysis:
-   - The general topic or domain (e.g., medical, technical, casual conversation)
-   - Any specialized terminology or jargon (e.g., AI, machine learning, deep learning, etc. list all of them)
-   - The overall tone or style of speech
-   - Key themes or subjects discussed
-
-2. Transcript Summary:
-   - Identify logical chapters/sections based on topic shifts.
-   - For long transcripts (e.g., over 30 minutes), aim to create chapters that cover approximately 15-20 minutes of content each, while still following logical topic shifts.
-   - For each chapter/section, provide a clear title and brief summary (2-3 sentences).
-   - Assign approximate timecodes for each chapter (use format "HH:MM:SS" for start_time).
-   - Write a comprehensive overall summary (3-5 sentences) describing the main topics and flow of the content, suitable for use as a video description.
-
-{glossary_section}
-{additional_context_section}
-
-IMPORTANT: Create the summary in "{target_language}" language.
-
-Transcript (format: [HH:MM:SS] SPEAKER: text):
-<transcript>
-{all_text}
-</transcript>
-
-IMPORTANT: Create the summary in "{target_language}" language.
-
-Provide your analysis in JSON format with these keys: 
-domain, terminology, tone, themes, chapters, overall_summary
-
-For chapters, include title, summary, and start_time for each chapter.
-
-Example JSON output:
-{{
-    "domain": "technology",
-    "terminology": ["API", "LLM", "vector database"],
-    "tone": "informative",
-    "themes": ["artificial intelligence", "software development"],
-    "chapters": [
-        {{
-            "title": "Introduction to AI",
-            "summary": "Brief overview of artificial intelligence concepts.",
-            "start_time": "00:00:00"
-        }},
-        {{
-            "title": "Machine Learning Applications",
-            "summary": "Discussion of real-world applications of machine learning.",
-            "start_time": "00:18:45" 
-        }},
-        {{
-            "title": "Future Trends",
-            "summary": "Exploring upcoming advancements in AI.",
-            "start_time": "00:35:10"
-        }}
-    ],
-    "overall_summary": "This video provides a comprehensive overview of artificial intelligence, starting with fundamental concepts, moving into practical machine learning applications across various industries, and concluding with a look at future trends and the potential impact of AI development."
-}}
-"""
+        combined_prompt = CONTEXT_ANALYSIS_PROMPT_TEMPLATE.format(
+            source_language=source_language,
+            target_language=target_language,
+            glossary_section=glossary_section,
+            additional_context_section=additional_context_section,
+            transcript_body=all_text,
+        )
         
         try:
             result = self.llm.complete(combined_prompt)
@@ -421,6 +428,8 @@ Example JSON output:
                 response_text = result.text
             else:
                 response_text = str(result)
+            
+            self._record_llm_cost(self.llm_provider, self.model_name, combined_prompt, response_text)
             
             # Extract JSON from the response
             try:
@@ -949,92 +958,20 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 """ if self.prompt_prefix else ""
 
         # Build prompt with context information
-        prompt = f"""
-You are a professional translator specializing in {context_info['domain']} content.
-
-Translate the following transcript of a conversation from '{source_language}' language to '{target_language}' language.
-
-Preserve the meaning, tone, and style of the original.
-
-# General rules:
-1. Do not translate proper names, brand names, and abbreviations (e.g., LLM, API, etc.) - instead
-2. Translatable terms: AI -> ИИ
-3. Number and Date Conversion: Convert all digits and numbers to their written form in the target language as they would be naturally spoken aloud.
-4. Remember this translation will be used for audio dubbing, so ensure the text flows naturally when spoken
-5. Maintain the speaker identifiers exactly as given
-6. Preserve the conversational flow and natural dialogue tone - don't make it sound too formal or robotic
-7. Keep the emotional tone of the original speech (excited, concerned, questioning, etc.)
-8. Ensure NO details or nuances from the original text are lost in translation - preserve
-9. Pay special attention to {context_info['domain']} terminology. all information, examples, technical concepts, and specific details accurately.
-10. Preserve the original structure of the conversation, number of lines, and number of speakers.
-
-{glossary_section}
-{custom_section}
-
-# Special handling for filler words and conciseness:
-1. Remove any filler words (e.g., 'um', 'uh', 'like', 'you know', 'Итак...' etc.) from the translation to make it sound more fluent and professional. 
-2. When removing filler words results in a significantly shorter translation, use the freed-up space to:
-   - Expand on technical concepts for better clarity
-   - Add natural connecting phrases to improve flow
-   - Provide slightly more context where the original might be too terse
-   - Make implicit ideas more explicit when appropriate
-3. The goal is a natural-sounding translation that conveys the full meaning, not just a direct word-for-word conversion
-4. Balance conciseness with comprehensiveness - the translation should be clear and complete
-
-# When you detect humor, jokes, puns, or wordplay:
-1. Try to preserve the humor in the target language
-2. If a direct translation would lose the humor, adapt it to an equivalent joke in the target language
-3. If a cultural reference wouldn't make sense, replace it with a similar reference that would be understood by speakers of the target language
-4. For wordplay that can't be directly translated, focus on preserving the comedic effect rather than the exact words
-
-# Length considerations for audio dubbing:
-1. Try to maintain a similar length between the original and translated text
-2. This is crucial for audio dubbing, as the translated speech needs to fit within the same time constraints as the original
-3. If the translation would naturally be much longer:
-   - Look for more concise ways to express the same ideas
-   - Remove redundancies while preserving all information
-   - Use more compact phrasing where possible
-4. If the translation would naturally be much shorter:
-   - Add natural filler phrases that enhance clarity
-   - Expand slightly on concepts where appropriate
-   - Use more descriptive language while maintaining the original meaning
-5. The goal is to have the translated audio match the timing of the original speech as closely as possible
-
-# Translation considerations:
-- Domain: {context_info['domain']}
-- Tone: {context_info['tone']}
-- Key themes: {', '.join(context_info['themes'])}
-- Technical terms: {', '.join(context_info['terminology'])}
-{summary_section}
-
-# Following is the context of the conversation:
-
-Context before:
-<context_before>
-{context_before}
-</context_before>
-
-Text to translate:
-<text_to_translate>
-{chunk_text}
-</text_to_translate>
-
-Context after:
-<context_after>
-{context_after}
-</context_after>
-
-CRITICAL: Output tanslation should contain same number of rows and original speaker names. If phrase is not translatable, leave blank.
-
-IMPORTANT: Respond in JSON format with an array of objects containing speaker and translated text:
-{{
-    "translations": [
-        {{"speaker": "SPEAKER_00", "text": "translated text 1"}},
-        {{"speaker": "SPEAKER_01", "text": "translated text 2"}},
-        ...
-    ]
-}}
-"""
+        prompt = TRANSLATION_PROMPT_TEMPLATE.format(
+            domain=context_info.get('domain', 'general'),
+            source_language=source_language,
+            target_language=target_language,
+            glossary_section=glossary_section,
+            custom_section=custom_section,
+            tone=context_info.get('tone', 'neutral'),
+            themes=', '.join(context_info.get('themes', [])),
+            terminology=', '.join(context_info.get('terminology', [])),
+            context_before=context_before,
+            text_to_translate=chunk_text,
+            context_after=context_after,
+            summary_section=summary_section,
+        )
 
         # Start timer for this chunk's translation
         chunk_start_time = time.perf_counter()
@@ -1052,6 +989,8 @@ IMPORTANT: Respond in JSON format with an array of objects containing speaker an
                     translation_text = translation.text.strip()
                 else:
                     translation_text = str(translation).strip()
+
+                self._record_llm_cost(self.llm_provider, self.model_name, prompt, translation_text)
                 
                 # Check if translation is empty
                 if not translation_text:
@@ -1534,6 +1473,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     else: # openrouter
                         llm_response_text = str(refinement_response).strip()
 
+                    self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, effective_refinement_prompt, llm_response_text)
+
                     if not llm_response_text:
                         if attempt < max_attempts - 1:
                             logger.warning(f"Empty refinement response received, retrying ({attempt+1}/{max_attempts})...")
@@ -1998,6 +1939,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             try:
                 response = self.refinement_llm.complete(prompt)
                 response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
+                self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, prompt, response_text)
                 if not response_text:
                     continue
 

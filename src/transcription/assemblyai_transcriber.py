@@ -28,6 +28,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         convert_to_mp3: bool = True,
         mp3_bitrate: str = "128k",
         mp3_size_threshold_mb: int = 20,
+        cost_tracker: Optional[Any] = None,
         **kwargs
     ):
         """
@@ -49,6 +50,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         self.convert_to_mp3 = convert_to_mp3
         self.mp3_bitrate = mp3_bitrate
         self.mp3_size_threshold_mb = mp3_size_threshold_mb
+        self.cost_tracker = cost_tracker
         
         # Get API key from environment
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -232,6 +234,7 @@ class AssemblyAITranscriber(BaseTranscriber):
             config = self.aai.TranscriptionConfig(
                 speech_model=getattr(self.aai.SpeechModel, self.speech_model),
                 speaker_labels=True,  # Enable speaker diarization
+                #speakers_expected=2,
                 language_code=self.source_language,
                 word_boost=None,  # Can be configured if needed
                 boost_param="default"  # Can be configured if needed
@@ -264,6 +267,13 @@ class AssemblyAITranscriber(BaseTranscriber):
                     "transcription": transcription
                 }
                 self.cache_manager.save_to_cache(step_name, cache_key, results_to_cache)
+
+            if self.cost_tracker:
+                audio_seconds = getattr(transcript, "audio_duration", None)
+                if not audio_seconds and transcription:
+                    audio_seconds = max((seg.get("end", 0.0) for seg in transcription), default=0.0)
+                if audio_seconds:
+                    self.cost_tracker.add_transcription_actual("assemblyai", float(audio_seconds))
             
             logger.info(f"AssemblyAI transcription completed successfully")
             logger.debug(f"Identified {len(set(speakers_rolls.values()))} speakers")

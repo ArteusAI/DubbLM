@@ -9,6 +9,8 @@ import shutil
 import hashlib
 from pathlib import Path
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from .models import (
     TTSSegmentData, 
@@ -46,6 +48,13 @@ try:
     LIBROSA_AVAILABLE = True
 except ImportError:
     LIBROSA_AVAILABLE = False
+
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    tiktoken = None
+    TIKTOKEN_AVAILABLE = False
 
 logger = get_logger(__name__)
 
@@ -93,6 +102,13 @@ class GeminiTTSConfig(BaseModel):
     retry_delay_base: float = 2.0
     prompt_prefix: str = "Read aloud in a calm, articulate manner with natural pacing and avoid unnecessary emotions or dramatic emphasis:"
     enable_audio_validation: bool = True  # Allow disabling validation for debugging
+    enable_emotion_enrichment: bool = False  # Enable emotion enrichment using LLM
+    emotion_enrichment_model: str = "gemini-2.5-pro"  # Model for emotion enrichment
+    emotion_enrichment_temperature: float = 0.7  # Temperature for emotion enrichment
+    max_workers: int = 4  # Maximum number of parallel workers for segment synthesis
+    duration_smoothing_alpha: float = 0.35  # EMA smoothing factor for runtime stats
+    duration_stats_auto_save: bool = True  # Persist runtime stats automatically
+    duration_stats_save_interval: int = 20  # Save after this many updates
 
 
 class AudioFileUtils:
@@ -464,6 +480,147 @@ class GeminiAPIClient:
         return b''
 
 
+class EmotionEnricher:
+    """Enriches text with emotional markup tags using Gemini LLM."""
+
+    def __init__(self, config: GeminiTTSConfig):
+        """
+        Initialize the EmotionEnricher.
+
+        Args:
+            config: GeminiTTS configuration with enrichment settings
+        """
+        self.config = config
+        self.llm = None  # Will be initialized with llama_index Gemini
+
+    def initialize(self) -> None:
+        """Initialize the Gemini LLM for emotion enrichment using llama_index."""
+        try:
+            from llama_index.llms.gemini import Gemini
+        except ImportError:
+            logger.error("llama_index.llms.gemini not available for emotion enrichment")
+            return
+
+        import os
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.error("GOOGLE_API_KEY not found for emotion enrichment")
+            return
+
+        try:
+            self.llm = Gemini(
+                model=self.config.emotion_enrichment_model,
+                temperature=self.config.emotion_enrichment_temperature
+            )
+            logger.info(f"Emotion enrichment LLM initialized with model: {self.config.emotion_enrichment_model}")
+        except Exception as e:
+            logger.error(f"Failed to initialize emotion enrichment LLM: {e}")
+            self.llm = None
+
+    @property
+    def enrichment_prompt(self) -> str:
+        """Get the enrichment prompt template."""
+        return """You are an expert at enriching text with emotional markup tags for text-to-speech synthesis.
+
+Your task is to analyze the given text IN CONTEXT of the conversation and add appropriate markup tags to make the speech sound more natural and emotionally expressive.
+
+Available markup tags:
+1. Non-speech sounds: [sigh], [laughing], [chuckle], [uhm], [gasp], [clearing throat]
+2. Style modifiers: [sarcasm], [robotic], [shouting], [whispering], [excited], [calm]
+3. Vocalized emotions: [scared], [curious], [bored], [angry], [happy], [sad], [surprised]
+4. Pacing: [short pause], [medium pause], [long pause]
+
+Guidelines:
+- Use tags sparingly and only where they genuinely enhance the delivery
+- Consider the conversational context to understand the emotional tone
+- Place style modifiers at the beginning of relevant phrases
+- Use pauses for natural rhythm and emphasis
+- Non-speech sounds should feel natural and contextually appropriate
+- DO NOT overuse tags - subtlety is key
+- Preserve the original text exactly, only add markup tags where appropriate
+
+{context_section}
+
+Current text to enrich:
+{text}
+
+Return ONLY the enriched version of the CURRENT text with markup tags. Do not add explanations, comments, or repeat the context."""
+
+    def enrich_text(self, text: str, previous_segments: Optional[List[str]] = None) -> str:
+        """
+        Enrich text with emotional markup tags using conversation context.
+
+        Args:
+            text: The current text to enrich
+            previous_segments: List of previous text segments for context (up to 3-5 recent segments)
+
+        Returns:
+            Text enriched with markup tags
+        """
+        if not text or not text.strip():
+            logger.debug("Emotion enrichment: Empty text provided, skipping")
+            return text
+
+        try:
+            logger.debug(f"Emotion enrichment: Starting enrichment for text: '{text[:50]}...'")
+
+            # Build context section from previous segments
+            context_section = ""
+            if previous_segments and len(previous_segments) > 0:
+                context_lines = "\n".join([f"- {seg}" for seg in previous_segments[-5:]])  # Use last 5 segments
+                context_section = f"Previous conversation context:\n{context_lines}\n"
+                logger.debug(f"Emotion enrichment: Using {len(previous_segments[-5:])} previous segments as context")
+            else:
+                logger.debug("Emotion enrichment: No previous segments for context")
+
+            # Check if LLM is initialized
+            if not self.llm:
+                logger.warning("Emotion enrichment: LLM not initialized. Using original text.")
+                return text
+
+            # Build the prompt
+            prompt = self.enrichment_prompt.format(
+                context_section=context_section,
+                text=text
+            )
+            logger.debug(f"Emotion enrichment: Calling API with model {self.config.emotion_enrichment_model}")
+
+            # Call Gemini API for text enrichment using llama_index (same as translator)
+            response = self.llm.complete(prompt)
+
+            logger.debug(f"Emotion enrichment: Response received - type: {type(response)}, has text: {hasattr(response, 'text') if response else False}")
+
+            # Extract response text (same pattern as llm_translator.py)
+            if hasattr(response, "text"):
+                response_text = response.text
+            else:
+                response_text = str(response)
+
+            logger.debug(f"Emotion enrichment: Response text exists, length: {len(response_text) if response_text else 0}")
+
+            if response_text:
+                enriched_text = response_text.strip()
+                logger.debug(f"Emotion enrichment: Enriched text after strip: '{enriched_text[:100]}...'")
+
+                # Basic validation: ensure the enriched text is not empty and not too different
+                if enriched_text and len(enriched_text) <= len(text) * 3:
+                    logger.debug(f"Emotion enrichment SUCCESS:\n  Original: {text}\n  Enriched: {enriched_text}")
+                    return enriched_text
+                else:
+                    logger.warning(f"Emotion enrichment: Text validation failed - empty: {not enriched_text}, too long: {len(enriched_text) > len(text) * 3}")
+                    logger.warning(f"Enriched text seems invalid (too long or empty). Using original text.")
+                    logger.debug(f"  Original: {text}\n  Enriched: {enriched_text}")
+                    return text
+            else:
+                logger.warning("Emotion enrichment: Response text is empty/None. Using original text.")
+                return text
+
+        except Exception as e:
+            logger.error(f"Error during text enrichment: {e}", exc_info=True)
+            logger.error(f"Exception type: {type(e).__name__}, args: {e.args}")
+            return text
+
+
 class SpeechConfigBuilder:
     """Builds speech configurations for different scenarios."""
     
@@ -484,6 +641,31 @@ class SampleManager:
         self.api_client = api_client
         self.voice_matcher = voice_matcher
         self.duration_database = VoiceDurationDatabase()
+    
+    def save_duration_stats(self, preserve_embeddings: bool = True) -> None:
+        """Persist current duration statistics (and optionally embeddings) to disk."""
+        try:
+            embeddings_data: Dict[str, Any] = {}
+            if preserve_embeddings and DURATION_STATS_FILE.exists():
+                try:
+                    with open(DURATION_STATS_FILE, 'r', encoding='utf-8') as f:
+                        existing_data = json.load(f)
+                        embeddings_data = existing_data.get("embeddings", {})
+                except Exception as load_exc:
+                    logger.warning(f"Could not load existing duration stats for merge: {load_exc}")
+
+            combined_data = {
+                "voice_stats": self.duration_database.dict(),
+                "embeddings": embeddings_data
+            }
+
+            DURATION_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(DURATION_STATS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(combined_data, f, indent=2, ensure_ascii=False)
+
+            logger.debug(f"Saved runtime duration stats for {len(self.duration_database.voice_stats)} voices")
+        except Exception as save_exc:
+            logger.error(f"Error saving runtime duration stats: {save_exc}")
 
     def generate_sample_with_validation(self, voice_name: str, sample_file_path: Path,
                                       max_retries_per_model: int = 3) -> bool:
@@ -767,40 +949,119 @@ class GeminiTTSWrapper(TTSInterface):
         enable_audio_validation: bool = True,
         prompt_prefix: Optional[str] = None,
         debug_tts: bool = False,
+        enable_emotion_enrichment: bool = False,
+        emotion_enrichment_model: Optional[str] = None,
+        emotion_enrichment_temperature: Optional[float] = None,
+        max_workers: Optional[int] = None,
+        duration_smoothing_alpha: Optional[float] = None,
+        duration_stats_auto_save: Optional[bool] = None,
+        duration_stats_save_interval: Optional[int] = None,
+        cost_tracker: Optional[Any] = None,
     ):
         """Initialize Gemini TTS wrapper."""
         if not GEMINI_AVAILABLE:
             raise ImportError("Google GenAI SDK is not installed.")
 
-        self.config = GeminiTTSConfig(
-            model=model,
-            fallback_model=fallback_model,
-            default_voice=default_voice,
-            embedding_model_device=embedding_model_device,
-            enable_voice_matching=enable_voice_matching,
-            enable_audio_validation=enable_audio_validation,
-            prompt_prefix=prompt_prefix or ""
-        )
+        config_kwargs: Dict[str, Any] = {
+            "model": model,
+            "fallback_model": fallback_model,
+            "default_voice": default_voice,
+            "embedding_model_device": embedding_model_device,
+            "enable_voice_matching": enable_voice_matching,
+            "enable_audio_validation": enable_audio_validation,
+            "prompt_prefix": prompt_prefix or "",
+            "enable_emotion_enrichment": enable_emotion_enrichment,
+            "emotion_enrichment_model": emotion_enrichment_model or "gemini-2.5-pro",
+            "emotion_enrichment_temperature": emotion_enrichment_temperature if emotion_enrichment_temperature is not None else 0.7,
+        }
+        if max_workers is not None:
+            config_kwargs["max_workers"] = max_workers
+        if duration_smoothing_alpha is not None:
+            config_kwargs["duration_smoothing_alpha"] = duration_smoothing_alpha
+        if duration_stats_auto_save is not None:
+            config_kwargs["duration_stats_auto_save"] = duration_stats_auto_save
+        if duration_stats_save_interval is not None:
+            config_kwargs["duration_stats_save_interval"] = duration_stats_save_interval
+
+        self.config = GeminiTTSConfig(**config_kwargs)
         # Save rejected/silent attempts when debugging is enabled
         self.debug_save_rejected: bool = debug_tts
-        
+
         # Initialize components
         self.api_client = GeminiAPIClient(self.config)
-        
+
         audio_embedder = None
         if enable_voice_matching:
             audio_embedder = AudioEmbedder(device=embedding_model_device)
-        
+
         self.voice_matcher = VoiceMatcher(audio_embedder, enable_voice_matching)
         self.sample_manager = SampleManager(self.api_client, self.voice_matcher)
-        
+
+        # Emotion enricher (will be initialized after API client is ready)
+        self.emotion_enricher: Optional[EmotionEnricher] = None
+
         # Voice mappings
         self.voice_mapping: Dict[str, str] = {}
         self.voice_prompt_mapping: Dict[str, str] = {}
-        
+
         # Audio cache similar to OpenAI
         self._audio_cache: Dict[str, tuple[str, float]] = {}  # Maps cache_key to (file_path, duration)
         self._cache_dir = None
+        self._duration_stats_lock = threading.Lock()
+        self._stats_update_counter = 0
+        self.cost_tracker = cost_tracker
+
+    def _register_usage(
+        self,
+        usage_tracker: Optional[Dict[str, Any]],
+        model_name: str,
+        input_tokens: float = 0.0,
+        audio_seconds: float = 0.0,
+        output_tokens: float = 0.0
+    ) -> None:
+        """Thread-safe accumulation of TTS usage metrics per model."""
+        if not usage_tracker or not model_name:
+            return
+
+        models_map = usage_tracker.setdefault("models", {})
+
+        def _update(target: Dict[str, float]) -> None:
+            if input_tokens:
+                target["input_tokens"] = target.get("input_tokens", 0.0) + float(input_tokens)
+            if output_tokens:
+                target["output_tokens"] = target.get("output_tokens", 0.0) + float(output_tokens)
+            if audio_seconds:
+                target["audio_seconds"] = target.get("audio_seconds", 0.0) + float(audio_seconds)
+
+        lock = usage_tracker.get("lock")
+        if lock:
+            with lock:
+                model_usage = models_map.setdefault(model_name, {})
+                _update(model_usage)
+        else:
+            model_usage = models_map.setdefault(model_name, {})
+            _update(model_usage)
+
+    def _count_tokens(self, text: Optional[str]) -> int:
+        """Count tokens for billing, using tiktoken when possible."""
+        if not text:
+            return 0
+
+        if not (TIKTOKEN_AVAILABLE and tiktoken is not None):
+            raise RuntimeError("tiktoken is required for Gemini TTS token counting. Install the 'tiktoken' package.")
+
+        encoding = None
+        try:
+            encoding = tiktoken.encoding_for_model(self.config.model)
+        except Exception:
+            encoding = None
+        if encoding is None:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        try:
+            return len(encoding.encode(text))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to tokenize text for model '{self.config.model}': {exc}")
 
     def set_voice_mapping(self, mapping: Dict[str, str]) -> None:
         """Set a mapping of speaker IDs to Gemini voice names."""
@@ -815,10 +1076,28 @@ class GeminiTTSWrapper(TTSInterface):
     def initialize(self) -> None:
         """Initialize the Gemini TTS system."""
         self.api_client.initialize()
-        
+
         # Create cache directory
         self._cache_dir = tempfile.mkdtemp(prefix="gemini_tts_cache_")
         logger.debug(f"Gemini audio cache directory: {self._cache_dir}")
+
+        # Initialize emotion enricher if enabled
+        if self.config.enable_emotion_enrichment:
+            try:
+                self.emotion_enricher = EmotionEnricher(self.config)
+                self.emotion_enricher.initialize()
+                if self.emotion_enricher.llm:
+                    logger.info(f"Emotion enrichment enabled with model: {self.config.emotion_enrichment_model}")
+                else:
+                    logger.error("Failed to initialize emotion enricher LLM. Emotion enrichment disabled.")
+                    self.config.enable_emotion_enrichment = False
+                    self.emotion_enricher = None
+            except Exception as e:
+                logger.error(f"Failed to initialize emotion enricher: {e}. Emotion enrichment disabled.")
+                self.config.enable_emotion_enrichment = False
+                self.emotion_enricher = None
+        else:
+            logger.info("Emotion enrichment disabled by configuration.")
 
         if self.config.enable_voice_matching:
             if not self.voice_matcher.audio_embedder:
@@ -1040,6 +1319,92 @@ class GeminiTTSWrapper(TTSInterface):
                 self.voice_mapping.get(speaker_id) or 
                 self.config.default_voice)
 
+    def _resolve_voice_for_segment(self, segment_data: TTSSegmentData) -> str:
+        """Determine the validated voice name that will be used for the segment."""
+        speaker_id = segment_data.speaker or ""
+        raw_voice = (
+            segment_data.voice or
+            self.voice_mapping.get(speaker_id) or
+            self.config.default_voice
+        )
+        return self._validate_voice_name(raw_voice)
+
+    def _record_duration_stats(
+        self,
+        segment: TTSSegmentData,
+        synthesized_text: Optional[str],
+        duration_seconds: float
+    ) -> None:
+        """Update duration statistics with real synthesis data."""
+        if duration_seconds <= 0.05:
+            return
+
+        text_for_stats = (synthesized_text or segment.text or "").strip()
+        if not text_for_stats:
+            return
+
+        words = TextAnalysisUtils.count_words(text_for_stats)
+        characters = TextAnalysisUtils.count_characters(text_for_stats)
+        if words == 0 and characters == 0:
+            return
+
+        speed_factor = segment.speed if segment.speed and segment.speed > 0 else 1.0
+        normalized_duration = duration_seconds / speed_factor
+        if normalized_duration <= 0.05:
+            return
+
+        voice_name = self._resolve_voice_for_segment(segment)
+
+        smoothing_alpha = self.config.duration_smoothing_alpha
+        if smoothing_alpha is not None and smoothing_alpha <= 0:
+            smoothing_alpha = None
+
+        with self._duration_stats_lock:
+            self.sample_manager.duration_database.update_voice_stats(
+                voice_name=voice_name,
+                words=words,
+                characters=characters,
+                duration=normalized_duration,
+                smoothing_alpha=smoothing_alpha
+            )
+            self._stats_update_counter += 1
+            self._maybe_persist_duration_stats_locked()
+        logger.debug(
+            "Updated duration stats for voice '%s' with %d words, %d chars, %.2fs (normalized %.2fs)",
+            voice_name,
+            words,
+            characters,
+            duration_seconds,
+            normalized_duration
+        )
+
+    def _save_duration_stats_locked(self) -> None:
+        """Save duration statistics to disk. Caller must hold _duration_stats_lock."""
+        try:
+            self.sample_manager.save_duration_stats(preserve_embeddings=True)
+            logger.debug("Persisted Gemini duration stats to disk")
+        except Exception as e:
+            logger.error(f"Failed to persist Gemini duration stats: {e}")
+
+    def _maybe_persist_duration_stats_locked(self) -> None:
+        """Auto-save duration stats when configured threshold is met."""
+        if not self.config.duration_stats_auto_save:
+            return
+
+        interval = self.config.duration_stats_save_interval
+        if not interval or interval <= 0:
+            return
+
+        if self._stats_update_counter >= interval:
+            self._save_duration_stats_locked()
+            self._stats_update_counter = 0
+
+    def save_duration_stats(self) -> None:
+        """Persist current duration statistics to disk."""
+        with self._duration_stats_lock:
+            self._save_duration_stats_locked()
+            self._stats_update_counter = 0
+
     def _get_cache_key(self, segment_data: TTSSegmentData, language: str) -> str:
         """Generate a unique cache key for a segment based on its properties."""
         # Include all relevant parameters that affect audio generation
@@ -1068,9 +1433,15 @@ class GeminiTTSWrapper(TTSInterface):
         segment_data: TTSSegmentData,
         temp_output_path: str,
         language: str,
-        max_retries_per_model: int = 3
-    ) -> None:
-        """Synthesizes a single segment and saves it to a temporary path with validation and retry logic."""
+        max_retries_per_model: int = 3,
+        previous_segments: Optional[List[str]] = None,
+        usage_tracker: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Synthesizes a single segment and saves it to a temporary path with validation and retry logic.
+
+        Returns:
+            Tuple containing the text sent to the model and the model identifier used.
+        """
         if not self.api_client.client:
             raise RuntimeError("Gemini client not initialized.")
 
@@ -1081,27 +1452,32 @@ class GeminiTTSWrapper(TTSInterface):
             if os.path.exists(cached_path):
                 shutil.copy(cached_path, temp_output_path)
                 logger.debug(f"  Gemini: Using cached audio for speaker {segment_data.speaker}")
-                return
+                return None, None
 
         # Ensure the API client is using the original model
         self.api_client.reset_to_original_model()
 
         # Try with original model
-        success, primary_silence, primary_best_path = self._attempt_segment_synthesis(
-            segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.01
+        success, primary_silence, primary_best_path, primary_text, primary_model = self._attempt_segment_synthesis(
+            segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.01,
+            previous_segments=previous_segments,
+            usage_tracker=usage_tracker
         )
 
         if success:
             if primary_best_path:
                 shutil.move(primary_best_path, temp_output_path)
-            return
+            return primary_text, primary_model
 
         # If primary model fails, try the fallback model
         fallback_best_path = None
+        fallback_text: Optional[str] = None
         if self.api_client.switch_to_fallback_model():
             logger.info(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
-            success, fallback_silence, fallback_best_path = self._attempt_segment_synthesis(
-                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05
+            success, fallback_silence, fallback_best_path, fallback_text, fallback_model = self._attempt_segment_synthesis(
+                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05,
+                previous_segments=previous_segments,
+                usage_tracker=usage_tracker
             )
             self.api_client.reset_to_original_model()
 
@@ -1110,7 +1486,7 @@ class GeminiTTSWrapper(TTSInterface):
                     shutil.move(fallback_best_path, temp_output_path)
                 if primary_best_path and os.path.exists(primary_best_path):
                     os.remove(primary_best_path)
-                return
+                return fallback_text, fallback_model
 
         # Both models failed, compare the best attempts
         if primary_best_path and fallback_best_path:
@@ -1118,42 +1494,73 @@ class GeminiTTSWrapper(TTSInterface):
                 logger.warning(f"Both models failed validation. Using best attempt from primary model (silence: {primary_silence:.2f})")
                 shutil.move(primary_best_path, temp_output_path)
                 os.remove(fallback_best_path)
+                return primary_text, primary_model
             else:
                 logger.warning(f"Both models failed validation. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
                 shutil.move(fallback_best_path, temp_output_path)
                 os.remove(primary_best_path)
-            return
+                return fallback_text, fallback_model
 
         # Handle cases where one of the models didn't produce any output
         if primary_best_path:
             logger.warning(f"Fallback model failed. Using best attempt from primary model (silence: {primary_silence:.2f})")
             shutil.move(primary_best_path, temp_output_path)
-            return
+            return primary_text, primary_model
         if fallback_best_path:
             logger.warning(f"Primary model failed. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
             shutil.move(fallback_best_path, temp_output_path)
-            return
+            return fallback_text, fallback_model
 
         raise RuntimeError(f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts.")
 
     def _attempt_segment_synthesis(self, segment_data: TTSSegmentData, temp_output_path: str,
-                                 language: str, max_retries: int, max_silence_ratio: float = 0.01) -> Tuple[bool, float, Optional[str]]:
+                                 language: str, max_retries: int, max_silence_ratio: float = 0.01,
+                                 previous_segments: Optional[List[str]] = None,
+                                 usage_tracker: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
         """
         Attempt segment synthesis with the current model.
-        Returns a tuple of (success, silence_ratio, best_attempt_path).
+        Returns a tuple of (success, silence_ratio, best_attempt_path, best_attempt_text, model_used).
         """
         best_attempt_path: Optional[str] = None
+        best_attempt_text: Optional[str] = None
+        best_model: Optional[str] = None
         best_silence_ratio = float('inf')
         speaker_id = segment_data.speaker
         text_to_synthesize = segment_data.text
+
+        # Apply emotion enrichment if enabled
+        if self.config.enable_emotion_enrichment and self.emotion_enricher:
+            logger.debug(f"Emotion enrichment: Enabled for speaker {speaker_id}, enricher exists: {self.emotion_enricher is not None}")
+            try:
+                original_text = text_to_synthesize
+                logger.debug(f"Emotion enrichment: Calling enrich_text with {len(previous_segments) if previous_segments else 0} context segments")
+                text_to_synthesize = self.emotion_enricher.enrich_text(
+                    text_to_synthesize,
+                    previous_segments=previous_segments
+                )
+                # Only log if text actually changed
+                if text_to_synthesize != original_text:
+                    logger.info(f"Text was enriched for speaker {speaker_id}")
+                    logger.debug(f"  Original: {original_text}")
+                    logger.debug(f"  Enriched: {text_to_synthesize}")
+                else:
+                    logger.debug(f"Emotion enrichment: Text unchanged for speaker {speaker_id}")
+            except Exception as e:
+                logger.error(f"Emotion enrichment failed with exception: {e}", exc_info=True)
+                logger.warning(f"Emotion enrichment failed: {e}. Using original text.")
+        else:
+            if self.config.enable_emotion_enrichment:
+                logger.debug(f"Emotion enrichment: Enabled but enricher is None")
+            else:
+                logger.debug(f"Emotion enrichment: Disabled in config")
 
         for attempt in range(max_retries):
             temp_attempt_path = f"{temp_output_path}_attempt_{self.api_client.current_model}_{attempt}.wav"
 
             try:
                 logger.debug(f"  Gemini: Synthesizing segment for {speaker_id} (attempt {attempt + 1}/{max_retries}) with model {self.api_client.current_model}")
-                voice_name = segment_data.voice or self.voice_mapping.get(speaker_id, self.config.default_voice)
-                voice_name = self._validate_voice_name(voice_name)
+                voice_name = self._resolve_voice_for_segment(segment_data)
+                current_model = self.api_client.current_model
 
                 final_text = text_to_synthesize
                 style_hint = self._get_style_prompt_for_speaker(speaker_id, segment_data)
@@ -1174,6 +1581,8 @@ class GeminiTTSWrapper(TTSInterface):
                     all_chunks_successful = True
                     for i, chunk_text in enumerate(text_chunks):
                         chunk_file_path = os.path.join(temp_dir_for_chunks, f"chunk_{i}.wav")
+                        token_count = self._count_tokens(chunk_text)
+                        self._register_usage(usage_tracker, current_model, input_tokens=token_count)
                         audio_data = self.api_client.synthesize_chunk(chunk_text, speech_config)
                         if audio_data:
                             AudioFileUtils.save_wave_file(chunk_file_path, audio_data, rate=SAMPLE_RATE)
@@ -1227,6 +1636,8 @@ class GeminiTTSWrapper(TTSInterface):
                                 logger.warning(f"Could not remove old best_attempt_path: {e}")
                         best_silence_ratio = silence_ratio
                         best_attempt_path = temp_attempt_path
+                        best_attempt_text = final_text
+                        best_model = current_model
                     elif temp_attempt_path != best_attempt_path:
                         try:
                             os.remove(temp_attempt_path)
@@ -1234,18 +1645,120 @@ class GeminiTTSWrapper(TTSInterface):
                             logger.warning(f"Could not remove temp_attempt_path: {e}")
 
                     if is_valid:
-                        return True, silence_ratio, best_attempt_path
+                        best_model = current_model
+                        return True, silence_ratio, best_attempt_path, final_text, current_model
                     else:
                         logger.debug(f"Segment validation failed for {speaker_id} (attempt {attempt + 1}): {reason}")
                 else:
                     # If validation is disabled, we can't determine the best path, so we just return the first successful one.
-                    return True, 0.0, temp_attempt_path
+                    best_model = current_model
+                    return True, 0.0, temp_attempt_path, final_text, current_model
 
             except Exception as e:
                 logger.error(f"Error synthesizing segment for {speaker_id} (attempt {attempt + 1}): {e}")
                 time.sleep(2)
 
-        return False, best_silence_ratio, best_attempt_path
+        return False, best_silence_ratio, best_attempt_path, best_attempt_text, best_model
+
+    def _process_single_segment(
+        self,
+        segment: TTSSegmentData,
+        segment_index: int,
+        total_segments: int,
+        temp_dir: str,
+        language: str,
+        context_segments: List[str],
+        usage_tracker: Optional[Dict[str, Any]] = None
+    ) -> Optional[SegmentAlignment]:
+        """
+        Process a single segment: check cache or synthesize.
+
+        Args:
+            segment: Segment data to process
+            segment_index: Index of this segment
+            total_segments: Total number of segments
+            temp_dir: Temporary directory for audio files
+            language: Target language code
+            context_segments: List of previous segment texts for emotion enrichment context
+            usage_tracker: Shared usage tracker for cost accounting
+
+        Returns:
+            SegmentAlignment if successful, None otherwise
+        """
+        segment_file_path = os.path.join(temp_dir, f"segment_{segment_index}_{segment.speaker}.wav")
+
+        # Check if we already have this segment in cache
+        cache_key = self._get_cache_key(segment, language)
+        if cache_key in self._audio_cache:
+            cached_path, duration = self._audio_cache[cache_key]
+            if os.path.exists(cached_path):
+                logger.debug(f"Gemini: Using cached segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
+                shutil.copy(cached_path, segment_file_path)
+
+                # Save to output path if specified
+                if segment.output_path:
+                    os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
+                    shutil.copy(segment_file_path, segment.output_path)
+                    logger.debug(f"Saved segment audio to {segment.output_path}")
+
+                # Create alignment using cached duration
+                diarized = DiarizationSegment(
+                    start_time=0.0,
+                    end_time=duration,
+                    speaker=segment.speaker,
+                    text=segment.text,
+                    confidence=1.0
+                )
+                return SegmentAlignment(
+                    original_segment=segment,
+                    diarized_segment=diarized,
+                    alignment_confidence=1.0
+                )
+
+        # If not cached, synthesize normally
+        logger.info(f"Gemini: Synthesizing segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
+        try:
+            synthesized_text, model_used = self._synthesize_single_segment(
+                segment, segment_file_path, language,
+                previous_segments=context_segments,
+                usage_tracker=usage_tracker
+            )
+
+            # Get duration of the synthesized audio
+            duration = AudioFileUtils.get_audio_duration_seconds(segment_file_path) or 0.0
+            self._record_duration_stats(segment, synthesized_text, duration)
+            if duration and model_used:
+                self._register_usage(usage_tracker, model_used, audio_seconds=duration)
+
+            # Cache the generated audio
+            if self._cache_dir:
+                cache_path = os.path.join(self._cache_dir, f"{cache_key}.wav")
+                shutil.copy(segment_file_path, cache_path)
+                self._audio_cache[cache_key] = (cache_path, duration)
+
+            # Save to output path if specified
+            if segment.output_path:
+                os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
+                shutil.copy(segment_file_path, segment.output_path)
+                logger.debug(f"Saved segment audio to {segment.output_path}")
+
+            # Create alignment
+            diarized = DiarizationSegment(
+                start_time=0.0,
+                end_time=duration,
+                speaker=segment.speaker,
+                text=segment.text,
+                confidence=1.0
+            )
+            return SegmentAlignment(
+                original_segment=segment,
+                diarized_segment=diarized,
+                alignment_confidence=1.0
+            )
+
+        except Exception as e_segment:
+            logger.error(f"Error synthesizing segment {segment_index+1} for speaker '{segment.speaker}': {e_segment}")
+            return None
 
     def synthesize(
         self,
@@ -1254,15 +1767,16 @@ class GeminiTTSWrapper(TTSInterface):
         **kwargs: Any
     ) -> List[SegmentAlignment]:
         """
-        Synthesize speech for each segment individually.
-        
+        Synthesize speech for each segment individually using parallel processing.
+
         Args:
             segments_data: List of segments to synthesize
             language: Target language code
             **kwargs: Additional synthesis parameters
-            
+                - previous_context: List[str] - Previous segment texts for emotion enrichment
+
         Returns:
-            List of segment alignments
+            List of segment alignments (in original order)
         """
         if not self.is_available():
             raise RuntimeError("Gemini TTS not initialized.")
@@ -1281,89 +1795,113 @@ class GeminiTTSWrapper(TTSInterface):
         if self.config.enable_voice_matching and self.voice_matcher.audio_embedder:
             speaker_to_ref_path = {}
             for segment in valid_segments:
-                if (segment.speaker and segment.speaker not in self.voice_mapping and 
+                if (segment.speaker and segment.speaker not in self.voice_mapping and
                     segment.speaker not in speaker_to_ref_path and segment.reference_audio_path):
                     speaker_to_ref_path[segment.speaker] = segment.reference_audio_path
-            
+
             for speaker_id, ref_path in speaker_to_ref_path.items():
                 logger.debug(f"Auto-pinning voice for speaker '{speaker_id}'")
                 self.find_and_pin_voice_for_speaker(speaker_id, ref_path)
 
         temp_dir = tempfile.mkdtemp(prefix="gemini_segments_")
-        alignments = []
+
+        # Thread-safe context tracking for emotion enrichment
+        context_lock = threading.Lock()
+        usage_tracker: Dict[str, Any] = {"models": {}, "lock": threading.Lock()}
+
+        # Use external context if provided (for resynthesis), otherwise build from segments
+        external_context = kwargs.get('previous_context', None)
+        context_segments: List[str] = external_context if external_context is not None else []
+
+        def get_context_for_segment(segment_idx: int) -> List[str]:
+            """Get context segments for a given segment index (thread-safe)."""
+            with context_lock:
+                if external_context is not None:
+                    # Use provided external context (for resynthesis)
+                    return external_context
+                else:
+                    # Build context from previous segments in current batch
+                    start_idx = max(0, segment_idx - 5)
+                    return [valid_segments[i].text for i in range(start_idx, segment_idx)]
+
+        def update_context(segment_text: str) -> None:
+            """Update context with completed segment (thread-safe)."""
+            with context_lock:
+                # Only update context if we're building it ourselves (not using external)
+                if external_context is None:
+                    context_segments.append(segment_text)
 
         try:
-            for i, segment in enumerate(valid_segments):
-                segment_file_path = os.path.join(temp_dir, f"segment_{i}_{segment.speaker}.wav")
-                
-                # Check if we already have this segment in cache
-                cache_key = self._get_cache_key(segment, language)
-                if cache_key in self._audio_cache:
-                    cached_path, duration = self._audio_cache[cache_key]
-                    if os.path.exists(cached_path):
-                        logger.debug(f"Gemini: Using cached segment {i+1}/{len(valid_segments)} for speaker '{segment.speaker}'")
-                        shutil.copy(cached_path, segment_file_path)
-                        
-                        # Save to output path if specified
-                        if segment.output_path:
-                            os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
-                            shutil.copy(segment_file_path, segment.output_path)
-                            logger.debug(f"Saved segment audio to {segment.output_path}")
-                        
-                        # Create alignment using cached duration
-                        diarized = DiarizationSegment(
-                            start_time=0.0,
-                            end_time=duration,
-                            speaker=segment.speaker,
-                            text=segment.text,
-                            confidence=1.0
+            # Results dict to preserve order: {segment_index: alignment}
+            results: Dict[int, Optional[SegmentAlignment]] = {}
+            results_lock = threading.Lock()
+
+            def process_segment_wrapper(idx: int, seg: TTSSegmentData) -> None:
+                """Wrapper to process segment and store result with index."""
+                context = get_context_for_segment(idx) if self.config.enable_emotion_enrichment else []
+                alignment = self._process_single_segment(
+                    segment=seg,
+                    segment_index=idx,
+                    total_segments=len(valid_segments),
+                    temp_dir=temp_dir,
+                    language=language,
+                    context_segments=context,
+                    usage_tracker=usage_tracker
+                )
+
+                with results_lock:
+                    results[idx] = alignment
+
+                # Update context after successful synthesis
+                if alignment and self.config.enable_emotion_enrichment:
+                    update_context(seg.text)
+
+            # Use ThreadPoolExecutor for parallel processing
+            max_workers = min(self.config.max_workers, len(valid_segments))
+            logger.info(f"Gemini: Starting parallel synthesis with {max_workers} workers for {len(valid_segments)} segments")
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                futures = {
+                    executor.submit(process_segment_wrapper, i, segment): i
+                    for i, segment in enumerate(valid_segments)
+                }
+
+                # Wait for all to complete and handle any exceptions
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        future.result()  # This will raise exception if task failed
+                    except Exception as e:
+                        logger.error(f"Unexpected error in parallel segment {idx}: {e}")
+                        with results_lock:
+                            results[idx] = None
+
+            # Collect results in original order
+            alignments = [results.get(i) for i in range(len(valid_segments)) if results.get(i) is not None]
+
+            logger.info(f"Gemini: Synthesized {len(alignments)}/{len(valid_segments)} segments successfully")
+            if self.cost_tracker and usage_tracker:
+                models_usage: Dict[str, Dict[str, float]] = {}
+                lock = usage_tracker.get("lock")
+                if lock:
+                    with lock:
+                        models_usage = dict(usage_tracker.get("models", {}))
+                else:
+                    models_usage = dict(usage_tracker.get("models", {}))
+
+                for model_name, metrics in models_usage.items():
+                    input_tok = metrics.get("input_tokens", 0.0)
+                    output_tok = metrics.get("output_tokens", 0.0)
+                    audio_sec = metrics.get("audio_seconds", 0.0)
+                    if input_tok or output_tok or audio_sec:
+                        self.cost_tracker.add_tts_actual(
+                            "gemini",
+                            model=model_name,
+                            input_tokens=input_tok,
+                            output_tokens=output_tok,
+                            audio_seconds=audio_sec
                         )
-                        alignments.append(SegmentAlignment(
-                            original_segment=segment,
-                            diarized_segment=diarized,
-                            alignment_confidence=1.0
-                        ))
-                        continue
-                
-                # If not cached, synthesize normally
-                logger.info(f"Gemini: Synthesizing segment {i+1}/{len(valid_segments)} for speaker '{segment.speaker}'")
-                try:
-                    self._synthesize_single_segment(segment, segment_file_path, language)
-                    
-                    # Get duration of the synthesized audio
-                    duration = AudioFileUtils.get_audio_duration_seconds(segment_file_path) or 0.0
-                    
-                    # Cache the generated audio
-                    if self._cache_dir:
-                        cache_path = os.path.join(self._cache_dir, f"{cache_key}.wav")
-                        shutil.copy(segment_file_path, cache_path)
-                        self._audio_cache[cache_key] = (cache_path, duration)
-                    
-                    # Save to output path if specified
-                    if segment.output_path:
-                        os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
-                        shutil.copy(segment_file_path, segment.output_path)
-                        logger.debug(f"Saved segment audio to {segment.output_path}")
-                    
-                    # Create alignment
-                    diarized = DiarizationSegment(
-                        start_time=0.0,
-                        end_time=duration,
-                        speaker=segment.speaker,
-                        text=segment.text,
-                        confidence=1.0
-                    )
-                    alignments.append(SegmentAlignment(
-                        original_segment=segment,
-                        diarized_segment=diarized,
-                        alignment_confidence=1.0
-                    ))
-                    
-                except Exception as e_segment:
-                    logger.error(f"Error synthesizing segment {i+1} for speaker '{segment.speaker}': {e_segment}")
-                    # Continue with other segments
-            
-            logger.info(f"Gemini: Synthesized {len(alignments)} segments successfully")
             return alignments
 
         finally:
@@ -1376,6 +1914,12 @@ class GeminiTTSWrapper(TTSInterface):
 
     def cleanup(self) -> None:
         """Clean up resources."""
+        # Persist any pending duration statistics before tearing down
+        try:
+            self.save_duration_stats()
+        except Exception as e:
+            logger.error(f"Failed to save duration stats during cleanup: {e}")
+
         # Clean up cache directory
         if self._cache_dir and os.path.exists(self._cache_dir):
             shutil.rmtree(self._cache_dir, ignore_errors=True)
