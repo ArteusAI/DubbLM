@@ -94,6 +94,7 @@ cache/
 *.m4v
 *.m4a
 *.m4b
+*.srt
 artifacts/
 
 # Project specifics
