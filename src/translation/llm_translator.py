@@ -272,21 +272,106 @@ class LLMTranslator(TranslationInterface):
         provider: str,
         model_name: Optional[str],
         prompt_text: Optional[str],
-        response_text: Optional[str]
+        response_text: Optional[str],
+        llm_result: Optional[Any] = None,
     ) -> None:
         """Record usage metrics for a single LLM call via the cost tracker."""
         if not self.cost_tracker:
             return
 
-        input_tokens = self._count_tokens(model_name, prompt_text)
-        output_tokens = self._count_tokens(model_name, response_text)
-        if input_tokens == 0 and output_tokens == 0:
+        usage_tokens = self._extract_usage_tokens(llm_result)
+        input_tokens = usage_tokens.get("prompt_tokens")
+        output_tokens = usage_tokens.get("completion_tokens")
+        reasoning_tokens = usage_tokens.get("reasoning_tokens")
+
+        if input_tokens is None:
+            input_tokens = self._count_tokens(model_name, prompt_text)
+        if reasoning_tokens is None:
+            reasoning_tokens = usage_tokens.get("thinking_tokens")
+        if output_tokens is None:
+            output_tokens = self._count_tokens(model_name, response_text)
+        if reasoning_tokens is None:
+            reasoning_tokens = usage_tokens.get("candidates_token_count", 0.0)
+
+        if input_tokens == 0 and output_tokens == 0 and reasoning_tokens == 0:
             return
 
         try:
-            self.cost_tracker.add_translation_actual(provider, model_name, input_tokens, output_tokens)
+            self.cost_tracker.add_translation_actual(
+                provider,
+                model_name,
+                float(input_tokens or 0.0),
+                float(output_tokens or 0.0),
+                float(reasoning_tokens or 0.0),
+            )
         except Exception as exc:
             logger.warning(f"Failed to record translation cost for provider {provider}: {exc}")
+
+    def _extract_usage_tokens(self, llm_result: Optional[Any]) -> Dict[str, float]:
+        """Extract token usage metrics from an LLM result object."""
+        token_data: Dict[str, float] = {}
+
+        if llm_result is None:
+            return token_data
+
+        def _update_from_dict(data: Optional[Dict[str, Any]]) -> None:
+            if not isinstance(data, dict):
+                return
+            alias_map = {
+                "prompt_tokens": ("prompt_tokens",),
+                "completion_tokens": ("completion_tokens",),
+                "total_tokens": ("total_tokens",),
+                "reasoning_tokens": ("reasoning_tokens",),
+                "thinking_tokens": ("thinking_tokens",),
+                "prompt_token_count": ("prompt_tokens",),
+                "candidates_token_count": ("reasoning_tokens", "thinking_tokens"),
+                "total_token_count": ("total_tokens",),
+                "reasoning_token_count": ("reasoning_tokens",),
+                "thinking_token_count": ("thinking_tokens",),
+            }
+            for source_key, target_key in alias_map.items():
+                value = data.get(source_key)
+                if not isinstance(target_key, tuple):
+                    # backwards compatibility in case code paths call this with str
+                    target_key = (target_key,)
+                if not isinstance(value, (int, float)):
+                    continue
+                for normalized_key in target_key:
+                    if normalized_key:
+                        token_data[normalized_key] = float(value)
+
+        # additional_kwargs usually contains prompt/completion tokens
+        additional_kwargs = getattr(llm_result, "additional_kwargs", None)
+        _update_from_dict(additional_kwargs)
+
+        raw_response = getattr(llm_result, "raw", None)
+        usage_obj = None
+        if raw_response is not None:
+            usage_obj = getattr(raw_response, "usage", None)
+            if isinstance(raw_response, dict):
+                usage_dict = raw_response.get("usage")
+                usage_metadata = raw_response.get("usage_metadata")
+                if isinstance(usage_dict, dict):
+                    _update_from_dict(usage_dict)
+                if isinstance(usage_metadata, dict):
+                    _update_from_dict(usage_metadata)
+            elif hasattr(raw_response, "dict") and not usage_obj:
+                try:
+                    raw_dict = raw_response.dict()
+                except Exception:  # pragma: no cover - best effort
+                    raw_dict = None
+                if isinstance(raw_dict, dict):
+                    _update_from_dict(raw_dict.get("usage"))
+                    _update_from_dict(raw_dict.get("usage_metadata"))
+
+        if usage_obj is not None:
+            potential_keys = ["prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "thinking_tokens"]
+            for key in potential_keys:
+                value = getattr(usage_obj, key, None)
+                if isinstance(value, (int, float)):
+                    token_data[key] = float(value)
+
+        return token_data
             
     def _load_cache(self) -> None:
         """Load translation cache from disk if it exists."""
@@ -429,7 +514,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             else:
                 response_text = str(result)
             
-            self._record_llm_cost(self.llm_provider, self.model_name, combined_prompt, response_text)
+            self._record_llm_cost(self.llm_provider, self.model_name, combined_prompt, response_text, result)
             
             # Extract JSON from the response
             try:
@@ -989,7 +1074,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 else:
                     translation_text = str(translation).strip()
 
-                self._record_llm_cost(self.llm_provider, self.model_name, prompt, translation_text)
+                self._record_llm_cost(self.llm_provider, self.model_name, prompt, translation_text, translation)
                 
                 # Check if translation is empty
                 if not translation_text:
@@ -1491,7 +1576,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     else: # openrouter
                         llm_response_text = str(refinement_response).strip()
 
-                    self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, effective_refinement_prompt, llm_response_text)
+                    self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, effective_refinement_prompt, llm_response_text, refinement_response)
 
                     if not llm_response_text:
                         if attempt < max_attempts - 1:
@@ -1957,7 +2042,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             try:
                 response = self.refinement_llm.complete(prompt)
                 response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
-                self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, prompt, response_text)
+                self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, prompt, response_text, response)
                 if not response_text:
                     continue
 

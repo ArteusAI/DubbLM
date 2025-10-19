@@ -25,16 +25,25 @@ class CostEstimator:
     _AVERAGE_SPOKEN_TOKENS_PER_SECOND = 3.0
     _TRANSLATION_CHUNK_TOKEN_TARGET = 1200  # rough heuristic
 
-    def __init__(self, config: Any):
+    def __init__(self, config: Any, cost_tracker: Optional[Any] = None):
         self._config = config
-        self._tracker = CostTracker(config)
+        self._tracker = cost_tracker if cost_tracker is not None else CostTracker(config)
         self._prompt_token_cache: Dict[str, int] = {}
 
-    def estimate(self) -> Dict[str, float]:
-        """Estimate total and per-step costs. Returns a dict of costs."""
-        video_path = self._config.get("input")
-        duration_seconds = self._probe_video_duration(video_path)
-        self._tracker.set_audio_duration(duration_seconds)
+    def estimate(self, write_summary: bool = True) -> Dict[str, float]:
+        """Estimate total and per-step costs. Returns a dict of costs.
+
+        Args:
+            write_summary: If True, write cost summary to logs after estimation.
+                          Set to False when estimation is part of a larger pipeline.
+        """
+        # Use pre-set duration if available (from audio processor), otherwise probe video
+        if self._tracker.audio_duration_sec is not None:
+            duration_seconds = self._tracker.audio_duration_sec
+        else:
+            video_path = self._config.get("input")
+            duration_seconds = self._probe_video_duration(video_path)
+            self._tracker.set_audio_duration(duration_seconds)
 
         logger.info(
             "Video duration: %.2f seconds (%.2f minutes)",
@@ -47,7 +56,7 @@ class CostEstimator:
         estimated_tokens = max(
             0.0, duration_seconds * self._AVERAGE_SPOKEN_TOKENS_PER_SECOND
         )
-        logger.info(
+        logger.debug(
             "Estimating translation tokens: %.0f (assumes %.2f tokens/second)",
             estimated_tokens,
             self._AVERAGE_SPOKEN_TOKENS_PER_SECOND,
@@ -56,14 +65,15 @@ class CostEstimator:
         self._estimate_translation(estimated_tokens)
         self._estimate_tts(duration_seconds, estimated_tokens)
 
-        self._tracker.write_cost_summary()
         costs = self._tracker.get_estimated_costs()
 
-        logger.info("Estimated cost (USD):")
-        for step in ("transcription", "translation", "speech_synthesis", "total"):
-            logger.info(
-                "  %s: $%.4f", step.replace("_", " ").title(), costs.get(step, 0.0)
-            )
+        if write_summary:
+            self._tracker.write_cost_summary()
+            logger.info("Estimated cost (USD):")
+            for step in ("transcription", "translation", "speech_synthesis", "total"):
+                logger.info(
+                    "  %s: $%.4f", step.replace("_", " ").title(), costs.get(step, 0.0)
+                )
 
         return costs
 
@@ -126,7 +136,11 @@ class CostEstimator:
         )
         try:
             self._tracker.estimate_translation_cost(
-                provider, model_name, translation_input_tokens, estimated_tokens
+                provider,
+                model_name,
+                translation_input_tokens,
+                estimated_tokens,
+                expected_reasoning_tokens=estimated_tokens,
             )
         except ValueError as exc:
             logger.warning("Skipping translation cost estimation: %s", exc)
@@ -148,6 +162,7 @@ class CostEstimator:
                 refinement_model,
                 refinement_input_tokens,
                 estimated_tokens,
+                expected_reasoning_tokens=estimated_tokens,
             )
         except ValueError as exc:
             logger.warning(
@@ -381,5 +396,5 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         if provider == "gemini":
             return "models/gemini-2.5-flash-preview-04-17"
         if provider == "openrouter":
-            return "anthropic/claude-3.7-sonnet:thinking"
+            return "anthropic/claude-sonnet-4.5"
         return None

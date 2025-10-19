@@ -125,6 +125,23 @@ class SegmentOptimizer:
                         logger.debug(f"Added {pause_type} (gap={gap:.2f}s) merging segments at "
                                     f"{old_end:.2f}s-{segment['start']:.2f}s, speaker={segment.get('speaker', 'unknown')}")
 
+                # Merge alternative translation variants (very_short, short, long)
+                for variant_key in ['very_short_translation', 'short_translation', 'long_translation']:
+                    if variant_key in segment and variant_key in current_segment:
+                        separator = self._get_translation_separator(gap)
+                        current_variant = current_segment.get(variant_key, '').strip()
+                        new_variant = segment.get(variant_key, '').strip()
+                        current_segment[variant_key] = f"{current_variant}{separator}{new_variant}".strip()
+                    elif variant_key in segment and variant_key not in current_segment:
+                        # If current doesn't have this variant but segment does, copy it
+                        current_segment[variant_key] = segment.get(variant_key, '')
+                
+                # Log variant merging
+                merged_variants = [k for k in ['very_short_translation', 'short_translation', 'long_translation'] 
+                                  if k in current_segment]
+                if merged_variants:
+                    logger.debug(f"Merged translation variants ({phase}): {', '.join(merged_variants)}")
+
                 # Log segment modification
                 logger.debug(f"Merged segment ({phase}): [{old_end:.2f}s-{segment['start']:.2f}s] "
                             f"gap={gap:.2f}s, speaker={segment.get('speaker', 'unknown')}, "

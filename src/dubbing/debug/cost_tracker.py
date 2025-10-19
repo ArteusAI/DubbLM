@@ -24,6 +24,7 @@ pricing:
         anthropic/claude-3.7-sonnet:thinking:
           input_per_1m_tokens: 3.50
           output_per_1m_tokens: 7.00
+          reasoning_per_1m_tokens: 14.00
   tts:
     gemini:
       models:
@@ -84,7 +85,7 @@ class CostTracker:
 
         # For detailed usage tracking (best-effort)
         self.usage: Dict[str, Dict[str, float]] = {
-            "translation": {"input_tokens": 0.0, "output_tokens": 0.0, "details": {}},
+            "translation": {"input_tokens": 0.0, "output_tokens": 0.0, "reasoning_tokens": 0.0, "details": {}},
             "tts": {"input_tokens": 0.0, "output_tokens": 0.0, "audio_seconds": 0.0, "details": {}},
             "transcription": {"audio_seconds": 0.0},
         }
@@ -93,8 +94,8 @@ class CostTracker:
     def set_audio_duration(self, seconds: Optional[float]) -> None:
         self.audio_duration_sec = seconds
 
-    def _get_translation_rates(self, provider: str, model: Optional[str]) -> Tuple[float, float]:
-        """Retrieve input/output pricing (per million tokens) for a translation provider/model combo."""
+    def _get_translation_rates(self, provider: str, model: Optional[str]) -> Tuple[float, float, float]:
+        """Retrieve input/output/reasoning pricing (per million tokens) for a translation provider/model combo."""
         translation_cfg = self.pricing.get("translation")
         if not isinstance(translation_cfg, dict):
             raise ValueError("Translation pricing configuration is missing.")
@@ -113,17 +114,19 @@ class CostTracker:
                 if isinstance(model_cfg, dict):
                     in_rate = model_cfg.get("input_per_1m_tokens")
                     out_rate = model_cfg.get("output_per_1m_tokens")
+                    reasoning_rate = model_cfg.get("reasoning_per_1m_tokens", provider_cfg.get("reasoning_per_1m_tokens"))
                     if in_rate is None or out_rate is None:
                         raise ValueError(
                             f"Translation pricing for {provider} model '{model}' must define input/output per_1m_tokens."
                         )
-                    return float(in_rate), float(out_rate)
+                    return float(in_rate), float(out_rate), float(reasoning_rate or 0.0)
 
         in_rate = provider_cfg.get("input_per_1m_tokens")
         out_rate = provider_cfg.get("output_per_1m_tokens")
+        reasoning_rate = provider_cfg.get("reasoning_per_1m_tokens")
         if in_rate is None or out_rate is None:
             raise ValueError(f"Translation pricing for provider '{provider}' must define input/output per_1m_tokens.")
-        return float(in_rate), float(out_rate)
+        return float(in_rate), float(out_rate), float(reasoning_rate or 0.0)
 
     def _get_tts_rates(self, provider: str, model: Optional[str]) -> Tuple[float, float, Optional[float]]:
         """Retrieve TTS pricing (per million tokens and per audio minute)."""
@@ -182,50 +185,85 @@ class CostTracker:
         return cost
 
     # ----- Translation (LLM) -----
-    def estimate_translation_cost(self, provider: str, model: Optional[str], input_tokens: float, expected_output_tokens: Optional[float] = None) -> float:
+    def estimate_translation_cost(
+        self,
+        provider: str,
+        model: Optional[str],
+        input_tokens: float,
+        expected_output_tokens: Optional[float] = None,
+        expected_reasoning_tokens: Optional[float] = None,
+    ) -> float:
         if input_tokens <= 0:
             return 0.0
         if expected_output_tokens is None:
             expected_output_tokens = input_tokens
 
-        in_rate, out_rate = self._get_translation_rates(provider, model)
-        cost = in_rate * (float(input_tokens) / 1_000_000.0) + out_rate * (float(expected_output_tokens) / 1_000_000.0)
+        in_rate, out_rate, reasoning_rate = self._get_translation_rates(provider, model)
+        reasoning_tokens = float(expected_reasoning_tokens or 0.0)
+
+        cost = (
+            in_rate * (float(input_tokens) / 1_000_000.0)
+            + out_rate * (float(expected_output_tokens) / 1_000_000.0)
+            + reasoning_rate * (reasoning_tokens / 1_000_000.0)
+        )
 
         self.estimate["translation"] += cost
         self.estimate["total"] += cost
         self.usage["translation"]["input_tokens"] += float(input_tokens or 0.0)
         self.usage["translation"]["output_tokens"] += float(expected_output_tokens or 0.0)
+        self.usage["translation"]["reasoning_tokens"] += reasoning_tokens
         detail_map = self.usage["translation"].setdefault("details", {})
-        detail_entry = detail_map.setdefault(f"{provider}:{model or 'default'}", {"input_tokens": 0.0, "output_tokens": 0.0})
+        detail_entry = detail_map.setdefault(
+            f"{provider}:{model or 'default'}",
+            {"input_tokens": 0.0, "output_tokens": 0.0, "reasoning_tokens": 0.0},
+        )
         detail_entry["input_tokens"] += float(input_tokens or 0.0)
         detail_entry["output_tokens"] += float(expected_output_tokens or 0.0)
+        detail_entry["reasoning_tokens"] += reasoning_tokens
         logger.debug(
             f"Estimated translation cost [{provider}#{model or 'default'}]: "
-            f"${cost:.4f} (in≈{input_tokens:.0f} tok, out≈{expected_output_tokens:.0f} tok)"
+            f"${cost:.4f} (in≈{input_tokens:.0f} tok, out≈{expected_output_tokens:.0f} tok, reasoning≈{reasoning_tokens:.0f} tok)"
         )
         return cost
 
-    def add_translation_actual(self, provider: str, model: Optional[str], input_tokens: float, output_tokens: float) -> float:
+    def add_translation_actual(
+        self,
+        provider: str,
+        model: Optional[str],
+        input_tokens: float,
+        output_tokens: float,
+        reasoning_tokens: float = 0.0,
+    ) -> float:
         input_tokens = float(input_tokens or 0.0)
         output_tokens = float(output_tokens or 0.0)
+        reasoning_tokens = float(reasoning_tokens or 0.0)
 
-        in_rate, out_rate = self._get_translation_rates(provider, model)
-        cost = in_rate * (input_tokens / 1_000_000.0) + out_rate * (output_tokens / 1_000_000.0)
+        in_rate, out_rate, reasoning_rate = self._get_translation_rates(provider, model)
+        cost = (
+            in_rate * (input_tokens / 1_000_000.0)
+            + out_rate * (output_tokens / 1_000_000.0)
+            + reasoning_rate * (reasoning_tokens / 1_000_000.0)
+        )
         self.actual["translation"] += cost
         self.actual["total"] += cost
         self.usage["translation"]["input_tokens"] += input_tokens
         self.usage["translation"]["output_tokens"] += output_tokens
+        self.usage["translation"]["reasoning_tokens"] += reasoning_tokens
 
         if provider and model:
             detail_map = self.usage["translation"].setdefault("details", {})
             detail_key = f"{provider}:{model}"
-            entry = detail_map.setdefault(detail_key, {"input_tokens": 0.0, "output_tokens": 0.0})
+            entry = detail_map.setdefault(
+                detail_key,
+                {"input_tokens": 0.0, "output_tokens": 0.0, "reasoning_tokens": 0.0},
+            )
             entry["input_tokens"] += input_tokens
             entry["output_tokens"] += output_tokens
+            entry["reasoning_tokens"] += reasoning_tokens
 
         logger.debug(
             f"Calculated translation cost [{provider}#{model or 'default'}]: "
-            f"${cost:.4f} (in≈{input_tokens:.0f}, out≈{output_tokens:.0f})"
+            f"${cost:.4f} (in≈{input_tokens:.0f}, out≈{output_tokens:.0f}, reasoning≈{reasoning_tokens:.0f})"
         )
         return cost
 
@@ -331,10 +369,12 @@ class CostTracker:
         tts_out = self.usage["tts"].get("output_tokens", 0.0)
         tts_sec = self.usage["tts"].get("audio_seconds", 0.0)
         tr_sec = self.usage["transcription"].get("audio_seconds", 0.0)
+        reasoning_tokens = self.usage["translation"].get("reasoning_tokens", 0.0)
 
         lines.append("")
         lines.append("Usage details (approx):")
-        lines.append(f" - Translation tokens: in≈{t_in:.0f}, out≈{t_out:.0f}")
+        reasoning_segment = f", reasoning≈{reasoning_tokens:.0f}" if reasoning_tokens > 0 else ""
+        lines.append(f" - Translation tokens: in≈{t_in:.0f}, out≈{t_out:.0f}{reasoning_segment}")
         lines.append(f" - TTS tokens: in≈{tts_in:.0f}, out≈{tts_out:.0f}, audio≈{tts_sec/60.0:.2f} min")
         lines.append(f" - Transcription audio: ≈{tr_sec/60.0:.2f} min")
 

@@ -7,6 +7,7 @@ import re
 import tempfile
 import shutil
 import hashlib
+import math
 from pathlib import Path
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -87,6 +88,8 @@ DURATION_SAMPLE_TEXT = " ".join(DURATION_SAMPLE_TEXTS)
 
 EMBEDDING_CACHE_FILE = DEFAULT_SAMPLES_DIR / "gemini_voice_stats.json"
 DURATION_STATS_FILE = DEFAULT_SAMPLES_DIR / "gemini_voice_stats.json"
+# Separate adjustments (biases) file
+DURATION_ADJUSTMENTS_FILE = DEFAULT_SAMPLES_DIR / "gemini_duration_adjustments.json"
 MAX_CHAR_LIMIT_PER_REQUEST = 1024*30
 SAMPLE_RATE = 24000
 
@@ -386,6 +389,73 @@ class TextAnalysisUtils:
         
         return min(complexity, 2.0)  # Cap at 2x normal complexity
 
+    @staticmethod
+    def estimate_punctuation_pause_seconds(text: str) -> float:
+        """Estimate additional pause time from punctuation.
+
+        Simple weights (seconds per mark):
+        - comma (,): 0.12
+        - period/exclam/question (. ! ?): 0.26
+        - colon/semicolon/ellipsis (: ; …): 0.18
+        - dash (— -): 0.14
+        """
+        if not text:
+            return 0.0
+
+        commas = len(re.findall(r",", text))
+        terminals = len(re.findall(r"[\.!\?]", text))
+        mids = len(re.findall(r"[:;…]", text))
+        dashes = len(re.findall(r"[—-]", text))
+
+        return commas * 0.12 + terminals * 0.26 + mids * 0.18 + dashes * 0.14
+
+    @staticmethod
+    def style_emotion_speed_multiplier(style_prompt: Optional[str], emotion: Optional[str]) -> float:
+        """Return multiplicative speed factor based on style/emotion.
+
+        <1.0 means faster (shorter duration), >1.0 means slower.
+        """
+        style_prompt_l = (style_prompt or "").lower()
+        emotion_l = (emotion or "").lower()
+
+        # Emotion mapping
+        emotion_map: Dict[str, float] = {
+            "angry": 0.93,
+            "excited": 0.94,
+            "happy": 0.97,
+            "sad": 1.08,
+            "bored": 1.06,
+            "surprised": 0.96,
+            "scared": 1.03,
+        }
+
+        # Style mapping
+        style_map: Dict[str, float] = {
+            "whisper": 1.05,  # whisper/whispering
+            "whispering": 1.05,
+            "shout": 0.95,    # shout/shouting
+            "shouting": 0.95,
+            "sarcasm": 1.02,
+            "robotic": 0.98,
+            "calm": 1.00,
+        }
+
+        factor = 1.0
+
+        # Emotion factor
+        for key, val in emotion_map.items():
+            if key in emotion_l:
+                factor *= val
+                break
+
+        # Style factor (match by keyword presence)
+        for key, val in style_map.items():
+            if key in style_prompt_l:
+                factor *= val
+                break
+
+        return max(0.8, min(1.25, factor))
+
 
 class GeminiAPIClient:
     """Handles Gemini API communication."""
@@ -646,29 +716,30 @@ class SampleManager:
         self.duration_database = VoiceDurationDatabase()
     
     def save_duration_stats(self, preserve_embeddings: bool = True) -> None:
-        """Persist current duration statistics (and optionally embeddings) to disk."""
-        try:
-            embeddings_data: Dict[str, Any] = {}
-            if preserve_embeddings and DURATION_STATS_FILE.exists():
-                try:
-                    with open(DURATION_STATS_FILE, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                        embeddings_data = existing_data.get("embeddings", {})
-                except Exception as load_exc:
-                    logger.warning(f"Could not load existing duration stats for merge: {load_exc}")
+        """Persist current duration statistics (and optionally embeddings) to disk.
 
-            combined_data = {
-                "voice_stats": self.duration_database.dict(),
-                "embeddings": embeddings_data
-            }
+        Simplified: we no longer mix adjustments here; those live in a separate file.
+        """
+        embeddings_data: Dict[str, Any] = {}
+        if preserve_embeddings and DURATION_STATS_FILE.exists():
+            try:
+                with open(DURATION_STATS_FILE, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                    embeddings_data = existing_data.get("embeddings", {})
+            except Exception:
+                # Non-critical
+                embeddings_data = {}
 
-            DURATION_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(DURATION_STATS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(combined_data, f, indent=2, ensure_ascii=False)
+        combined_data = {
+            "voice_stats": self.duration_database.dict(),
+            "embeddings": embeddings_data,
+        }
 
-            logger.debug(f"Saved runtime duration stats for {len(self.duration_database.voice_stats)} voices")
-        except Exception as save_exc:
-            logger.error(f"Error saving runtime duration stats: {save_exc}")
+        DURATION_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(DURATION_STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(combined_data, f, indent=2, ensure_ascii=False)
+
+        logger.debug(f"Saved runtime duration stats for {len(self.duration_database.voice_stats)} voices")
 
     def generate_sample_with_validation(self, voice_name: str, sample_file_path: Path,
                                       max_retries_per_model: int = 3) -> bool:
@@ -1014,6 +1085,11 @@ class GeminiTTSWrapper(TTSInterface):
         self._stats_update_counter = 0
         self.cost_tracker = cost_tracker
 
+        # Adaptive duration bias tracking (speaker/voice/language)
+        self._biases: Dict[str, Dict[str, float]] = {"speaker": {}, "voice": {}, "language": {}}
+        self._bias_lock = threading.Lock()
+        self._bias_alpha: float = 0.6  # EMA smoothing for bias updates
+
     def _register_usage(
         self,
         usage_tracker: Optional[Dict[str, Any]],
@@ -1120,11 +1196,44 @@ class GeminiTTSWrapper(TTSInterface):
         except Exception as e:
             logger.error(f"Error during duration analysis initialization: {e}")
 
+        # Load persisted biases from separate adjustments file if available
+        if DURATION_ADJUSTMENTS_FILE.exists():
+            with open(DURATION_ADJUSTMENTS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            biases = data.get('biases', {}) or {}
+            if isinstance(biases, dict):
+                with self._bias_lock:
+                    for scope in ("speaker", "voice", "language"):
+                        if isinstance(biases.get(scope), dict):
+                            self._biases[scope].update({str(k): float(v) for k, v in biases[scope].items()})
+                logger.debug(
+                    f"Loaded biases: speakers={len(self._biases['speaker'])}, voices={len(self._biases['voice'])}, languages={len(self._biases['language'])}"
+                )
+
     def estimate_audio_segment_length(
         self,
         segment_data: TTSSegmentData,
         language: str = "en"
     ) -> Optional[float]:
+        """Public estimator with biases applied."""
+        return self._estimate_duration_internal(segment_data, language, apply_biases=True)
+
+    def _estimate_duration_internal(
+        self,
+        segment_data: TTSSegmentData,
+        language: str,
+        apply_biases: bool = True,
+    ) -> Optional[float]:
+        """Internal duration estimator.
+
+        Args:
+            segment_data: Segment to estimate
+            language: Target language code
+            apply_biases: Whether to apply adaptive biases
+
+        Returns:
+            Estimated duration in seconds
+        """
         """
         Estimate the duration in seconds for a given text segment.
 
@@ -1150,51 +1259,109 @@ class GeminiTTSWrapper(TTSInterface):
         # Get voice statistics
         voice_stats = self.sample_manager.duration_database.get_or_create_stats(voice_name)
 
-        # Analyze text
-        text = segment_data.text.strip()
+        # Analyze text (ignore prompt prefix/style as spoken content; apply style factor later)
+        text = (segment_data.text or "").strip()
         word_count = TextAnalysisUtils.count_words(text)
         char_count = TextAnalysisUtils.count_characters(text)
         complexity_factor = TextAnalysisUtils.estimate_speech_complexity(text)
+        punctuation_pause_sec = TextAnalysisUtils.estimate_punctuation_pause_seconds(text)
 
         logger.debug(
             f"Length estimation for voice '{voice_name}': {word_count} words, {char_count} chars, "
             f"complexity={complexity_factor:.2f}, stats_samples={voice_stats.total_samples}"
         )
 
-        # Estimate using both word-based and character-based methods
+        # Estimate using both word- and character-based methods, mixed by length
         if voice_stats.words_per_minute > 0:
-            word_based_duration = (word_count / voice_stats.words_per_minute) * 60
+            word_based_duration = (word_count / voice_stats.words_per_minute) * 60.0
         else:
-            word_based_duration = (word_count / 150.0) * 60  # Fallback WPM
+            word_based_duration = (word_count / 150.0) * 60.0  # Fallback WPM
 
         if voice_stats.characters_per_second > 0:
             char_based_duration = char_count / voice_stats.characters_per_second
         else:
             char_based_duration = char_count / 12.5  # Fallback CPS
 
-        # Use the average of both methods if we have data, otherwise use word-based
-        if voice_stats.total_samples > 0:  # We have sample data
-            estimated_duration = (word_based_duration + char_based_duration) / 2
-            logger.debug(
-                f"  Using avg: word_based={word_based_duration:.2f}s (WPM={voice_stats.words_per_minute:.1f}), "
-                f"char_based={char_based_duration:.2f}s (CPS={voice_stats.characters_per_second:.1f})"
-            )
-        else:  # No data, use fallback
-            estimated_duration = word_based_duration
-            logger.debug(
-                f"  Using fallback: word_based={word_based_duration:.2f}s (no stats available)"
-            )
+        # Mixing weight: favor chars for short texts, words for long texts
+        # Smooth transition via logistic over character count (threshold ~120 chars)
+        # w_char close to 1 for short → rely on char_based; w_word = 1 - w_char
+        w_char = 1.0 / (1.0 + math.exp((char_count - 120.0) / 25.0))
+        w_word = 1.0 - w_char
 
-        # Apply complexity factor
-        estimated_duration *= complexity_factor
+        base_duration = w_char * char_based_duration + w_word * word_based_duration
 
-        # Apply speed factor if specified
+        # If we have stats, small confidence bonus toward the mix
+        if voice_stats.total_samples > 0:
+            estimated_duration = base_duration
+            logger.debug(
+                f"  Mixed estimate: words={word_based_duration:.2f}s, chars={char_based_duration:.2f}s, "
+                f"w_char={w_char:.2f} → base={base_duration:.2f}s"
+            )
+        else:
+            estimated_duration = base_duration
+
+        # Apply complexity factor and punctuation pauses
+        estimated_duration = max(0.0, estimated_duration * complexity_factor + punctuation_pause_sec)
+
+        # Apply language multiplier (RU tends to be slightly longer)
+        lang = (language or "").lower()
+        if lang.startswith("ru"):
+            estimated_duration *= 1.12
+        elif lang.startswith("en"):
+            estimated_duration *= 1.00
+        # others unchanged for now
+
+        # Style/emotion multiplier (shortens or lengthens)
+        style_factor = TextAnalysisUtils.style_emotion_speed_multiplier(
+            segment_data.style_prompt, segment_data.emotion
+        )
+        estimated_duration *= style_factor
+
+        # Adaptive biases for language/voice/speaker
+        if apply_biases:
+            bias_lang = self._get_bias("language", lang or "")
+            bias_voice = self._get_bias("voice", voice_name)
+            bias_speaker = self._get_bias("speaker", segment_data.speaker or "")
+            bias_total = bias_lang * bias_voice * bias_speaker
+            # Clamp combined bias to avoid runaway
+            if bias_total < 0.7:
+                bias_total = 0.7
+            elif bias_total > 1.3:
+                bias_total = 1.3
+            estimated_duration *= bias_total
+
+        # Apply explicit speed factor if specified
         if segment_data.speed and segment_data.speed > 0:
             estimated_duration /= segment_data.speed
             logger.debug(f"  Applied speed factor {segment_data.speed:.2f}")
 
         logger.debug(f"  Final estimated duration: {estimated_duration:.2f}s")
         return max(0.1, estimated_duration)  # Minimum 0.1 seconds
+
+    def _get_bias(self, scope: str, key: str) -> float:
+        """Get bias factor for scope/key (default 1.0)."""
+        if not key:
+            return 1.0
+        try:
+            with self._bias_lock:
+                return float(self._biases.get(scope, {}).get(key, 1.0))
+        except Exception:
+            return 1.0
+
+    def _update_bias(self, scope: str, key: str, target_ratio: float) -> None:
+        """EMA update of bias toward target_ratio (actual/predicted)."""
+        if not key:
+            return
+        try:
+            with self._bias_lock:
+                old = float(self._biases.setdefault(scope, {}).get(key, 1.0))
+                alpha = self._bias_alpha if self._bias_alpha > 0 else 0.6
+                new = (1.0 - alpha) * old + alpha * float(target_ratio)
+                # Clamp to sane bounds
+                new = max(0.7, min(1.3, new))
+                self._biases[scope][key] = new
+        except Exception as e:
+            logger.debug(f"Bias update failed for {scope}:{key}: {e}")
 
     def get_voice_duration_stats(self, voice_name: Optional[str] = None) -> Dict[str, Any]:
         """Get duration statistics for a specific voice or all voices."""
@@ -1350,7 +1517,8 @@ class GeminiTTSWrapper(TTSInterface):
         self,
         segment: TTSSegmentData,
         synthesized_text: Optional[str],
-        duration_seconds: float
+        duration_seconds: float,
+        language: str
     ) -> None:
         """Update duration statistics with real synthesis data."""
         if duration_seconds <= 0.05:
@@ -1407,13 +1575,58 @@ class GeminiTTSWrapper(TTSInterface):
             f"(normalized {normalized_duration:.2f}s, speed={speed_factor:.2f})"
         )
 
-    def _save_duration_stats_locked(self) -> None:
-        """Save duration statistics to disk. Caller must hold _duration_stats_lock."""
+        # Update adaptive biases using prediction for the exact spoken text (without biases)
         try:
-            self.sample_manager.save_duration_stats(preserve_embeddings=True)
-            logger.debug("Persisted Gemini duration stats to disk")
+            unbiased_segment = TTSSegmentData(
+                speaker=segment.speaker,
+                text=text_for_stats,
+                emotion=segment.emotion,
+                style_prompt=segment.style_prompt,
+                reference_audio_path=segment.reference_audio_path,
+                reference_text=segment.reference_text,
+                voice=segment.voice,
+                speed=segment.speed,
+                output_path=None,
+            )
+            predicted_unbiased = self._estimate_duration_internal(
+                unbiased_segment, language=language, apply_biases=False
+            ) or 0.0
+            if predicted_unbiased > 0:
+                target_ratio = normalized_duration / predicted_unbiased
+                # Update biases for language, voice and speaker
+                lang_key = (language or '').lower()
+                self._update_bias('language', lang_key, target_ratio)
+                self._update_bias('voice', voice_name, target_ratio)
+                self._update_bias('speaker', segment.speaker or '', target_ratio)
+
+                logger.debug(
+                    f"Bias updates (target={target_ratio:.3f}) → "
+                    f"lang={self._get_bias('language', lang_key):.3f}, "
+                    f"voice={self._get_bias('voice', voice_name):.3f}, "
+                    f"speaker={self._get_bias('speaker', segment.speaker or ''):.3f}"
+                )
+
+                # Persist occasionally via existing mechanism
+                with self._duration_stats_lock:
+                    self._maybe_persist_duration_stats_locked()
         except Exception as e:
-            logger.error(f"Failed to persist Gemini duration stats: {e}")
+            logger.debug(f"Adaptive bias update failed: {e}")
+
+    def _save_duration_stats_locked(self) -> None:
+        """Save duration statistics and adjustments to disk. Caller must hold _duration_stats_lock."""
+        self.sample_manager.save_duration_stats(preserve_embeddings=True)
+
+        # Persist biases to separate adjustments file
+        DURATION_ADJUSTMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with self._bias_lock:
+            biases_copy = {
+                'speaker': dict(self._biases.get('speaker', {})),
+                'voice': dict(self._biases.get('voice', {})),
+                'language': dict(self._biases.get('language', {})),
+            }
+        with open(DURATION_ADJUSTMENTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'biases': biases_copy}, f, indent=2, ensure_ascii=False)
+        logger.debug("Persisted duration adjustments to separate file")
 
     def _maybe_persist_duration_stats_locked(self) -> None:
         """Auto-save duration stats when configured threshold is met."""
@@ -1755,7 +1968,7 @@ class GeminiTTSWrapper(TTSInterface):
 
             # Get duration of the synthesized audio
             duration = AudioFileUtils.get_audio_duration_seconds(segment_file_path) or 0.0
-            self._record_duration_stats(segment, synthesized_text, duration)
+            self._record_duration_stats(segment, synthesized_text, duration, language)
             if duration and model_used:
                 self._register_usage(usage_tracker, model_used, audio_seconds=duration)
 

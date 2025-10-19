@@ -40,6 +40,7 @@ from ..debug.reporter import SpeakerReporter
 from ..debug.cost_tracker import CostTracker
 from ..utils.subtitle_utils import SubtitleManager
 from .log_config import get_logger
+from .cost_estimator import CostEstimator
 
 # Import existing factories and interfaces
 from tts.tts_factory import TTSFactory
@@ -249,7 +250,18 @@ class SmartDubbing:
                 self.config.get('duration')
             )
             self.cost_tracker.set_audio_duration(self.audio_processor.get_total_duration())
-            
+
+            # Perform cost estimation before starting the actual pipeline work
+            try:
+                logger.info("Estimating pipeline costs before processing...")
+                estimator = CostEstimator(self.config, cost_tracker=self.cost_tracker)
+                estimated_costs = estimator.estimate(write_summary=False)
+                estimated_total = estimated_costs.get('total', 0.0)
+                logger.info(f"Estimated total cost: ${estimated_total:.4f}")
+                logger.debug("Cost estimation completed")
+            except Exception as est_exc:
+                logger.warning(f"Failed to estimate costs: {est_exc}")
+
             # Perform speaker diarization and transcription
             speakers_rolls, transcription = self.diarize_and_transcribe(audio_file)
             if speakers_rolls is None or len(speakers_rolls) == 0:
@@ -683,8 +695,9 @@ class SmartDubbing:
         from tts.models import TTSSegmentData
         
         # Define comfort ratio constants
-        COMFORT_MIN_ADJUSTMENT_RATIO = 0.75
-        COMFORT_MAX_ADJUSTMENT_RATIO = 1.15
+        # Allow comfort zone override from config (optionally language-specific)
+        COMFORT_MIN_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_min_adjustment_ratio', 0.75)
+        COMFORT_MAX_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_max_adjustment_ratio', 1.15)
         
         # Iteratively estimate and synthesize segments to leverage dynamic duration stats
         segments_metadata: List[Dict[str, Any]] = []
@@ -734,7 +747,7 @@ class SmartDubbing:
                 completed = progress_state["completed"]
             logger.info(
                 f"Completed segment {segment_index+1}/{total_segments} for speaker '{speaker_id}' "
-                f"({completed}/{total_segments} overall) - {note}"
+                f"- {note}"
             )
 
         def select_best_text_variant(
@@ -951,7 +964,10 @@ class SmartDubbing:
             with metadata_lock:
                 segments_metadata.append(metadata)
 
-            logger.info(f"Processing segment {segment_index+1}/{total_segments} (Speaker: {speaker}, TTS: {tts_system})")
+            text = segment_dict["translation"]
+            text_snippet = f"{text[:20]}...{text[-20:]}" if len(text) > 80 else text
+            seg_info = "segment" if total_segments == 1 else f"segment {segment_index+1}/{total_segments}"
+            logger.info(f"Processing {seg_info} (Speaker: {speaker}, TTS: {tts_system}): \"{text_snippet}\"")
 
             tts_lock = tts_locks.get(tts_system)
             if tts_lock is None:
@@ -1016,7 +1032,7 @@ class SmartDubbing:
                     estimation_stats["inaccurate_estimations"] += 1
 
                 logger.info(
-                    f"[MISS] Segment {metadata['index']+1}/{total_segments}: Estimation MISS - "
+                    f"[MISS] Segment duration estimation MISS - "
                     f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
                     f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s. "
                     f"Resynthesizing..."
@@ -1035,7 +1051,7 @@ class SmartDubbing:
                     estimation_stats["accurate_estimations"] += 1
 
                 logger.debug(
-                    f"[HIT] Segment {metadata['index']+1}/{total_segments}: Estimation HIT - "
+                    f"[HIT] Segment estimation HIT - "
                     f"Ratio={ratio:.2f}, Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s"
                 )
 
@@ -1513,34 +1529,34 @@ class SmartDubbing:
         
         # Process each speaker's segments separately
         for speaker in sorted(all_speakers):
-            # Get segments for this speaker
-            speaker_segments = [segment for segment in segments if segment["speaker"] == speaker]
+            # Get segments for this speaker with their original indices
+            speaker_segments = [(idx, segment) for idx, segment in enumerate(segments) if segment["speaker"] == speaker]
             logger.debug(f"Processing {len(speaker_segments)} segments for speaker {speaker}")
             
             # Group segments by continuous speech
             speaker_groups = []
             current_group = []
             
-            for i, segment in enumerate(speaker_segments):
+            for i, (orig_idx, segment) in enumerate(speaker_segments):
                 start_new_group = False
                 
                 if not current_group:
                     start_new_group = True
                 elif i > 0:
-                    prev_segment = speaker_segments[i-1]
+                    prev_orig_idx, prev_segment = speaker_segments[i-1]
                     pause_duration = segment["start"] - prev_segment["end"]
                     
                     if pause_duration > SPLITTING_PAUSE_THRESHOLD_SECONDS:
                         start_new_group = True
                 
-                if current_group and segment["end"] - current_group[0]["start"] > MAX_GROUP_DURATION_SECONDS:
+                if current_group and segment["end"] - current_group[0][1]["start"] > MAX_GROUP_DURATION_SECONDS:
                     start_new_group = True
                 
                 if start_new_group and current_group:
                     speaker_groups.append(current_group)
                     current_group = []
                 
-                current_group.append(segment)
+                current_group.append((orig_idx, segment))
             
             # Add the last group
             if current_group:
@@ -1548,27 +1564,28 @@ class SmartDubbing:
             
             logger.debug(f"Divided speaker {speaker} into {len(speaker_groups)} continuous groups")
             
-            # Store groups information for debug
+            # Store groups information for debug (extract just segments without indices)
             if self.config.get('debug_info', False):
-                speaker_groups_info[speaker] = speaker_groups
+                speaker_groups_info[speaker] = [[seg for _, seg in group] for group in speaker_groups]
                 self.debug_data["speaker_groups"] = speaker_groups_info
             
             # Process each group for this speaker
             for group_idx, group in enumerate(speaker_groups):
-                group_start_time_ms = group[0]["start"] * 1000
-                group_end_time_ms = group[-1]["end"] * 1000
+                group_start_time_ms = group[0][1]["start"] * 1000
+                group_end_time_ms = group[-1][1]["end"] * 1000
                 target_duration_ms = int(group_end_time_ms - group_start_time_ms)
                 
                 # Combine all synthesized audio in this group
                 combined_group_audio = AudioSegment.empty()
                 group_segment_positions = []  # Track individual segment positions within the group
                 
-                for i, segment in enumerate(group):
+                for i, (orig_idx, segment) in enumerate(group):
                     # Add pause between segments if not the first segment
                     segment_start_in_group_ms = len(combined_group_audio)
                     
                     if i > 0:
-                        prev_segment_end = group[i-1]["end"]
+                        _, prev_segment = group[i-1]
+                        prev_segment_end = prev_segment["end"]
                         current_segment_start = segment["start"]
                         pause_duration_ms = int((current_segment_start - prev_segment_end) * 1000)
                         if pause_duration_ms > 0:
@@ -1576,7 +1593,7 @@ class SmartDubbing:
                             segment_start_in_group_ms = len(combined_group_audio)
                     
                     # Load segment audio
-                    segment_file = segment.get('synthesized_speech_file', f"artifacts/audio_chunks/{segments.index(segment)}.wav")
+                    segment_file = segment.get('synthesized_speech_file', f"artifacts/audio_chunks/{orig_idx}.wav")
                     if os.path.exists(segment_file):
                         segment_audio = AudioSegment.from_file(segment_file)
                     else:
@@ -1592,7 +1609,7 @@ class SmartDubbing:
                         "segment": segment,
                         "start_in_group_ms": segment_start_in_group_ms,
                         "end_in_group_ms": segment_end_in_group_ms,
-                        "original_index": segments.index(segment)
+                        "original_index": orig_idx
                     })
                 
                 # Calculate required speed adjustment for the entire group
@@ -1614,8 +1631,8 @@ class SmartDubbing:
                         
                         # Store ratio for debugging
                         if self.config.get('debug_info', False):
-                            for segment in group:
-                                self.debug_data.setdefault("speed_ratios", {})[segments.index(segment)] = ratio_clamped
+                            for orig_idx, segment in group:
+                                self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
                         
                         # Apply tempo filter
                         tempo = 1.0 / ratio_clamped
