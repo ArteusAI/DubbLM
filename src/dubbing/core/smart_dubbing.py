@@ -29,6 +29,7 @@ warnings.filterwarnings("ignore")
 # Import our components
 from .config import DubbingConfig
 from .cache_manager import CacheManager
+from .segment_optimizer import SegmentOptimizer
 from ..audio.audio_processor import AudioProcessor
 from ..audio.speaker_processor import SpeakerProcessor
 from ..video.video_processor import VideoProcessor
@@ -88,6 +89,7 @@ class SmartDubbing:
         )
         self.performance_tracker = PerformanceTracker()
         self.cost_tracker = CostTracker(config)
+        self.segment_optimizer = SegmentOptimizer(config, tts_system=config.get('tts_system'))
         
         # Initialize processors
         self.audio_processor = AudioProcessor(self.cache_manager, self.performance_tracker)
@@ -346,8 +348,8 @@ class SmartDubbing:
                 normalize_audio=self.config.get('normalize_audio', True),
                 use_two_pass_encoding=self.config.get('use_two_pass_encoding', True),
                 remove_pauses=self.config.get('remove_pauses', True),
-                min_pause_duration=self.config.get('min_pause_duration', 3),
-                preserve_pause_duration=self.config.get('preserve_pause_duration', 1.5),
+                min_pause_duration=self.config.get('segments_optimization', {}).get('min_pause_duration', 3),
+                preserve_pause_duration=self.config.get('segments_optimization', {}).get('preserve_pause_duration', 1.5),
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
                 ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
                 dubbed_volume=self.config.get('dubbed_volume', 1.0),
@@ -503,7 +505,10 @@ class SmartDubbing:
             cache_key=cache_key,
             use_cache=self.cache_manager.use_cache
         )
-        
+
+        # Optimize segments after diarization
+        transcription = self.segment_optimizer.optimize_post_diarization(transcription)
+
         # Store for debug
         self.debug_data["diarization"] = speakers_rolls
         self.debug_data["transcription"] = transcription
@@ -549,10 +554,21 @@ class SmartDubbing:
             # End timing
             elapsed_time = self.performance_tracker.end_timing("translation")
             logger.info(f"Finished translation in {elapsed_time:.2f} seconds (≈ {elapsed_time/60:.2f} minutes)")
-        
+
+        # Optimize segments after translation
+        initial_count = len(transcription)
+        pre_opt_count = len(translated_segments)
+        translated_segments = self.segment_optimizer.optimize_post_translation(translated_segments)
+
+        # Log final translation pipeline statistics
+        logger.info(
+            f"Translation pipeline: {initial_count} input segments → {pre_opt_count} translated segments → "
+            f"{len(translated_segments)} final optimized segments"
+        )
+
         # Store for debug
         self.debug_data["translation"] = translated_segments
-        
+
         return translated_segments
     
     def analyze_emotions(self, segments: List[Dict], audio_file: str) -> List[Dict]:
@@ -1416,9 +1432,11 @@ class SmartDubbing:
             return AudioSegment.empty(), []
         
         logger.info("Grouping segments by speaker and optimizing timing...")
-        
-        SPLITTING_PAUSE_THRESHOLD_SECONDS = 3
-        MAX_GROUP_DURATION_SECONDS = 60
+
+        # Get parameters from config
+        opt_cfg = self.config.get('segments_optimization', {})
+        SPLITTING_PAUSE_THRESHOLD_SECONDS = opt_cfg.get('post_translation_merge_gap', 1.5)
+        MAX_GROUP_DURATION_SECONDS = opt_cfg.get('max_segment_duration', 60)
         LIMIT_MIN_ADJUSTMENT_RATIO = 0.5
         LIMIT_MAX_ADJUSTMENT_RATIO = 1.15
         
@@ -1554,10 +1572,7 @@ class SmartDubbing:
                         logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
                 
                 # Enforce allowed overflow beyond the group's original timeframe
-                try:
-                    overflow_tolerance = float(self.config.get('group_overflow_tolerance', 1.0))
-                except Exception:
-                    overflow_tolerance = 1.0
+                overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 1.0))
                 overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
 
                 original_group_span_ms = target_duration_ms

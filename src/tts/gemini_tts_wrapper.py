@@ -456,7 +456,10 @@ class GeminiAPIClient:
                             part.inline_data.mime_type == "audio/L16;codec=pcm;rate=24000"):
                             return part.inline_data.data
                 
-                logger.warning(f"Attempt {attempt + 1}/{self.config.max_retries}: No audio data in response for text: {content[:30]}...")
+                # Extract text without prompt for logging
+                log_text = content.split('\n', 1)[-1] if '\n' in content else content
+                log_preview = f"{log_text[:30]}...{log_text[-30:]}" if len(log_text) > 70 else log_text
+                logger.warning(f"Attempt {attempt + 1}/{self.config.max_retries}: No audio data in response for text: {log_preview}")
                 if attempt + 1 >= self.config.max_retries:
                     logger.error(f"Gemini API call failed after {self.config.max_retries} attempts.")
                     return b''
@@ -1124,11 +1127,11 @@ class GeminiTTSWrapper(TTSInterface):
     ) -> Optional[float]:
         """
         Estimate the duration in seconds for a given text segment.
-        
+
         Args:
             segment_data: TTSSegmentData object containing text and voice parameters
             language: Target language code (e.g., "en")
-            
+
         Returns:
             Estimated duration in seconds, or None if estimation is not possible
         """
@@ -1141,17 +1144,22 @@ class GeminiTTSWrapper(TTSInterface):
             voice_name = self.voice_mapping.get(segment_data.speaker)
         if not voice_name:
             voice_name = self.config.default_voice
-        
+
         voice_name = self._validate_voice_name(voice_name)
 
         # Get voice statistics
         voice_stats = self.sample_manager.duration_database.get_or_create_stats(voice_name)
-        
+
         # Analyze text
         text = segment_data.text.strip()
         word_count = TextAnalysisUtils.count_words(text)
         char_count = TextAnalysisUtils.count_characters(text)
         complexity_factor = TextAnalysisUtils.estimate_speech_complexity(text)
+
+        logger.debug(
+            f"Length estimation for voice '{voice_name}': {word_count} words, {char_count} chars, "
+            f"complexity={complexity_factor:.2f}, stats_samples={voice_stats.total_samples}"
+        )
 
         # Estimate using both word-based and character-based methods
         if voice_stats.words_per_minute > 0:
@@ -1167,8 +1175,15 @@ class GeminiTTSWrapper(TTSInterface):
         # Use the average of both methods if we have data, otherwise use word-based
         if voice_stats.total_samples > 0:  # We have sample data
             estimated_duration = (word_based_duration + char_based_duration) / 2
+            logger.debug(
+                f"  Using avg: word_based={word_based_duration:.2f}s (WPM={voice_stats.words_per_minute:.1f}), "
+                f"char_based={char_based_duration:.2f}s (CPS={voice_stats.characters_per_second:.1f})"
+            )
         else:  # No data, use fallback
             estimated_duration = word_based_duration
+            logger.debug(
+                f"  Using fallback: word_based={word_based_duration:.2f}s (no stats available)"
+            )
 
         # Apply complexity factor
         estimated_duration *= complexity_factor
@@ -1176,7 +1191,9 @@ class GeminiTTSWrapper(TTSInterface):
         # Apply speed factor if specified
         if segment_data.speed and segment_data.speed > 0:
             estimated_duration /= segment_data.speed
+            logger.debug(f"  Applied speed factor {segment_data.speed:.2f}")
 
+        logger.debug(f"  Final estimated duration: {estimated_duration:.2f}s")
         return max(0.1, estimated_duration)  # Minimum 0.1 seconds
 
     def get_voice_duration_stats(self, voice_name: Optional[str] = None) -> Dict[str, Any]:
@@ -1355,6 +1372,12 @@ class GeminiTTSWrapper(TTSInterface):
 
         voice_name = self._resolve_voice_for_segment(segment)
 
+        # Get current stats before update for comparison
+        voice_stats = self.sample_manager.duration_database.get_or_create_stats(voice_name)
+        old_wpm = voice_stats.words_per_minute
+        old_cps = voice_stats.characters_per_second
+        old_samples = voice_stats.total_samples
+
         smoothing_alpha = self.config.duration_smoothing_alpha
         if smoothing_alpha is not None and smoothing_alpha <= 0:
             smoothing_alpha = None
@@ -1369,13 +1392,19 @@ class GeminiTTSWrapper(TTSInterface):
             )
             self._stats_update_counter += 1
             self._maybe_persist_duration_stats_locked()
+
+        # Get updated stats for comparison
+        new_wpm = voice_stats.words_per_minute
+        new_cps = voice_stats.characters_per_second
+
+        logger.info(
+            f"Stats correction for voice '{voice_name}': "
+            f"WPM {old_wpm:.1f} -> {new_wpm:.1f}, CPS {old_cps:.1f} -> {new_cps:.1f} "
+            f"(samples: {old_samples} -> {voice_stats.total_samples}, alpha={smoothing_alpha})"
+        )
         logger.debug(
-            "Updated duration stats for voice '%s' with %d words, %d chars, %.2fs (normalized %.2fs)",
-            voice_name,
-            words,
-            characters,
-            duration_seconds,
-            normalized_duration
+            f"  From synthesis: {words} words, {characters} chars, {duration_seconds:.2f}s "
+            f"(normalized {normalized_duration:.2f}s, speed={speed_factor:.2f})"
         )
 
     def _save_duration_stats_locked(self) -> None:

@@ -1,5 +1,8 @@
 from typing import Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field
+from src.dubbing.core.log_config import get_logger
+
+logger = get_logger(__name__)
 
 class TTSSegmentData(BaseModel):
     """Data model for a single text segment to be synthesized."""
@@ -44,11 +47,15 @@ class VoiceDurationStats(BaseModel):
             smoothing_alpha: Optional smoothing factor (0-1). When provided,
                 applies exponential smoothing to derived rates instead of a pure average.
         """
+        # Store old values for logging
+        old_wpm = self.words_per_minute
+        old_cps = self.characters_per_second
+
         self.total_samples += 1
         self.total_words += words
         self.total_characters += characters
         self.total_duration_seconds += duration
-        
+
         if duration <= 0:
             return
 
@@ -65,6 +72,12 @@ class VoiceDurationStats(BaseModel):
             self.characters_per_second = (
                 (1 - alpha) * self.characters_per_second + alpha * sample_characters_per_second
             )
+
+            logger.debug(
+                f"Applied EMA smoothing (alpha={alpha:.2f}): "
+                f"sample WPM={sample_words_per_minute:.1f}, CPS={sample_characters_per_second:.1f} -> "
+                f"smoothed WPM={self.words_per_minute:.1f}, CPS={self.characters_per_second:.1f}"
+            )
         else:
             if self.total_duration_seconds > 0:
                 self.words_per_minute = (self.total_words / self.total_duration_seconds) * 60
@@ -72,6 +85,12 @@ class VoiceDurationStats(BaseModel):
             else:
                 self.words_per_minute = sample_words_per_minute
                 self.characters_per_second = sample_characters_per_second
+
+            logger.debug(
+                f"Updated stats using cumulative average: "
+                f"sample WPM={sample_words_per_minute:.1f}, CPS={sample_characters_per_second:.1f} -> "
+                f"avg WPM={self.words_per_minute:.1f}, CPS={self.characters_per_second:.1f}"
+            )
 
 
 class VoiceDurationDatabase(BaseModel):

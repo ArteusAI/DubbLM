@@ -603,8 +603,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         # Report performance metrics
         elapsed_time = time.perf_counter() - start_time
         logger.debug(f"Completed translation pipeline (including refinement) in {elapsed_time:.2f} seconds")
-        logger.info(f"Processed {len(segments)} segments → {len(optimized_segments)} initial optimized segments → {len(chunks)} chunks → {len(refined_chunks)} refined chunks → {len(translated_segments)} translated segments → {len(final_segments)} final segments")
-        
+
         return final_segments
     
     def _optimize_segments(self, segments: List[Dict], max_gap_seconds: float = 0.3, max_chars: int = 500) -> List[Dict]:
@@ -997,19 +996,38 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     if attempt < max_attempts - 1:
                         logger.warning(f"Empty translation received, retrying ({attempt+1}/{max_attempts})...")
                         if debug:
-                            self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, translation_text, None, 
+                            self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, translation_text, None,
                                                      chunk_text, f"Empty translation received")
                         continue
                     else:
                         # Will handle failure after loop
                         logger.error(f"Failed to get translation after {max_attempts} attempts, empty response")
                         break  # Will trigger the fallback splitting mechanism
-                
+
+                logger.debug(f"TRACE: Raw LLM response (first 500 chars): {translation_text[:500]}")
+
                 try:
                     # Try to parse JSON from LLM response
                     repaired_json = json_repair.loads(translation_text)
-                            
-                    translated_pairs = repaired_json.get("translations", [])
+                    logger.debug(f"TRACE: Parsed JSON type: {type(repaired_json)}, is_list: {isinstance(repaired_json, list)}, is_dict: {isinstance(repaired_json, dict)}")
+                    if isinstance(repaired_json, (list, dict)) and len(str(repaired_json)) < 500:
+                        logger.debug(f"TRACE: Parsed JSON value: {repaired_json}")
+                    else:
+                        logger.debug(f"TRACE: Parsed JSON value (truncated): {str(repaired_json)[:500]}...")
+
+                    # Handle different response formats from LLM
+                    if isinstance(repaired_json, list):
+                        # LLM returned array directly: [{"speaker": "X", "translation": "..."}, ...]
+                        translated_pairs = repaired_json
+                        # Normalize field names: "translation" -> "text"
+                        for pair in translated_pairs:
+                            if isinstance(pair, dict) and "translation" in pair and "text" not in pair:
+                                pair["text"] = pair.pop("translation")
+                    elif isinstance(repaired_json, dict):
+                        # LLM returned object: {"translations": [...]}
+                        translated_pairs = repaired_json.get("translations", [])
+                    else:
+                        raise ValueError(f"Unexpected JSON type: {type(repaired_json)}")
                         
                     # Validate all translations match the target language
                     validation_errors = []

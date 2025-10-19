@@ -1204,5 +1204,22 @@ Context after:
 
 CRITICAL: Output translation should contain same number of rows and original speaker names. If phrase is not translatable, leave blank.
 
-IMPORTANT: Respond in JSON format with an array of objects containing speaker and translated text.
+IMPORTANT: Respond in JSON format following this exact structure:
+
+{{
+  "translations": [
+    {{
+      "speaker": "SPEAKER_ID",
+      "text": "translated text here"
+    }}
+  ]
+}}
+
+JSON Requirements:
+- Root object with single key "translations"
+- Value is array of objects
+- Each object has "speaker" and "text" fields
+- Field name is "text" NOT "translation"
+- Number of objects must match input lines
+- Speaker IDs must match exactly
 """

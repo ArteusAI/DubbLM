@@ -34,7 +34,6 @@ logger = get_logger(__name__)
 # Constants for audio chunking
 TARGET_CHUNK_LENGTH_MINUTES = 15
 MIN_CHUNK_LENGTH_MINUTES = 5
-ADJACENT_SPEAKER_SEGMENTS_MAX_GAP_SECONDS = 0.3
 
 class PyAnnoteOpenAITranscriber(BaseTranscriber):
     """Transcription and diarization service using PyAnnote and OpenAI/Whisper."""
@@ -562,11 +561,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         for start, end, speaker in all_segments:
             logger.debug(f"Speaker {speaker}: from {start:.2f}s to {end:.2f}s")
             speakers_rolls[(start, end)] = speaker
-        
-        # Merge adjacent segments from the same speaker with short pauses
-        logger.debug("Merging adjacent segments from the same speaker...")
-        speakers_rolls = self._merge_adjacent_speaker_segments(speakers_rolls, ADJACENT_SPEAKER_SEGMENTS_MAX_GAP_SECONDS)
-        
+
         # Store for debug
         self.debug_data["diarization"] = speakers_rolls
         
@@ -575,76 +570,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             self.cache_manager.save_to_cache(step_name, cache_key, speakers_rolls)
         
         return speakers_rolls
-    
-    def _merge_adjacent_speaker_segments(self, speakers_rolls: Dict[Tuple[float, float], str], max_pause: float) -> Dict[Tuple[float, float], str]:
-        """
-        Merge adjacent speech segments from the same speaker when the pause between them is less than max_pause.
-        Performs multiple passes until no more merges are possible.
-        
-        Args:
-            speakers_rolls: Dictionary mapping time ranges to speaker IDs
-            max_pause: Maximum pause in seconds to consider for merging
-            
-        Returns:
-            Dictionary with merged segments
-        """
-        if not speakers_rolls:
-            return {}
-            
-        # Convert speakers_rolls to a list of (start, end, speaker) tuples
-        segments = [(start, end, speaker) for (start, end), speaker in speakers_rolls.items()]
-        
-        # Sort segments by start time
-        segments.sort(key=lambda x: x[0])
-        
-        total_merged = 0
-        pass_count = 0
-        
-        # Keep merging until no more merges happen
-        while True:
-            pass_count += 1
-            merged_in_this_pass = 0
-            i = 0
-            
-            while i < len(segments) - 1:
-                start1, end1, speaker1 = segments[i]
-                start2, end2, speaker2 = segments[i + 1]
-                gap = start2 - end1
-                
-                if speaker1 == speaker2 and gap <= max_pause:
-                    # Log merges with different characteristics
-                    if gap < 0:
-                        logger.debug(f"Merging overlapping segments: {end1:.2f}-{start2:.2f} (overlap: {-gap:.2f}s)")
-                    elif gap == 0:
-                        logger.debug(f"Merging exactly adjacent segments at {end1:.2f}s")
-                    
-                    # Merge segments
-                    segments[i] = (start1, end2, speaker1)
-                    # Remove the merged segment
-                    segments.pop(i + 1)
-                    merged_in_this_pass += 1
-                else:
-                    i += 1
-            
-            total_merged += merged_in_this_pass
-            
-            # If no merges in this pass, we're done
-            if merged_in_this_pass == 0:
-                break
-                
-            # Safety check - don't go into infinite loop
-            if pass_count >= 10:
-                logger.info("Reached maximum number of merge passes (10)")
-                break
-        
-        if total_merged > 0:
-            logger.debug(f"Merged {total_merged} adjacent segments in {pass_count} passes (pauses < {max_pause:.1f}s)")
-            
-        # Convert back to dictionary
-        merged_speakers_rolls = {(start, end): speaker for start, end, speaker in segments}
-        
-        return merged_speakers_rolls
-    
+
     def _transcribe_audio(
         self,
         audio_file: str,

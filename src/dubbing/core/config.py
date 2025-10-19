@@ -69,17 +69,31 @@ class DubbingConfig:
             'tts_system_mapping': None,
             'tts_prompt_prefix': None,
             'remove_pauses': False,
-            'min_pause_duration': 3,
             'use_two_pass_encoding': True,
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
             'background_volume': 0.562341,
-            'group_overflow_tolerance': 1.0,
             'enable_emotion_enrichment': False,
             'emotion_enrichment_model': 'gemini-2.5-pro',
             'emotion_enrichment_temperature': 0.7,
             'max_workers': 4,
-            'estimate_cost': False
+            'estimate_cost': False,
+            # Segment optimization settings (grouped)
+            'segments_optimization': {
+                # Merging after diarization (tight gap for better transcription/translation)
+                'post_diarization_merge_gap': 0.3,
+                # Merging after translation (relaxed gap for TTS optimization)
+                'post_translation_merge_gap': 1.5,
+                # Segment length constraints
+                'max_segment_chars': 420,
+                'max_segment_duration': 60,
+                'min_segment_duration': 0.5,
+                # Video pause processing
+                'min_pause_duration': 3,
+                'preserve_pause_duration': 1.5,
+                # TTS grouping
+                'group_overflow_tolerance': 1.0,
+            }
         }
         
         # Required parameters that must come from CLI
@@ -271,12 +285,10 @@ class DubbingConfig:
         parser.add_argument('--tts_system_mapping', type=str, help='JSON string mapping speakers to TTS systems')
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
         parser.add_argument('--remove_pauses', type=lambda x: (str(x).lower() == 'true'), help='Remove small pauses from video while preserving keyframes (True/False)')
-        parser.add_argument('--min_pause_duration', default=3, type=float, help='Minimum pause duration to consider for removal (seconds)')
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')
         parser.add_argument('--background_volume', type=float, help='Gain multiplier for background track when keep_background=true (e.g., 0.56 ≈ -5 dB)')
-        parser.add_argument('--group_overflow_tolerance', type=float, help='Allowed overflow beyond group timeframe when combining segments (0..1, default 1.0)')
         
         return parser
 
