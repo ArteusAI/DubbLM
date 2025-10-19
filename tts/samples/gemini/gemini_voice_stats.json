@@ -39,12 +39,12 @@
       },
       "Alnilam": {
         "voice_name": "Alnilam",
-        "words_per_minute": 358.224434694456,
-        "characters_per_second": 38.378852078869606,
-        "total_samples": 22,
-        "total_words": 1218,
-        "total_characters": 8125,
-        "total_duration_seconds": 291.64108333333337
+        "words_per_minute": 282.1323796305081,
+        "characters_per_second": 32.31682422072555,
+        "total_samples": 44,
+        "total_words": 2237,
+        "total_characters": 15040,
+        "total_duration_seconds": 523.1221666666667
       },
       "Aoede": {
         "voice_name": "Aoede",
@@ -192,12 +192,12 @@
       },
       "Rasalgethi": {
         "voice_name": "Rasalgethi",
-        "words_per_minute": 282.74221858996447,
-        "characters_per_second": 31.27373083231629,
-        "total_samples": 9,
-        "total_words": 621,
-        "total_characters": 4215,
-        "total_duration_seconds": 199.81862499999997
+        "words_per_minute": 381.9124444208112,
+        "characters_per_second": 42.66688047140139,
+        "total_samples": 24,
+        "total_words": 1407,
+        "total_characters": 9571,
+        "total_duration_seconds": 407.42299999999994
       },
       "Sadachbia": {
         "voice_name": "Sadachbia",

@@ -16,6 +16,7 @@ import warnings
 import shutil
 import subprocess
 import random
+import hashlib
 from typing import Dict, List, Tuple, Optional, Any, Literal, Union
 from pathlib import Path
 from dotenv import load_dotenv
@@ -685,357 +686,388 @@ class SmartDubbing:
         COMFORT_MIN_ADJUSTMENT_RATIO = 0.75
         COMFORT_MAX_ADJUSTMENT_RATIO = 1.15
         
-        # Group segments by TTS system for batch processing
-        segments_by_tts_system = {}
-        segment_to_tts_mapping = {}
-        
-        for i, segment_dict in enumerate(segments):
+        # Iteratively estimate and synthesize segments to leverage dynamic duration stats
+        segments_metadata: List[Dict[str, Any]] = []
+        total_segments = len(segments)
+        target_language = self.config.get('target_language')
+
+        # Track estimation accuracy
+        estimation_stats = {
+            "total_segments": 0,
+            "accurate_estimations": 0,  # Within comfort zone
+            "inaccurate_estimations": 0,  # Outside comfort zone, needed resynthesis
+        }
+
+        logger.info(f"Iteratively synthesizing {total_segments} segments with dynamic duration feedback...")
+
+        # Prepare speaker queues while preserving original order
+        speaker_to_indices: Dict[str, List[int]] = {}
+        for idx, seg in enumerate(segments):
+            speaker_id = seg["speaker"]
+            speaker_to_indices.setdefault(speaker_id, []).append(idx)
+
+        max_workers_config = self.config.get('max_workers', 4)
+        if not max_workers_config or max_workers_config <= 0:
+            max_workers_config = 1
+        max_workers = min(max_workers_config, max(1, len(speaker_to_indices)))
+
+        logger.debug(f"Using up to {max_workers} worker(s) for parallel synthesis across speakers")
+
+        # Shared synchronization primitives
+        debug_data_lock = threading.Lock()
+        metadata_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        progress_state = {"completed": 0}
+
+        # Ensure each TTS instance has a synthesis lock to avoid concurrent model switching
+        tts_locks: Dict[str, threading.Lock] = {}
+        for system_name, tts_instance in self.tts_systems.items():
+            lock = getattr(tts_instance, "_synthesis_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(tts_instance, "_synthesis_lock", lock)
+            tts_locks[system_name] = lock
+
+        def increment_progress(segment_index: int, speaker_id: str, note: str) -> None:
+            with progress_lock:
+                progress_state["completed"] += 1
+                completed = progress_state["completed"]
+            logger.info(
+                f"Completed segment {segment_index+1}/{total_segments} for speaker '{speaker_id}' "
+                f"({completed}/{total_segments} overall) - {note}"
+            )
+
+        def select_best_text_variant(
+            segment_index: int,
+            segment_dict: Dict[str, Any],
+            tts_segment_data_args: Dict[str, Any],
+            tts_instance,
+            tts_system: str,
+            original_duration: float
+        ) -> Tuple[str, float, float, str]:
+            base_text = segment_dict.get("translation", "")
+            best_text = base_text
+            best_track_type = "translation"
+            best_ratio = 1.0
+            best_deviation = 0.0
+
+            try:
+                normal_duration = tts_instance.estimate_audio_segment_length(
+                    TTSSegmentData(**tts_segment_data_args),
+                    language=target_language
+                )
+            except Exception as estimate_exc:
+                logger.warning(
+                    f"Segment {segment_index+1} ({tts_system}): duration estimation failed for base translation: {estimate_exc}"
+                )
+                return best_text, best_ratio, best_deviation, best_track_type
+
+            if not normal_duration or normal_duration <= 0:
+                logger.warning(
+                    f"Segment {segment_index+1} ({tts_system}): Invalid duration estimate for base translation. Using as-is."
+                )
+                return best_text, best_ratio, best_deviation, best_track_type
+
+            ratio_normal = original_duration / normal_duration if normal_duration > 0 else 1.0
+            deviation_normal = self._calculate_percentage_deviation(
+                ratio_normal,
+                COMFORT_MIN_ADJUSTMENT_RATIO,
+                COMFORT_MAX_ADJUSTMENT_RATIO,
+            )
+            best_ratio = ratio_normal
+            best_deviation = deviation_normal
+
+            logger.debug(
+                f"Segment {segment_index+1} ({tts_system}): Normal translation - Estimated duration: {normal_duration:.2f}s, "
+                f"Ratio: {ratio_normal:.2f}, Deviation: {deviation_normal:.2%}"
+            )
+
+            if deviation_normal == 0.0:
+                logger.debug("  Normal translation is within comfort zone. Selecting it.")
+                return best_text, best_ratio, best_deviation, best_track_type
+
+            alternatives: List[Tuple[str, str]] = []
+            if ratio_normal < COMFORT_MIN_ADJUSTMENT_RATIO:
+                if segment_dict.get("very_short_translation"):
+                    alternatives.append(("very_short_translation", segment_dict["very_short_translation"]))
+                if segment_dict.get("short_translation"):
+                    alternatives.append(("short_translation", segment_dict["short_translation"]))
+            elif ratio_normal > COMFORT_MAX_ADJUSTMENT_RATIO:
+                if segment_dict.get("long_translation"):
+                    alternatives.append(("long_translation", segment_dict["long_translation"]))
+
+            if alternatives:
+                logger.debug(f"  Evaluating {len(alternatives)} alternative(s) for segment {segment_index+1}...")
+                for alt_key, alt_text in alternatives:
+                    if not alt_text:
+                        continue
+                    alt_args = {**tts_segment_data_args, "text": alt_text}
+                    try:
+                        alt_duration = tts_instance.estimate_audio_segment_length(
+                            TTSSegmentData(**alt_args),
+                            language=target_language
+                        )
+                    except Exception as alt_exc:
+                        logger.warning(
+                            f"Segment {segment_index+1} ({tts_system}): duration estimation failed for {alt_key}: {alt_exc}"
+                        )
+                        continue
+
+                    if not alt_duration or alt_duration <= 0:
+                        continue
+
+                    alt_ratio = original_duration / alt_duration if alt_duration > 0 else 1.0
+                    alt_deviation = self._calculate_percentage_deviation(
+                        alt_ratio,
+                        COMFORT_MIN_ADJUSTMENT_RATIO,
+                        COMFORT_MAX_ADJUSTMENT_RATIO,
+                    )
+
+                    logger.debug(
+                        f"    Alternative {alt_key.replace('_', ' ')} - Estimated duration: {alt_duration:.2f}s, "
+                        f"Ratio: {alt_ratio:.2f}, Deviation: {alt_deviation:.2%}"
+                    )
+
+                    if alt_deviation < best_deviation:
+                        best_text = alt_text
+                        best_ratio = alt_ratio
+                        best_deviation = alt_deviation
+                        best_track_type = alt_key
+                        logger.debug(
+                            f"      New best: {alt_key.replace('_', ' ').title()} (Deviation: {best_deviation:.2%})"
+                        )
+                        if best_deviation == 0.0:
+                            break
+
+            logger.debug(
+                f"  Selected for synthesis: '{best_text[:50]}...' (Ratio: {best_ratio:.2f}, Deviation: {best_deviation:.2%})"
+            )
+            return best_text, best_ratio, best_deviation, best_track_type
+
+        def handle_segment(segment_index: int) -> Optional[Dict[str, Any]]:
+            segment_dict = segments[segment_index]
             speaker = segment_dict["speaker"]
             tts_system = self._get_tts_system_for_speaker(speaker)
-            
-            if tts_system not in segments_by_tts_system:
-                segments_by_tts_system[tts_system] = []
-            
-            segments_by_tts_system[tts_system].append((i, segment_dict))
-            segment_to_tts_mapping[i] = tts_system
-        
-        logger.debug(f"Segments grouped by TTS system: {[(tts_sys, len(segs)) for tts_sys, segs in segments_by_tts_system.items()]}")
-        
-        # First pass: Determine the best text version for each segment using estimation
-        segments_to_synthesize_by_tts = {tts_sys: [] for tts_sys in segments_by_tts_system.keys()}
-        segments_metadata = []
-        
-        # Initialize progress tracking
-        total_segments = len(segments)
-        completed_segments = 0
-        
-        logger.info(f"Estimating audio durations to select optimal text versions for {total_segments} segments...")
-        
-        for tts_system, segment_list in segments_by_tts_system.items():
-            # Get the shared TTS instance for this system type
             tts_instance = self.tts_systems.get(tts_system)
             if not tts_instance:
-                logger.warning(f"Warning: TTS system {tts_system} not available, using default")
+                logger.warning(f"TTS system {tts_system} not available, falling back to default")
                 tts_instance = self.default_tts
-            
-            logger.debug(f"Processing {len(segment_list)} segments with {tts_system} TTS ...")
-            
-            for i, segment_dict in segment_list:
-                # Determine speaker for this segment
-                speaker = segment_dict["speaker"]
-                
-                # Get the voice prompt for this speaker if available
-                segment_style_prompt = self.voice_prompt.get(speaker, None)
-                
-                # Get voice name if available (for OpenAI/Gemini TTS)
-                voice_name = None
-                voice_config = self.config.get('voice_name')
-                if isinstance(voice_config, dict):
-                    voice_name = voice_config.get(speaker, next(iter(voice_config.values()), "default"))
-                elif isinstance(voice_config, str):
-                    voice_name = voice_config
-                
-                # Store the voice information for debug
-                if self.config.get('debug_info', False):
-                    self.debug_data["voices"][i] = {
+            if not tts_instance:
+                raise ValueError(f"No TTS instance available for speaker '{speaker}' (system {tts_system})")
+
+            segment_style_prompt = self.voice_prompt.get(speaker, None)
+
+            voice_name = None
+            voice_config = self.config.get('voice_name')
+            if isinstance(voice_config, dict):
+                voice_name = voice_config.get(speaker, next(iter(voice_config.values()), "default"))
+            elif isinstance(voice_config, str):
+                voice_name = voice_config
+
+            if self.config.get('debug_info', False):
+                with debug_data_lock:
+                    self.debug_data["voices"][segment_index] = {
                         "speaker": speaker,
                         "voice": voice_name,
                         "style_prompt": segment_style_prompt,
                         "tts_system": tts_system
                     }
-                
-                # Check cache first
-                import hashlib
-                translation_hash = hashlib.md5(segment_dict["translation"].encode()).hexdigest()[:8]
-                voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
-                segment_cache_key = f"{base_cache_prefix}_{tts_system}_{i}_{speaker}_{translation_hash}_{voice_prompt_hash}"
-                current_segment_output_path = f"artifacts/audio_chunks/{i}.wav"
-                os.makedirs(os.path.dirname(current_segment_output_path), exist_ok=True)
-                
-                segment_cached_file_path = segment_cache_path / f"{segment_cache_key}.wav"
-                
-                # Try to use cached segment
-                if self.cache_manager.use_cache and segment_cached_file_path.exists():
+
+            translation_hash = hashlib.md5(segment_dict["translation"].encode()).hexdigest()[:8]
+            voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
+            segment_cache_key = f"{base_cache_prefix}_{tts_system}_{segment_index}_{speaker}_{translation_hash}_{voice_prompt_hash}"
+            current_segment_output_path = f"artifacts/audio_chunks/{segment_index}.wav"
+            os.makedirs(os.path.dirname(current_segment_output_path), exist_ok=True)
+            segment_cached_file_path = segment_cache_path / f"{segment_cache_key}.wav"
+
+            if self.cache_manager.use_cache and segment_cached_file_path.exists():
+                try:
+                    cached_audio_info = AudioSegment.from_file(segment_cached_file_path)
+                    if len(cached_audio_info) > 0:
+                        shutil.copy(segment_cached_file_path, current_segment_output_path)
+                        segment_dict['synthesized_speech_len'] = len(cached_audio_info) / 1000.0
+                        segment_dict['synthesized_speech_file'] = current_segment_output_path
+                        increment_progress(segment_index, speaker, "cache hit")
+                        return None
+                    else:
+                        os.remove(segment_cached_file_path)
+                except Exception:
                     try:
-                        cached_audio_info = AudioSegment.from_file(segment_cached_file_path)
-                        if len(cached_audio_info) > 0:
-                            logger.debug(f"Using valid cached segment {i+1}/{len(segments)} ({tts_system})")
-                            shutil.copy(segment_cached_file_path, current_segment_output_path)
-                            segment_dict['synthesized_speech_len'] = len(cached_audio_info) / 1000.0
-                            segment_dict['synthesized_speech_file'] = current_segment_output_path
-                            continue
-                        else:
-                            os.remove(segment_cached_file_path)
-                    except Exception as e:
-                        try:
-                            os.remove(segment_cached_file_path)
-                        except:
-                            pass
-                
-                # Prepare base TTSSegmentData
-                tts_segment_data_args = {
-                    "speaker": speaker,
-                    "text": segment_dict["translation"],
-                    "emotion": segment_dict.get("emotion", "Neutral"),
-                    "style_prompt": segment_style_prompt,
-                    "reference_audio_path": None,
-                    "reference_text": None,
-                    "voice": voice_name,
-                    "speed": 1.0
-                }
-                
-                # Generic reference audio path for systems that might use it
-                potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"
-                if os.path.exists(potential_ref_audio_for_speaker):
-                    tts_segment_data_args["reference_audio_path"] = potential_ref_audio_for_speaker
-                
-                # Calculate original duration and estimate current translation
-                original_duration = segment_dict["end"] - segment_dict["start"]
-                
-                # Create TTSSegmentData for estimation
-                segment_data_model = TTSSegmentData(**tts_segment_data_args)
-                
-                # Estimate duration for normal translation
-                estimated_duration_normal = tts_instance.estimate_audio_segment_length(
-                    segment_data_model,
-                    language=self.config.get('target_language')
+                        os.remove(segment_cached_file_path)
+                    except Exception:
+                        pass
+
+            tts_segment_data_args = {
+                "speaker": speaker,
+                "text": segment_dict["translation"],
+                "emotion": segment_dict.get("emotion", "Neutral"),
+                "style_prompt": segment_style_prompt,
+                "reference_audio_path": None,
+                "reference_text": None,
+                "voice": voice_name,
+                "speed": 1.0
+            }
+
+            potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"
+            if os.path.exists(potential_ref_audio_for_speaker):
+                tts_segment_data_args["reference_audio_path"] = potential_ref_audio_for_speaker
+
+            original_duration = segment_dict["end"] - segment_dict["start"]
+
+            best_text, best_ratio, best_deviation, best_track_type = select_best_text_variant(
+                segment_index,
+                segment_dict,
+                tts_segment_data_args,
+                tts_instance,
+                tts_system,
+                original_duration
+            )
+
+            final_segment_data = TTSSegmentData(
+                **{**tts_segment_data_args, "text": best_text, "output_path": current_segment_output_path}
+            )
+
+            previous_texts: List[str] = []
+            if self.config.get('enable_emotion_enrichment', False):
+                for j in range(max(0, segment_index - 5), segment_index):
+                    prev_segment = segments[j]
+                    prev_text = prev_segment.get('translation', '')
+                    if prev_text:
+                        previous_texts.append(prev_text)
+
+            metadata = {
+                "index": segment_index,
+                "segment_dict": segment_dict,
+                "cache_path": segment_cached_file_path,
+                "output_path": current_segment_output_path,
+                "chosen_text": best_text,
+                "estimated_ratio": best_ratio,
+                "tts_system": tts_system,
+                "segment_data_args": tts_segment_data_args,
+                "selected_track_type": best_track_type,
+                "previous_context": previous_texts,
+            }
+
+            with metadata_lock:
+                segments_metadata.append(metadata)
+
+            logger.debug(f"Processing segment {segment_index+1}/{total_segments} (Speaker: {speaker}, TTS: {tts_system})")
+
+            tts_lock = tts_locks.get(tts_system)
+            if tts_lock is None:
+                tts_lock = threading.Lock()
+                tts_locks[tts_system] = tts_lock
+                setattr(tts_instance, "_synthesis_lock", tts_lock)
+
+            try:
+                with tts_lock:
+                    tts_instance.synthesize(
+                        segments_data=[final_segment_data],
+                        language=target_language,
+                        previous_context=previous_texts
+                    )
+            except Exception as synth_exc:
+                logger.error(f"Failed to synthesize segment {segment_index+1} ({tts_system}): {synth_exc}")
+                segment_dict['synthesized_speech_len'] = 0
+                segment_dict['synthesized_speech_file'] = None
+                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
+                increment_progress(segment_index, speaker, "synthesis failed")
+                return metadata
+
+            if not os.path.exists(current_segment_output_path):
+                logger.warning(f"Warning: No audio file created for segment {segment_index+1} ({tts_system})")
+                segment_dict['synthesized_speech_len'] = 0
+                segment_dict['synthesized_speech_file'] = None
+                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
+                increment_progress(segment_index, speaker, "missing output")
+                return metadata
+
+            try:
+                audio_info = AudioSegment.from_file(current_segment_output_path)
+            except Exception as audio_exc:
+                logger.error(f"Failed to load synthesized audio for segment {segment_index+1}: {audio_exc}")
+                segment_dict['synthesized_speech_len'] = 0
+                segment_dict['synthesized_speech_file'] = None
+                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
+                increment_progress(segment_index, speaker, "audio load failed")
+                return metadata
+
+            segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
+            segment_dict['synthesized_speech_file'] = current_segment_output_path
+
+            if self.cache_manager.use_cache and len(audio_info) > 0:
+                try:
+                    shutil.copy(current_segment_output_path, segment_cached_file_path)
+                except Exception as cache_exc:
+                    logger.error(f"Error caching segment {segment_index+1}: {cache_exc}")
+
+            original_dur = segment_dict["end"] - segment_dict["start"]
+            actual_dur = segment_dict['synthesized_speech_len']
+            ratio = original_dur / actual_dur if actual_dur > 0 else 1.0
+            deviation = abs(original_dur - actual_dur) / original_dur if original_dur > 0 else 0.0
+
+            # Track estimation accuracy
+            with metadata_lock:
+                estimation_stats["total_segments"] += 1
+
+            if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
+                # Estimation was inaccurate - outside comfort zone
+                with metadata_lock:
+                    estimation_stats["inaccurate_estimations"] += 1
+
+                logger.info(
+                    f"[MISS] Segment {metadata['index']+1}/{total_segments}: Estimation MISS - "
+                    f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
+                    f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s. "
+                    f"Resynthesizing..."
                 )
-                
-                best_text = segment_dict["translation"]
-                best_estimated_duration = estimated_duration_normal
-                best_ratio = float('inf')
-                best_deviation = float('inf')
-                best_track_type = "translation"  # Track which translation variant was selected
-                
-                if estimated_duration_normal is None or estimated_duration_normal <= 0:
-                    logger.warning(f"Segment {i+1}: Duration estimation failed for normal translation, using it directly.")
-                else:
-                    ratio_normal = original_duration / estimated_duration_normal
-                    deviation_normal = self._calculate_percentage_deviation(
-                        ratio_normal,
+                with tts_lock:
+                    self._resynthesize_segment(
+                        metadata,
+                        tts_instance,
                         COMFORT_MIN_ADJUSTMENT_RATIO,
                         COMFORT_MAX_ADJUSTMENT_RATIO,
+                        current_ratio=ratio,
                     )
-                    best_ratio = ratio_normal
-                    best_deviation = deviation_normal
-                    logger.debug(
-                        f"Segment {i+1} ({tts_system}): Normal translation - Estimated duration: {estimated_duration_normal:.2f}s, Ratio: {ratio_normal:.2f}, Deviation: {deviation_normal:.2%}"
-                    )
-                    
-                    # If normal is perfect, no need to check alternatives
-                    if deviation_normal == 0.0:
-                        logger.debug(f"  Normal translation is within comfort zone. Selecting it.")
-                    else:
-                        alternatives = []
-                        # Decide which alternatives to consider based on whether we need to shorten or lengthen
-                        if ratio_normal < COMFORT_MIN_ADJUSTMENT_RATIO:
-                            # Synthesized audio longer than original – try shorter variants first
-                            if "very_short_translation" in segment_dict:
-                                alternatives.append(("very_short_translation", segment_dict["very_short_translation"]))
-                            if "short_translation" in segment_dict:
-                                alternatives.append(("short_translation", segment_dict["short_translation"]))
-                        elif ratio_normal > COMFORT_MAX_ADJUSTMENT_RATIO:
-                            # Synthesized audio shorter than original – try longer variant
-                            if "long_translation" in segment_dict:
-                                alternatives.append(("long_translation", segment_dict["long_translation"]))
-                            # Fallback to original text if long not available (handled later)
-                        
-                        if alternatives:
-                            logger.debug(f"  Normal translation is outside comfort. Estimating {len(alternatives)} alternative(s)...")
-                        
-                        # Preference: when remove_pauses enabled and non-zero deviation remains, prefer negative deviation (shorter) in tie
-                        prefer_shorter = self.config.get('remove_pauses', True)
-                        def deviation_key(dev: float) -> tuple:
-                            # Primary: minimal absolute deviation; Secondary: prefer negative when enabled
-                            return (abs(dev), 0 if (prefer_shorter and dev < 0) else 1)
+            else:
+                # Estimation was accurate - within comfort zone
+                with metadata_lock:
+                    estimation_stats["accurate_estimations"] += 1
 
-                        for alt_key, alt_text_content in alternatives:
-                            alt_segment_data_args = {**tts_segment_data_args, "text": alt_text_content}
-                            alt_segment_data_model = TTSSegmentData(**alt_segment_data_args)
-                            estimated_duration_alt = tts_instance.estimate_audio_segment_length(
-                                alt_segment_data_model,
-                                language=self.config.get('target_language')
-                            )
-                            
-                            if estimated_duration_alt is None or estimated_duration_alt <= 0:
-                                logger.warning(f"    {alt_key.replace('_', ' ').title()}: Estimation failed.")
-                                continue
-                            
-                            ratio_alt = original_duration / estimated_duration_alt
-                            deviation_alt = self._calculate_percentage_deviation(
-                                ratio_alt,
-                                COMFORT_MIN_ADJUSTMENT_RATIO,
-                                COMFORT_MAX_ADJUSTMENT_RATIO,
-                            )
-                            logger.debug(f"    {alt_key.replace('_', ' ').title()} - Estimated duration: {estimated_duration_alt:.2f}s, Ratio: {ratio_alt:.2f}, Deviation: {deviation_alt:.2%}")
-                            
-                            # Update if this alternative is better per deviation_key
-                            if deviation_key(deviation_alt) < deviation_key(best_deviation):
-                                best_deviation = deviation_alt
-                                best_ratio = ratio_alt
-                                best_text = alt_text_content
-                                best_estimated_duration = estimated_duration_alt
-                                best_track_type = alt_key  # Track the selected variant
-                                logger.debug(
-                                    f"      New best: {alt_key.replace('_', ' ').title()} (Deviation: {best_deviation:.2%})"
-                                )
-                                if best_deviation == 0.0:
-                                    break
-                
-                logger.debug(f"  Selected for synthesis: '{best_text[:50]}...' (Ratio: {best_ratio:.2f}, Deviation: {best_deviation:.2%})")
-                
-                # Prepare segment for synthesis with chosen text
-                final_segment_data = TTSSegmentData(**{**tts_segment_data_args, "text": best_text, "output_path": current_segment_output_path})
-                segments_to_synthesize_by_tts[tts_system].append(final_segment_data)
-
-                # Collect context from previous segments for emotion enrichment
-                previous_texts = []
-                if self.config.get('enable_emotion_enrichment', False):
-                    # Get up to 5 previous segments' texts
-                    for j in range(max(0, i - 5), i):
-                        prev_segment = segments[j]
-                        prev_text = prev_segment.get('translation', '')
-                        if prev_text:
-                            previous_texts.append(prev_text)
-
-                segments_metadata.append({
-                    "index": i,
-                    "segment_dict": segment_dict,
-                    "cache_path": segment_cached_file_path,
-                    "output_path": current_segment_output_path,
-                    "chosen_text": best_text,
-                    "estimated_ratio": best_ratio,
-                    "tts_system": tts_system,
-                    "segment_data_args": tts_segment_data_args,
-                    "selected_track_type": best_track_type,  # Store the selected track type
-                    "previous_context": previous_texts  # Add context for emotion enrichment
-                })
-        
-        # Second pass: Batch synthesize all segments by TTS system
-        for tts_system, segments_to_synthesize in segments_to_synthesize_by_tts.items():
-            if not segments_to_synthesize:
-                continue
-            
-            # Get the shared TTS instance for this system type
-            tts_instance = self.tts_systems.get(tts_system)
-            if not tts_instance:
-                logger.warning(f"Warning: TTS system {tts_system} not available, skipping segments")
-                continue
-            
-            logger.info(f"Synthesizing {len(segments_to_synthesize)} segments with {tts_system} TTS ...")
-            
-            try:
-                # Synthesize all segments for this TTS system in one call
-                segment_alignments = tts_instance.synthesize(
-                    segments_data=segments_to_synthesize,
-                    language=self.config.get('target_language')
+                logger.debug(
+                    f"[HIT] Segment {metadata['index']+1}/{total_segments}: Estimation HIT - "
+                    f"Ratio={ratio:.2f}, Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s"
                 )
-                
-                # Process results and update segment metadata
-                for segment_data in segments_to_synthesize:
-                    # Find corresponding metadata
-                    metadata = next((m for m in segments_metadata if m["output_path"] == segment_data.output_path), None)
-                    if not metadata:
-                        continue
-                    
-                    segment_dict = metadata["segment_dict"]
-                    output_path = metadata["output_path"]
-                    
-                    # Update progress tracking
-                    completed_segments += 1
-                    logger.info(f"Processing segment {completed_segments}/{total_segments} (Speaker: {segment_dict['speaker']})")
-                    
-                    # Check if file was created successfully
-                    if os.path.exists(output_path):
-                        audio_info = AudioSegment.from_file(output_path)
-                        segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
-                        segment_dict['synthesized_speech_file'] = output_path
-                        
-                        # Cache the synthesized segment
-                        if self.cache_manager.use_cache and len(audio_info) > 0:
-                            try:
-                                shutil.copy(output_path, metadata["cache_path"])
-                                logger.debug(f"Cached synthesized segment {metadata['index']+1} ({tts_system})")
-                            except Exception as e:
-                                logger.error(f"Error caching segment {metadata['index']+1}: {e}")
 
-                        # Validate actual duration and resynthesize if needed
-                        original_dur = segment_dict["end"] - segment_dict["start"]
-                        actual_dur = segment_dict['synthesized_speech_len']
-                        ratio = original_dur / actual_dur if actual_dur > 0 else 1.0
-                        deviation = abs(original_dur - actual_dur) / original_dur if original_dur > 0 else 0.0
-                        if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
-                            logger.debug(f"Segment {metadata['index']+1}: duration mismatch after synthesis (ratio={ratio:.2f}, dev={deviation:.2%}). Trying alternatives...")
-                            self._resynthesize_segment(
-                                metadata,
-                                tts_instance,
-                                COMFORT_MIN_ADJUSTMENT_RATIO,
-                                COMFORT_MAX_ADJUSTMENT_RATIO,
-                                current_ratio=ratio,
-                            )
-                    else:
-                        logger.warning(f"Warning: No audio file created for segment {metadata['index']+1} ({tts_system})")
-                        segment_dict['synthesized_speech_len'] = 0
-                        segment_dict['synthesized_speech_file'] = None
-                        # Create empty file to prevent downstream errors
-                        AudioSegment.silent(duration=0).export(output_path, format="wav")
-                
-                logger.debug(f"Batch synthesis completed for {len(segments_to_synthesize)} segments with {tts_system}")
-                
-            except Exception as e:
-                logger.error(f"Batch synthesis failed for {tts_system}: {e}. Falling back to individual synthesis...")
-                
-                # Fallback: synthesize individually
-                for segment_data in segments_to_synthesize:
-                    metadata = next((m for m in segments_metadata if m["output_path"] == segment_data.output_path), None)
-                    if not metadata:
-                        continue
-                    
-                    segment_dict = metadata["segment_dict"]
-                    output_path = metadata["output_path"]
-                    
-                    # Update progress tracking for fallback synthesis
-                    completed_segments += 1
-                    logger.info(f"Processing segment {completed_segments}/{total_segments} (Fallback - Speaker: {segment_dict['speaker']})")
-                    
-                    try:
-                        tts_instance.synthesize(
-                            segments_data=[segment_data],
-                            language=self.config.get('target_language')
-                        )
-                        
-                        if os.path.exists(output_path):
-                            audio_info = AudioSegment.from_file(output_path)
-                            segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
-                            segment_dict['synthesized_speech_file'] = output_path
-                            
-                            # Cache the synthesized segment
-                            if self.cache_manager.use_cache and len(audio_info) > 0:
-                                shutil.copy(output_path, metadata["cache_path"])
-                        
-                        # After fallback individual synthesis, validate duration again
-                        original_dur = segment_dict["end"] - segment_dict["start"]
-                        actual_dur = segment_dict.get('synthesized_speech_len', 0)
-                        ratio = original_dur / actual_dur if actual_dur > 0 else 1.0
-                        deviation = abs(original_dur - actual_dur) / original_dur if original_dur > 0 else 0.0
-                        if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
-                            logger.info(f"Segment {metadata['index']+1}: duration mismatch after fallback synthesis (ratio={ratio:.2f}, dev={deviation:.2%}). Trying alternatives...")
-                            self._resynthesize_segment(
-                                metadata,
-                                tts_instance,
-                                COMFORT_MIN_ADJUSTMENT_RATIO,
-                                COMFORT_MAX_ADJUSTMENT_RATIO,
-                                current_ratio=ratio,
-                            )
-                        
-                        logger.debug(f"Synthesized segment {metadata['index']+1}/{len(segments)} individually ({tts_system})")
-                        
-                    except Exception as e_synth:
-                        logger.error(f"Failed to synthesize segment {metadata['index']+1} ({tts_system}): {e_synth}")
-                        segment_dict['synthesized_speech_len'] = 0
-                        segment_dict['synthesized_speech_file'] = None
-                        AudioSegment.silent(duration=0).export(output_path, format="wav")
-        
+            increment_progress(segment_index, speaker, "synthesized")
+            return metadata
+
+        def process_speaker_segments(speaker_id: str) -> None:
+            indices = speaker_to_indices.get(speaker_id, [])
+            for segment_index in indices:
+                try:
+                    handle_segment(segment_index)
+                except Exception as segment_exc:
+                    logger.error(
+                        f"Unexpected error while processing segment {segment_index+1} "
+                        f"for speaker '{speaker_id}': {segment_exc}"
+                    )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_speaker_segments, speaker_id): speaker_id
+                for speaker_id in speaker_to_indices.keys()
+            }
+
+            for future in as_completed(futures):
+                speaker_id = futures[future]
+                try:
+                    future.result()
+                except Exception as speaker_exc:
+                    logger.error(f"Synthesis thread for speaker '{speaker_id}' failed: {speaker_exc}")
+
+        # Ensure metadata is ordered for downstream reporting
+        segments_metadata.sort(key=lambda item: item["index"])
         # Adjust timing and combine audio segments
         combined_audio, real_segment_positions = self._adjust_and_combine_audio_grouped(segments)
         output_path = "artifacts/audio/output.wav"
@@ -1069,13 +1101,38 @@ class SmartDubbing:
             percentage = (count / total_samples * 100) if total_samples > 0 else 0
             logger.debug(f"  {track_type}: {count} samples ({percentage:.1f}%)")
         logger.debug(f"Total voice samples processed: {total_samples}")
-        
+
+        # Log estimation accuracy statistics
+        logger.info("=" * 70)
+        logger.info("SEGMENT LENGTH ESTIMATION ACCURACY REPORT")
+        logger.info("=" * 70)
+
+        total_estimated = estimation_stats["total_segments"]
+        accurate = estimation_stats["accurate_estimations"]
+        inaccurate = estimation_stats["inaccurate_estimations"]
+
+        if total_estimated > 0:
+            accuracy_rate = (accurate / total_estimated) * 100
+            miss_rate = (inaccurate / total_estimated) * 100
+
+            logger.info(f"Total segments synthesized: {total_estimated}")
+            logger.info(f"[HIT] Accurate estimations (within comfort zone): {accurate} ({accuracy_rate:.1f}%)")
+            logger.info(f"[MISS] Inaccurate estimations (required resynthesis): {inaccurate} ({miss_rate:.1f}%)")
+            logger.info(f"")
+            logger.info(f"Overall Accuracy Rate: {accuracy_rate:.1f}%")
+            logger.info(f"Overall Miss Rate: {miss_rate:.1f}%")
+            logger.info(f"Comfort zone range: {COMFORT_MIN_ADJUSTMENT_RATIO:.2f} - {COMFORT_MAX_ADJUSTMENT_RATIO:.2f}")
+        else:
+            logger.info("No segments were synthesized")
+
+        logger.info("=" * 70)
+
         # Log completion summary
         logger.info(f"Speech synthesis completed! Processed {total_segments} segments successfully.")
-        
+
         # End timing
         self.performance_tracker.end_timing("speech_synthesis")
-        
+
         return output_path
     
     def _save_transcription_file(self, transcription: List[Dict]) -> None:

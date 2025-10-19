@@ -1397,7 +1397,7 @@ class GeminiTTSWrapper(TTSInterface):
         new_wpm = voice_stats.words_per_minute
         new_cps = voice_stats.characters_per_second
 
-        logger.info(
+        logger.debug(
             f"Stats correction for voice '{voice_name}': "
             f"WPM {old_wpm:.1f} -> {new_wpm:.1f}, CPS {old_cps:.1f} -> {new_cps:.1f} "
             f"(samples: {old_samples} -> {voice_stats.total_samples}, alpha={smoothing_alpha})"
@@ -1745,7 +1745,7 @@ class GeminiTTSWrapper(TTSInterface):
                 )
 
         # If not cached, synthesize normally
-        logger.info(f"Gemini: Synthesizing segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
+        logger.debug(f"Gemini: Synthesizing segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
         try:
             synthesized_text, model_used = self._synthesize_single_segment(
                 segment, segment_file_path, language,
@@ -1887,7 +1887,7 @@ class GeminiTTSWrapper(TTSInterface):
 
             # Use ThreadPoolExecutor for parallel processing
             max_workers = min(self.config.max_workers, len(valid_segments))
-            logger.info(f"Gemini: Starting parallel synthesis with {max_workers} workers for {len(valid_segments)} segments")
+            logger.debug(f"Gemini: Starting parallel synthesis with {max_workers} workers for {len(valid_segments)} segments")
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks

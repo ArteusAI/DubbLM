@@ -167,7 +167,7 @@ class CostTracker:
         self.estimate["transcription"] += cost
         self.estimate["total"] += cost
         self.usage["transcription"]["audio_seconds"] += float(audio_seconds or 0.0)
-        logger.info(f"Estimated transcription cost [{provider}]: ${cost:.4f} for {audio_seconds/60.0:.2f} min")
+        logger.debug(f"Estimated transcription cost [{provider}]: ${cost:.4f} for {audio_seconds/60.0:.2f} min")
         return cost
 
     def add_transcription_actual(self, provider: str, audio_seconds: Optional[float]) -> float:
@@ -178,7 +178,7 @@ class CostTracker:
         self.actual["transcription"] += cost
         self.actual["total"] += cost
         self.usage["transcription"]["audio_seconds"] += float(audio_seconds)
-        logger.info(f"Calculated transcription cost [{provider}]: ${cost:.4f}")
+        logger.debug(f"Calculated transcription cost [{provider}]: ${cost:.4f}")
         return cost
 
     # ----- Translation (LLM) -----
@@ -199,7 +199,7 @@ class CostTracker:
         detail_entry = detail_map.setdefault(f"{provider}:{model or 'default'}", {"input_tokens": 0.0, "output_tokens": 0.0})
         detail_entry["input_tokens"] += float(input_tokens or 0.0)
         detail_entry["output_tokens"] += float(expected_output_tokens or 0.0)
-        logger.info(
+        logger.debug(
             f"Estimated translation cost [{provider}#{model or 'default'}]: "
             f"${cost:.4f} (in≈{input_tokens:.0f} tok, out≈{expected_output_tokens:.0f} tok)"
         )
@@ -223,7 +223,7 @@ class CostTracker:
             entry["input_tokens"] += input_tokens
             entry["output_tokens"] += output_tokens
 
-        logger.info(
+        logger.debug(
             f"Calculated translation cost [{provider}#{model or 'default'}]: "
             f"${cost:.4f} (in≈{input_tokens:.0f}, out≈{output_tokens:.0f})"
         )
@@ -257,7 +257,7 @@ class CostTracker:
         detail_entry["input_tokens"] += float(input_tokens or 0.0)
         detail_entry["output_tokens"] += float(expected_output_tokens or 0.0)
         detail_entry["audio_seconds"] += float(expected_audio_seconds or 0.0)
-        logger.info(f"Estimated TTS cost [{provider}#{model or 'default'}]: ${cost:.4f}")
+        logger.debug(f"Estimated TTS cost [{provider}#{model or 'default'}]: ${cost:.4f}")
         return cost
 
     def add_tts_actual(
@@ -289,7 +289,7 @@ class CostTracker:
             entry["output_tokens"] += float(output_tokens or 0.0)
             entry["audio_seconds"] += float(audio_seconds or 0.0)
 
-        logger.info(f"Calculated TTS cost [{provider}#{model or 'default'}]: ${cost:.4f}")
+        logger.debug(f"Calculated TTS cost [{provider}#{model or 'default'}]: ${cost:.4f}")
         return cost
 
     # ----- Summary -----

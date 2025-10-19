@@ -378,7 +378,7 @@ class SegmentOptimizer:
         # Step 3: Filter very short segments
         filtered = self.filter_short_segments(split)
 
-        logger.info(f"Post-diarization optimization: {len(transcription)} → {len(filtered)} segments")
+        logger.debug(f"Post-diarization optimization: {len(transcription)} → {len(filtered)} segments")
 
         return filtered
 
@@ -410,6 +410,6 @@ class SegmentOptimizer:
             phase="post_translation"
         )
 
-        logger.info(f"Post-translation optimization: {len(segments)} → {len(merged)} segments")
+        logger.debug(f"Post-translation optimization: {len(segments)} → {len(merged)} segments")
 
         return merged
