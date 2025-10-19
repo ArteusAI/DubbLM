@@ -951,7 +951,7 @@ class SmartDubbing:
             with metadata_lock:
                 segments_metadata.append(metadata)
 
-            logger.debug(f"Processing segment {segment_index+1}/{total_segments} (Speaker: {speaker}, TTS: {tts_system})")
+            logger.info(f"Processing segment {segment_index+1}/{total_segments} (Speaker: {speaker}, TTS: {tts_system})")
 
             tts_lock = tts_locks.get(tts_system)
             if tts_lock is None:

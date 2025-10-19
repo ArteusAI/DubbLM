@@ -473,7 +473,7 @@ class GeminiAPIClient:
                     self.permanent_fallback = True
                     if self.switch_to_fallback_model():
                         # Retry immediately with fallback model
-                        logger.info("Retrying with fallback model after quota exhaustion.")
+                        logger.debug("Retrying with fallback model after quota exhaustion.")
                         continue
                 if attempt + 1 >= self.config.max_retries:
                     logger.error(f"Gemini API call failed after {self.config.max_retries} attempts.")
@@ -696,7 +696,7 @@ class SampleManager:
         if not success:
             # Switch to fallback model and try again
             if self.api_client.switch_to_fallback_model():
-                logger.info(f"Attempting sample generation for {voice_name} with fallback model")
+                logger.debug(f"Attempting sample generation for {voice_name} with fallback model")
                 success = self._attempt_sample_generation(voice_name, sample_file_path, max_retries_per_model, max_silence_ratio=0.2)
                 
                 # Reset to original model after attempts
@@ -1502,7 +1502,7 @@ class GeminiTTSWrapper(TTSInterface):
         fallback_best_path = None
         fallback_text: Optional[str] = None
         if self.api_client.switch_to_fallback_model():
-            logger.info(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
+            logger.debug(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
             success, fallback_silence, fallback_best_path, fallback_text, fallback_model = self._attempt_segment_synthesis(
                 segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05,
                 previous_segments=previous_segments,
@@ -1909,7 +1909,7 @@ class GeminiTTSWrapper(TTSInterface):
             # Collect results in original order
             alignments = [results.get(i) for i in range(len(valid_segments)) if results.get(i) is not None]
 
-            logger.info(f"Gemini: Synthesized {len(alignments)}/{len(valid_segments)} segments successfully")
+            logger.debug(f"Gemini: Synthesized {len(alignments)}/{len(valid_segments)} segments successfully")
             if self.cost_tracker and usage_tracker:
                 models_usage: Dict[str, Dict[str, float]] = {}
                 lock = usage_tracker.get("lock")
