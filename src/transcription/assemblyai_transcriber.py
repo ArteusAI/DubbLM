@@ -29,6 +29,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         mp3_bitrate: str = "128k",
         mp3_size_threshold_mb: int = 20,
         cost_tracker: Optional[Any] = None,
+        speakers_expected: Optional[int] = None,
         **kwargs
     ):
         """
@@ -42,6 +43,7 @@ class AssemblyAITranscriber(BaseTranscriber):
             convert_to_mp3: Whether to convert audio files to MP3 before upload
             mp3_bitrate: MP3 bitrate for conversion (e.g., '128k', '192k', '256k')
             mp3_size_threshold_mb: Only convert files larger than this size in MB
+            speakers_expected: Expected number of speakers for diarization (None for auto-detect)
             **kwargs: Additional parameters
         """
         super().__init__(source_language, device, **kwargs)
@@ -51,6 +53,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         self.mp3_bitrate = mp3_bitrate
         self.mp3_size_threshold_mb = mp3_size_threshold_mb
         self.cost_tracker = cost_tracker
+        self.speakers_expected = speakers_expected
         
         # Get API key from environment
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -231,14 +234,20 @@ class AssemblyAITranscriber(BaseTranscriber):
         
         try:
             # Configure transcription settings
-            config = self.aai.TranscriptionConfig(
-                speech_model=getattr(self.aai.SpeechModel, self.speech_model),
-                speaker_labels=True,  # Enable speaker diarization
-                #speakers_expected=2,
-                language_code=self.source_language,
-                word_boost=None,  # Can be configured if needed
-                boost_param="default"  # Can be configured if needed
-            )
+            config_params = {
+                'speech_model': getattr(self.aai.SpeechModel, self.speech_model),
+                'speaker_labels': True,  # Enable speaker diarization
+                'language_code': self.source_language,
+                'word_boost': None,  # Can be configured if needed
+                'boost_param': "default"  # Can be configured if needed
+            }
+            
+            # Add speakers_expected if specified
+            if self.speakers_expected is not None:
+                config_params['speakers_expected'] = self.speakers_expected
+                logger.info(f"Using explicit speaker count for diarization: {self.speakers_expected}")
+            
+            config = self.aai.TranscriptionConfig(**config_params)
             
             # Create transcriber and submit job
             transcriber = self.aai.Transcriber(config=config)

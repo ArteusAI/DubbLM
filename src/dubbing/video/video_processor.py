@@ -591,13 +591,10 @@ class VideoProcessor:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        # Normalize audio volume if enabled
-        if normalize_audio:
-            audio_processor = AudioProcessor(None, self.performance_tracker)  # Create temporary instance
-            normalized_translated_audio_path = audio_processor.normalize_audio(translated_audio_path)
-        else:
-            normalized_translated_audio_path = translated_audio_path
-            logger.debug("Audio normalization disabled, using original audio levels")
+        # Audio normalization is now done per-segment before combination
+        # Skip whole-track normalization since segments are already normalized
+        normalized_translated_audio_path = translated_audio_path
+        logger.debug("Using pre-normalized per-segment audio (normalization disabled at track level)")
 
         # Initialize logo dimensions to default values
         logo_width = 0

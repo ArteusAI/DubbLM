@@ -228,7 +228,8 @@ class SmartDubbing:
                 device=self.device,
                 whisper_model=self.config.get('whisper_model', 'large-v3'),
                 cache_manager=self.cache_manager,
-                cost_tracker=self.cost_tracker
+                cost_tracker=self.cost_tracker,
+                speakers_expected=self.config.get('speakers_expected')
             )
             logger.debug(f"Initialized {self.transcriber.name} transcriber")
         except Exception as e:
@@ -303,6 +304,16 @@ class SmartDubbing:
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
                 translated_audio_path = self.synthesize_speech(segments_for_output, speakers_rolls, audio_file)
+                
+                # Check if synthesis was skipped due to exit_before_synthesis flag
+                if not translated_audio_path:
+                    logger.info("Pipeline stopped before speech synthesis as requested.")
+                    # Write partial performance summary
+                    self.performance_tracker.record_metric("total", time.perf_counter() - pipeline_start_time)
+                    self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
+                    self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
+                    self.cost_tracker.write_cost_summary()
+                    return ""
             else:
                 logger.info("All segments filtered by mute_speakers; generating silent audio track...")
                 total_duration_sec = self.audio_processor.get_total_duration() or 0
@@ -670,6 +681,67 @@ class SmartDubbing:
         cache_key = f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}_{self.config.get('target_language')}_{self.config.get('tts_system')}"
         step_name = "synthesized_speech"
         
+        # Check for editable segments file first
+        segments_step_name = "segments_for_synthesis"
+        editable_data = self.cache_manager.load_segments_json(segments_step_name, cache_key, "_editable")
+        
+        if editable_data and editable_data.get("segments"):
+            logger.info("=" * 70)
+            logger.info("USING EDITABLE SEGMENTS FILE")
+            logger.info("=" * 70)
+            
+            edited_segments = editable_data.get("segments", [])
+            
+            # Count force resynthesis flags
+            force_resynth_count = sum(1 for seg in edited_segments if seg.get("force_resynthesize", False))
+            
+            logger.info(f"Loaded {len(edited_segments)} segments from editable file")
+            if force_resynth_count > 0:
+                logger.info(f"Force resynthesis enabled for {force_resynth_count} segment(s)")
+            logger.info("=" * 70)
+            
+            # Use edited segments
+            segments = edited_segments
+
+        # Prepare segments for saving (add force_resynthesize field if not present)
+        segments_to_save = []
+        for seg in segments:
+            seg_copy = seg.copy()
+            if "force_resynthesize" not in seg_copy:
+                seg_copy["force_resynthesize"] = False
+            segments_to_save.append(seg_copy)
+        
+        metadata = {
+            "source_language": self.config.get('source_language'),
+            "target_language": self.config.get('target_language'),
+            "tts_system": self.config.get('tts_system')
+        }
+        editable_path = self.cache_manager.save_segments_json(
+            segments_step_name, cache_key, segments_to_save, metadata, "_editable"
+        )
+        
+        # If exit_before_synthesis is True, save editable copy and exit
+        if self.config.get('exit_before_synthesis', False):            
+            logger.info("=" * 70)
+            logger.info("EXITING BEFORE SPEECH SYNTHESIS")
+            logger.info("=" * 70)
+            logger.info(f"Segments saved to: {editable_path}")
+            logger.info("")
+            logger.info("To edit translations:")
+            logger.info(f"  1. Open and edit: {editable_path}")
+            logger.info(f"  2. Modify 'translation' field(s) as needed")
+            logger.info(f"  3. Set 'force_resynthesize': true for segments to force regeneration")
+            logger.info(f"  4. Rerun without --exit_before_synthesis flag")
+            logger.info("")
+            logger.info("The pipeline will automatically use your edited file.")
+            logger.info("=" * 70)
+            
+            # End timing
+            self.performance_tracker.end_timing("speech_synthesis")
+            
+            # Return empty string to signal early exit
+            return ""
+        
         # Check if results are cached
         if self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading synthesized speech from cache...")
@@ -893,7 +965,9 @@ class SmartDubbing:
             os.makedirs(os.path.dirname(current_segment_output_path), exist_ok=True)
             segment_cached_file_path = segment_cache_path / f"{segment_cache_key}.wav"
 
-            if self.cache_manager.use_cache and segment_cached_file_path.exists():
+            # Check cache only if force_resynthesize is not set
+            force_resynth = segment_dict.get("force_resynthesize", False)
+            if self.cache_manager.use_cache and not force_resynth and segment_cached_file_path.exists():
                 try:
                     cached_audio_info = AudioSegment.from_file(segment_cached_file_path)
                     if len(cached_audio_info) > 0:
@@ -1044,6 +1118,7 @@ class SmartDubbing:
                         COMFORT_MIN_ADJUSTMENT_RATIO,
                         COMFORT_MAX_ADJUSTMENT_RATIO,
                         current_ratio=ratio,
+                        segments=segments,
                     )
             else:
                 # Estimation was accurate - within comfort zone
@@ -1084,6 +1159,18 @@ class SmartDubbing:
 
         # Ensure metadata is ordered for downstream reporting
         segments_metadata.sort(key=lambda item: item["index"])
+        
+        # Normalize all segments to average volume with fading
+        logger.info("Normalizing segment volumes and applying fades...")
+        segment_files = [
+            seg.get('synthesized_speech_file') for seg in segments 
+            if seg.get('synthesized_speech_file') and os.path.exists(seg.get('synthesized_speech_file'))
+        ]
+        if segment_files:
+            self.audio_processor.normalize_segments_to_average(segment_files)
+        else:
+            logger.warning("No valid segment files found for normalization")
+        
         # Adjust timing and combine audio segments
         combined_audio, real_segment_positions = self._adjust_and_combine_audio_grouped(segments)
         output_path = "artifacts/audio/output.wav"
@@ -1253,6 +1340,7 @@ class SmartDubbing:
         min_ratio: float,
         max_ratio: float,
         current_ratio: Optional[float] = None,
+        segments: Optional[List[Dict]] = None,
     ) -> None:
         """Attempt to resynthesize a segment using alternative translations,
         focusing on minimizing deviation from the target ratio range.
@@ -1263,6 +1351,7 @@ class SmartDubbing:
             min_ratio: Minimum acceptable ratio original/actual.
             max_ratio: Maximum acceptable ratio original/actual.
             current_ratio: Current ratio to help prioritize alternatives.
+            segments: Optional list of all segments for context extraction.
         """
 
         from tts.models import TTSSegmentData
@@ -1387,6 +1476,12 @@ class SmartDubbing:
                     desired_duration = original_duration / max(target_ratio, 1e-6)
                     duration_factor = max(0.2, min(2.0, desired_duration / max(actual_duration, 1e-6)))
 
+                    logger.info(f"Triggering LLM text adjustment for segment {metadata['index']+1}: "
+                               f"deviation={abs(current_deviation):.2%} (threshold={LLM_DEVIATION_THRESHOLD:.2%}), "
+                               f"duration_factor={duration_factor:.2f}, "
+                               f"original_duration={original_duration:.2f}s, actual_duration={actual_duration:.2f}s")
+                    logger.debug(f"Baseline text for adjustment: '{baseline_text[:80]}{'...' if len(baseline_text) > 80 else ''}'")
+
                     # Ask LLM to adjust text length
                     adjusted_text = self.translator.adjust_segment_text_length(
                         original_text=baseline_text,
@@ -1396,9 +1491,16 @@ class SmartDubbing:
                         target_char_count=int(len(baseline_text) * duration_factor),
                         context_info=None,
                         max_attempts=2,
+                        tts_system=metadata.get("tts_system"),
+                        segments=segments,
+                        current_segment_index=metadata["index"],
                     )
 
                     if adjusted_text and adjusted_text.strip() and adjusted_text.strip() != baseline_text.strip():
+                        logger.debug(f"LLM adjustment successful: '{adjusted_text[:80]}{'...' if len(adjusted_text) > 80 else ''}' "
+                                   f"(length: {len(baseline_text)} → {len(adjusted_text)} chars)")
+                    else:
+                        logger.debug(f"LLM adjustment produced no change or empty result")
                         # Estimate duration and synthesize to temp file with unique identifier
                         unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
                         temp_output_path = f"{output_path}.temp_llm_adjusted_{unique_id}"

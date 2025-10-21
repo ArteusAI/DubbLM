@@ -145,6 +145,27 @@ class AudioFileUtils:
             logger.error(f"Error getting duration for {audio_path}: {e}")
             return None
 
+    @staticmethod
+    def concatenate_audio_files(audio_files: List[str], sample_rate: int = SAMPLE_RATE) -> bytes:
+        """Concatenate multiple WAV files into a single PCM data stream."""
+        if not audio_files:
+            return b''
+        
+        if len(audio_files) == 1:
+            with wave.open(audio_files[0], 'rb') as wf:
+                return wf.readframes(wf.getnframes())
+        
+        combined_frames = b''
+        for audio_file in audio_files:
+            try:
+                with wave.open(audio_file, 'rb') as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    combined_frames += frames
+            except Exception as e:
+                logger.error(f"Error reading audio file {audio_file}: {e}")
+        
+        return combined_frames
+
 
 class AudioValidator:
     """Validates the quality of generated audio samples."""
@@ -1678,11 +1699,12 @@ class GeminiTTSWrapper(TTSInterface):
         max_retries_per_model: int = 3,
         previous_segments: Optional[List[str]] = None,
         usage_tracker: Optional[Dict[str, Any]] = None
-    ) -> Tuple[Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[str], bool]:
         """Synthesizes a single segment and saves it to a temporary path with validation and retry logic.
 
         Returns:
-            Tuple containing the text sent to the model and the model identifier used.
+            Tuple containing the text sent to the model, the model identifier used, and success flag.
+            Success flag is True only if validation passed, False if using best attempt.
         """
         if not self.api_client.client:
             raise RuntimeError("Gemini client not initialized.")
@@ -1694,7 +1716,7 @@ class GeminiTTSWrapper(TTSInterface):
             if os.path.exists(cached_path):
                 shutil.copy(cached_path, temp_output_path)
                 logger.debug(f"  Gemini: Using cached audio for speaker {segment_data.speaker}")
-                return None, None
+                return None, None, True
 
         # Ensure the API client is using the original model
         self.api_client.reset_to_original_model()
@@ -1709,7 +1731,7 @@ class GeminiTTSWrapper(TTSInterface):
         if success:
             if primary_best_path:
                 shutil.move(primary_best_path, temp_output_path)
-            return primary_text, primary_model
+            return primary_text, primary_model, True
 
         # If primary model fails, try the fallback model
         fallback_best_path = None
@@ -1728,7 +1750,7 @@ class GeminiTTSWrapper(TTSInterface):
                     shutil.move(fallback_best_path, temp_output_path)
                 if primary_best_path and os.path.exists(primary_best_path):
                     os.remove(primary_best_path)
-                return fallback_text, fallback_model
+                return fallback_text, fallback_model, True
 
         # Both models failed, compare the best attempts
         if primary_best_path and fallback_best_path:
@@ -1736,22 +1758,22 @@ class GeminiTTSWrapper(TTSInterface):
                 logger.warning(f"Both models failed validation. Using best attempt from primary model (silence: {primary_silence:.2f})")
                 shutil.move(primary_best_path, temp_output_path)
                 os.remove(fallback_best_path)
-                return primary_text, primary_model
+                return primary_text, primary_model, False
             else:
                 logger.warning(f"Both models failed validation. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
                 shutil.move(fallback_best_path, temp_output_path)
                 os.remove(primary_best_path)
-                return fallback_text, fallback_model
+                return fallback_text, fallback_model, False
 
         # Handle cases where one of the models didn't produce any output
         if primary_best_path:
             logger.warning(f"Fallback model failed. Using best attempt from primary model (silence: {primary_silence:.2f})")
             shutil.move(primary_best_path, temp_output_path)
-            return primary_text, primary_model
+            return primary_text, primary_model, False
         if fallback_best_path:
             logger.warning(f"Primary model failed. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
             shutil.move(fallback_best_path, temp_output_path)
-            return fallback_text, fallback_model
+            return fallback_text, fallback_model, False
 
         raise RuntimeError(f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts.")
 
@@ -1960,7 +1982,7 @@ class GeminiTTSWrapper(TTSInterface):
         # If not cached, synthesize normally
         logger.debug(f"Gemini: Synthesizing segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
         try:
-            synthesized_text, model_used = self._synthesize_single_segment(
+            synthesized_text, model_used, is_valid = self._synthesize_single_segment(
                 segment, segment_file_path, language,
                 previous_segments=context_segments,
                 usage_tracker=usage_tracker
@@ -1972,11 +1994,14 @@ class GeminiTTSWrapper(TTSInterface):
             if duration and model_used:
                 self._register_usage(usage_tracker, model_used, audio_seconds=duration)
 
-            # Cache the generated audio
-            if self._cache_dir:
+            # Cache the generated audio only if synthesis was successful (passed validation)
+            if self._cache_dir and is_valid:
                 cache_path = os.path.join(self._cache_dir, f"{cache_key}.wav")
                 shutil.copy(segment_file_path, cache_path)
                 self._audio_cache[cache_key] = (cache_path, duration)
+                logger.debug(f"Cached valid segment for speaker '{segment.speaker}'")
+            elif not is_valid:
+                logger.debug(f"Skipping cache for invalid segment (speaker '{segment.speaker}') to allow retry next time")
 
             # Save to output path if specified
             if segment.output_path:

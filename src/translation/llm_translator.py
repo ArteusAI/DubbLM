@@ -1963,6 +1963,9 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         context_info: Optional[Dict[str, Any]] = None,
         refinement_persona: Optional[str] = None,
         max_attempts: int = 3,
+        tts_system: Optional[str] = None,
+        segments: Optional[List[Dict]] = None,
+        current_segment_index: Optional[int] = None,
     ) -> str:
         """Adjust a segment's text length using the refinement LLM.
 
@@ -1978,12 +1981,60 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             context_info: Optional context with 'domain' and 'tone'.
             refinement_persona: Optional persona to use (overrides instance setting).
             max_attempts: Number of retries on transient failures.
+            tts_system: Optional TTS system name (e.g., 'gemini') to enable system-specific features.
+            segments: Optional list of all segments for context extraction.
+            current_segment_index: Optional index of current segment in segments list.
 
         Returns:
             Rewritten text in target language. Falls back to original_text on failure.
         """
+        logger.debug(f"=== adjust_segment_text_length called ===")
+        logger.debug(f"Original text length: {len(original_text)} chars")
+        logger.debug(f"Original text: '{original_text[:100]}{'...' if len(original_text) > 100 else ''}'")
+        logger.debug(f"Desired ratio: {desired_ratio:.2f}, Target char count: {target_char_count}")
+        logger.debug(f"TTS system: {tts_system}, Segment index: {current_segment_index}")
+        
         if not self.is_available():
+            logger.debug("LLM translator not available, returning original text")
             return original_text
+
+        # Extract context from segments if provided
+        current_segment_original = ""
+        context_before_section = ""
+        context_after_section = ""
+        
+        if segments is not None and current_segment_index is not None:
+            logger.debug(f"Extracting context from segments (total: {len(segments)}, current: {current_segment_index})")
+            
+            # Extract current segment's original text
+            if 0 <= current_segment_index < len(segments):
+                current_segment = segments[current_segment_index]
+                current_segment_original = current_segment.get("text", "")
+                logger.debug(f"Current segment original: '{current_segment_original[:80]}{'...' if len(current_segment_original) > 80 else ''}'")
+            
+            # Extract context before (previous segment)
+            if current_segment_index > 0:
+                prev_segment = segments[current_segment_index - 1]
+                prev_speaker = prev_segment.get("speaker", "UNKNOWN")
+                prev_original = prev_segment.get("text", "")
+                prev_translation = prev_segment.get("translation", "")
+                
+                context_before_section = f"""[Original] {prev_speaker}: {prev_original}
+[Translation] {prev_speaker}: {prev_translation}"""
+                logger.debug(f"Context before extracted: {prev_speaker}")
+            
+            # Extract context after (next segment)
+            if current_segment_index < len(segments) - 1:
+                next_segment = segments[current_segment_index + 1]
+                next_speaker = next_segment.get("speaker", "UNKNOWN")
+                next_original = next_segment.get("text", "")
+                next_translation = next_segment.get("translation", "")
+                
+                context_after_section = f"""[Original] {next_speaker}: {next_original}
+[Translation] {next_speaker}: {next_translation}"""
+                logger.debug(f"Context after extracted: {next_speaker}")
+        else:
+            logger.debug("No segment context provided")
 
         # Determine which persona to use
         persona = refinement_persona or self.refinement_persona
@@ -1994,6 +2045,9 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         # Clamp ratio to reasonable bounds to avoid extreme prompts
         safe_ratio = max(0.2, min(desired_ratio, 2.0))
         approx_target_chars = target_char_count if target_char_count is not None else max(1, int(len(original_text) * safe_ratio))
+        
+        logger.debug(f"Safe ratio: {safe_ratio:.2f} (clamped from {desired_ratio:.2f})")
+        logger.debug(f"Target chars: {approx_target_chars} (original: {len(original_text)})")
 
         # Build glossary section if available
         glossary_section = ""
@@ -2008,11 +2062,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 CRITICAL: You MUST use the translations from the glossary for all listed terms.
 IMPORTANT: The glossary provides base forms of translations. When using a term from the glossary, you MUST adapt it to fit the grammatical context (e.g., case, gender, number, verb conjugation) of the sentence in the target language \"{target_language}\".
 """
+            logger.debug(f"Using glossary with {len(self.glossary)} entries")
 
         domain = (context_info or {}).get("domain", "general")
         tone = (context_info or {}).get("tone", "neutral")
         themes = ', '.join((context_info or {}).get("themes", []))
         terminology = ', '.join((context_info or {}).get("terminology", []))
+        
+        logger.debug(f"Context info - domain: {domain}, tone: {tone}")
 
         # Extract persona-specific requirements from the refinement prompt
         persona_requirements = ""
@@ -2023,41 +2080,92 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             if goals_match:
                 persona_requirements = f"# Persona-specific constraints:\n{goals_match.group(1).strip()}"
 
+        # Build pause markers section only for Gemini TTS
+        pause_markers_section = ""
+        if tts_system and tts_system.lower() == "gemini" and safe_ratio > 1.0:
+            logger.debug("Enabling pause markers for Gemini TTS lengthening")
+            pause_markers_section = """
+# Pause Markers for Lengthening
+When lengthening text, if natural expansion is insufficient to reach the target length, you may strategically insert pause markers to extend the spoken duration:
+- [short pause] - Brief natural pause (~0.3-0.5 seconds)
+- [medium pause] - Moderate pause (~0.7-1.0 seconds)
+- [long pause] - Extended pause (~1.5-2.0 seconds)
+
+Use pause markers naturally at appropriate points:
+- After introductory phrases or transition words
+- Before or after important technical terms for emphasis
+- Between logical thought segments
+- After rhetorical questions or dramatic statements
+
+Do NOT overuse pause markers. They should feel natural and enhance the delivery, not make it awkward.
+"""
+
+        # Update lengthening guidance based on TTS system
+        if tts_system and tts_system.lower() == "gemini":
+            lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts. If natural expansion is still insufficient, strategically place pause markers [short pause], [medium pause], or [long pause] at appropriate locations to reach the target duration while maintaining natural flow."
+            logger.debug("Using Gemini-specific lengthening guidance with pause markers")
+        else:
+            lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts."
+            logger.debug("Using standard lengthening guidance without pause markers")
+
         prompt = LENGTH_ADJUST_PROMPT.format(
             source_language=source_language,
             target_language=target_language,
             desired_ratio=safe_ratio,
             target_char_count=approx_target_chars,
+            pause_markers_section=pause_markers_section,
+            lengthening_guidance=lengthening_guidance,
             glossary_section=glossary_section,
             domain=domain,
             tone=tone,
             themes=themes,
             terminology=terminology,
             persona_requirements=persona_requirements,
+            current_segment_original=current_segment_original,
+            context_before_section=context_before_section,
+            context_after_section=context_after_section,
             original_text=original_text,
         )
+        
+        logger.debug(f"Built adjustment prompt (length: {len(prompt)} chars)")
+        logger.debug(f"Starting LLM adjustment attempts (max: {max_attempts})")
 
         response_text = ""
         for attempt in range(max_attempts):
             try:
+                logger.debug(f"Attempt {attempt + 1}/{max_attempts}: Calling refinement LLM...")
                 response = self.refinement_llm.complete(prompt)
                 response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
                 self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, prompt, response_text, response)
+                
                 if not response_text:
+                    logger.warning(f"Attempt {attempt + 1}: Empty response from LLM")
                     continue
+
+                logger.debug(f"Attempt {attempt + 1}: Received response (length: {len(response_text)} chars)")
+                logger.debug(f"Response preview: '{response_text[:100]}{'...' if len(response_text) > 100 else ''}'")
 
                 try:
                     repaired = json_repair.loads(response_text)
                     adjusted = repaired.get("text") if isinstance(repaired, dict) else None
                     if adjusted and isinstance(adjusted, str) and adjusted.strip():
+                        logger.debug(f"Successfully parsed adjusted text (length: {len(adjusted)} chars)")
+                        logger.debug(f"Adjusted text: '{adjusted[:100]}{'...' if len(adjusted) > 100 else ''}'")
+                        logger.debug(f"Length change: {len(original_text)} → {len(adjusted)} chars (ratio: {len(adjusted)/len(original_text):.2f})")
                         return adjusted.strip()
-                except Exception:
+                    else:
+                        logger.warning(f"Attempt {attempt + 1}: Parsed JSON but no valid 'text' field")
+                except Exception as parse_exc:
+                    logger.debug(f"Attempt {attempt + 1}: JSON parsing failed: {parse_exc}")
                     # Try a naive fallback: if response looks like raw text without JSON
                     if response_text and response_text.lstrip().startswith("{") is False:
+                        logger.debug(f"Using raw response text as fallback (length: {len(response_text)} chars)")
                         return response_text
-            except Exception:
+            except Exception as api_exc:
+                logger.warning(f"Attempt {attempt + 1}: API error: {api_exc}")
                 # Retry on transient issues
                 continue
 
         # Fallback
+        logger.warning(f"All {max_attempts} adjustment attempts failed, returning original text")
         return original_text

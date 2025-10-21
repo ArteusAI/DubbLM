@@ -5,9 +5,10 @@ import subprocess
 import shutil
 import json
 import re
-from typing import Optional
+from typing import Optional, List
 from pydub import AudioSegment
 from audio_separator.separator import Separator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..core.cache_manager import CacheManager
 from ..debug.performance_tracker import PerformanceTracker
@@ -386,4 +387,167 @@ class AudioProcessor:
         Returns:
             Total duration in seconds or None if not determined
         """
-        return self.total_duration 
+        return self.total_duration
+    
+    def normalize_segments_to_average(self, segment_files: List[str]) -> None:
+        """Normalize all segments to global average volume with fade-in/fade-out.
+        
+        This method:
+        1. Calculates the average mean volume across all segments
+        2. Normalizes each segment to match the global average
+        3. Applies 100ms fade-in at start and 100ms fade-out at end
+        4. Overwrites original segment files with normalized versions
+        
+        Args:
+            segment_files: List of paths to segment audio files
+        """
+        if not segment_files:
+            logger.debug("No segments to normalize")
+            return
+        
+        logger.info(f"Normalizing {len(segment_files)} segments to average volume with fading...")
+        self.performance_tracker.start_timing("segment_normalization")
+        
+        # Step 1: Detect volume for all segments
+        logger.debug("Step 1/3: Detecting volume levels for all segments...")
+        segment_volumes = []
+        
+        def detect_volume(segment_file: str) -> tuple:
+            """Detect volume for a single segment."""
+            if not os.path.exists(segment_file):
+                logger.warning(f"Segment file not found: {segment_file}")
+                return (segment_file, None)
+            
+            try:
+                # Use ffmpeg volumedetect filter to measure volume
+                cmd = [
+                    'ffmpeg', '-i', segment_file, '-af', 'volumedetect',
+                    '-f', 'null', '-'
+                ]
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True,
+                    check=False
+                )
+                
+                # Parse mean volume from stderr
+                mean_volume = None
+                for line in result.stderr.split('\n'):
+                    if 'mean_volume:' in line:
+                        # Extract the dB value
+                        match = re.search(r'mean_volume:\s*([-\d.]+)\s*dB', line)
+                        if match:
+                            mean_volume = float(match.group(1))
+                            break
+                
+                if mean_volume is None:
+                    logger.warning(f"Could not detect volume for {segment_file}")
+                    return (segment_file, None)
+                
+                return (segment_file, mean_volume)
+                
+            except Exception as e:
+                logger.warning(f"Error detecting volume for {segment_file}: {e}")
+                return (segment_file, None)
+        
+        # Detect volumes in parallel
+        with ThreadPoolExecutor(max_workers=min(4, len(segment_files))) as executor:
+            futures = {executor.submit(detect_volume, sf): sf for sf in segment_files}
+            
+            for future in as_completed(futures):
+                segment_file, volume = future.result()
+                if volume is not None:
+                    segment_volumes.append((segment_file, volume))
+        
+        if not segment_volumes:
+            logger.warning("Could not detect volume for any segments, skipping normalization")
+            self.performance_tracker.end_timing("segment_normalization")
+            return
+        
+        # Step 2: Calculate average volume
+        average_volume_db = sum(vol for _, vol in segment_volumes) / len(segment_volumes)
+        logger.info(f"Global average volume: {average_volume_db:.2f} dB (across {len(segment_volumes)} segments)")
+        
+        # Step 3: Normalize each segment to average volume with fading
+        logger.debug("Step 2/3: Normalizing segments to average volume...")
+        
+        def normalize_segment(segment_file: str, current_volume: float) -> bool:
+            """Normalize a single segment and apply fading."""
+            try:
+                # Calculate volume adjustment needed
+                volume_adjustment_db = average_volume_db - current_volume
+                
+                # Get segment duration for fade-out timing
+                probe_cmd = [
+                    'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1', segment_file
+                ]
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                duration = float(probe_result.stdout.strip())
+                
+                # Calculate fade-out start time (duration - 0.1 seconds, but not less than 0)
+                fade_out_start = max(0, duration - 0.1)
+                
+                # Create temporary output file
+                temp_output = f"{segment_file}.temp_normalized.wav"
+                
+                # Build filter chain: fade-in + fade-out + volume adjustment
+                # Only apply fades if duration is sufficient (> 0.2s for both fades)
+                if duration > 0.2:
+                    filter_chain = (
+                        f"afade=t=in:st=0:d=0.1,"
+                        f"afade=t=out:st={fade_out_start}:d=0.1,"
+                        f"volume={volume_adjustment_db}dB"
+                    )
+                else:
+                    # For very short segments, only apply volume adjustment
+                    filter_chain = f"volume={volume_adjustment_db}dB"
+                
+                # Apply normalization and fading
+                cmd = [
+                    'ffmpeg', '-y', '-i', segment_file,
+                    '-af', filter_chain,
+                    '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    temp_output
+                ]
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                # Replace original file with normalized version
+                shutil.move(temp_output, segment_file)
+                
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Error normalizing segment {segment_file}: {e}")
+                # Clean up temp file if it exists
+                temp_output = f"{segment_file}.temp_normalized.wav"
+                if os.path.exists(temp_output):
+                    try:
+                        os.remove(temp_output)
+                    except Exception:
+                        pass
+                return False
+        
+        # Normalize segments in parallel
+        success_count = 0
+        with ThreadPoolExecutor(max_workers=min(4, len(segment_volumes))) as executor:
+            futures = {
+                executor.submit(normalize_segment, seg_file, vol): seg_file 
+                for seg_file, vol in segment_volumes
+            }
+            
+            for future in as_completed(futures):
+                if future.result():
+                    success_count += 1
+        
+        logger.info(f"Step 3/3: Successfully normalized {success_count}/{len(segment_volumes)} segments")
+        
+        self.performance_tracker.end_timing("segment_normalization")
+        logger.info("Segment normalization and fading complete") 

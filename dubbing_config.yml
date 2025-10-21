@@ -12,13 +12,13 @@ debug_diarize_only: false  # Stop after diarization/transcription and generate d
 debug_tts: true  # Save rejected/silent attempts for TTS
 
 #start_time: 1073
-duration: 300
+duration: 600
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
 keep_background: false  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
-remove_pauses: false  # Automatically shorten long silence periods
+remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
 dubbed_volume: 1.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
 use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
@@ -42,11 +42,12 @@ segments_optimization:
   post_diarization_merge_gap: 0.3  # Max gap (seconds) to merge adjacent segments from same speaker after diarization
   post_translation_merge_gap: 1.5  # Max gap (seconds) to merge adjacent segments from same speaker after translation (for TTS optimization)
   max_segment_chars: 800  # Maximum characters per segment (longer segments will be split)
-  max_segment_duration: 180  # Maximum segment duration in seconds
+  max_segment_duration: 240  # Maximum segment duration in seconds
   min_segment_duration: 0.5  # Minimum segment duration in seconds (shorter segments filtered out)
 
 # Transcription settings
 transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
+speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
 
 # Translation engine configuration
 translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
@@ -81,13 +82,12 @@ voice_auto_selection: false  # Auto-match voices to speakers based on audio char
 
 # Per-speaker voice mapping
 # Andrej Karpathy : rasalgethi
-# LEx Fridman : enceladus
+# LEx Fridman : algieba
 
 # Per-speaker voice mapping
 voice_name:
-  SPEAKER_A: "enceladus"
-  SPEAKER_B: "sadaltager"
-#  SPEAKER_B: "zubenelgenubi"      # Assign specific voice to speaker A
+  SPEAKER_A: "algieba"
+  SPEAKER_B: "sadaltager"      # Assign specific voice to speaker A
 
 # Per-speaker voice style instructions
 #voice_prompt:
@@ -120,6 +120,8 @@ glossary:
   "sparse model": "разряженная модель"
   "mental model": "понимание"
   "Andrej Karpathy": "Андрей Каррпатый"
+  "C++": "Си плюс плюс"
+  "clang": "си-лэнг"
 
 pricing:
   transcription:

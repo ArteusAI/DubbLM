@@ -78,6 +78,8 @@ class DubbingConfig:
             'emotion_enrichment_temperature': 0.7,
             'max_workers': 4,
             'estimate_cost': False,
+            'speakers_expected': None,
+            'exit_before_synthesis': False,
             # Segment optimization settings (grouped)
             'segments_optimization': {
                 # Merging after diarization (tight gap for better transcription/translation)
@@ -222,6 +224,21 @@ class DubbingConfig:
         except Exception:
             logger.warning("Warning: Invalid group_overflow_tolerance value. Falling back to 1.0.")
             self.config['group_overflow_tolerance'] = 1.0
+        
+        # Validate speakers_expected parameter
+        speakers_expected = self.config.get('speakers_expected')
+        if speakers_expected is not None:
+            try:
+                speakers_expected = int(speakers_expected)
+                if speakers_expected < 1:
+                    logger.warning(f"Warning: speakers_expected must be >= 1. Got {speakers_expected}. Ignoring.")
+                    self.config['speakers_expected'] = None
+                else:
+                    self.config['speakers_expected'] = speakers_expected
+                    logger.info(f"Expected number of speakers for diarization: {speakers_expected}")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Warning: Invalid speakers_expected value '{speakers_expected}': {e}. Ignoring.")
+                self.config['speakers_expected'] = None
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
@@ -289,6 +306,9 @@ class DubbingConfig:
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')
         parser.add_argument('--background_volume', type=float, help='Gain multiplier for background track when keep_background=true (e.g., 0.56 ≈ -5 dB)')
+        parser.add_argument('--speakers_expected', type=int, help='Expected number of speakers for diarization (if not specified, auto-detect)')
+        parser.add_argument('--exit_before_synthesis', action='store_true', default=argparse.SUPPRESS, 
+                            help='Save translated segments to JSON and exit before speech synthesis. Edit the file, rename it to *_edited.json, and rerun to use edited translations.')
         
         return parser
 

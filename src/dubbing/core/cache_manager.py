@@ -4,8 +4,9 @@ import os
 import hashlib
 import pickle
 import shutil
+import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List
 
 
 class CacheManager:
@@ -254,4 +255,75 @@ class CacheManager:
             input_hash = self.generate_input_hash(input_file)
             input_cache_dir = self.cache_root / input_hash
             if input_cache_dir.exists():
-                shutil.rmtree(input_cache_dir) 
+                shutil.rmtree(input_cache_dir)
+    
+    def save_segments_json(self, step_name: str, cache_key: str, segments: List[Dict], 
+                          metadata: Optional[Dict] = None, filename_suffix: str = "") -> str:
+        """Save segments to a JSON file for manual editing.
+        
+        Args:
+            step_name: Name of the pipeline step
+            cache_key: Cache key
+            segments: List of segment dictionaries to save
+            metadata: Optional metadata to include in the JSON file
+            filename_suffix: Optional suffix for the filename (e.g., "_editable")
+            
+        Returns:
+            Path to the saved JSON file
+        """
+        cache_dir = self.get_cache_path(step_name)
+        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_file = cache_dir / json_filename
+        
+        data = {
+            "cache_key": cache_key,
+            "segments": segments
+        }
+        
+        if metadata:
+            data.update(metadata)
+        
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        return str(json_file)
+    
+    def load_segments_json(self, step_name: str, cache_key: str, filename_suffix: str = "") -> Optional[Dict]:
+        """Load segments from a JSON file.
+        
+        Args:
+            step_name: Name of the pipeline step
+            cache_key: Cache key
+            filename_suffix: Optional suffix for the filename (e.g., "_edited")
+            
+        Returns:
+            Dictionary with segments and metadata if file exists, None otherwise
+        """
+        cache_dir = self.get_cache_path(step_name)
+        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_file = cache_dir / json_filename
+        
+        if not json_file.exists():
+            return None
+        
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            return None
+    
+    def segments_json_exists(self, step_name: str, cache_key: str, filename_suffix: str = "") -> bool:
+        """Check if a segments JSON file exists.
+        
+        Args:
+            step_name: Name of the pipeline step
+            cache_key: Cache key
+            filename_suffix: Optional suffix for the filename
+            
+        Returns:
+            True if file exists, False otherwise
+        """
+        cache_dir = self.get_cache_path(step_name)
+        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_file = cache_dir / json_filename
+        return json_file.exists() 

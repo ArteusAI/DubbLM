@@ -1067,7 +1067,10 @@ You are an expert dialogue editor optimizing text for audio dubbing. Rewrite the
 - Relative length factor: {desired_ratio:.2f}× of the original text length.
 - Target character count (approximate): {target_char_count} characters.
 
-If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts.
+{pause_markers_section}
+
+# Adjustment Strategy
+{lengthening_guidance}
 If shortening: remove redundancy, filler, hedging, and minor asides without losing essential information.
 
 **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
@@ -1075,7 +1078,7 @@ If shortening: remove redundancy, filler, hedging, and minor asides without losi
 # Constraints
 - Preserve all critical facts, numbers, names, and technical terms.
 - Convert digits and dates to spoken-form appropriate for '{target_language}'.
-- Maintain the original speaker’s intent, tone, and register.
+- Maintain the original speaker's intent, tone, and register.
 - Keep it natural for dubbing (flowing speech, not robotic).
 - Do not add new claims or technical details.
 - Prefer correct orthography and diacritics for the target language.
@@ -1090,7 +1093,18 @@ If shortening: remove redundancy, filler, hedging, and minor asides without losi
 # Persona-specific constraints
 {persona_requirements}
 
-# Original text
+# Current segment original text (for reference)
+<current_original>
+{current_segment_original}
+</current_original>
+
+# Context before (previous segment)
+{context_before_section}
+
+# Context after (next segment)
+{context_after_section}
+
+# Original text (translation to adjust)
 <original>
 {original_text}
 </original>
