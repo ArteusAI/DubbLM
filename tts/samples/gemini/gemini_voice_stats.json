@@ -30,12 +30,12 @@
       },
       "Algieba": {
         "voice_name": "Algieba",
-        "words_per_minute": 542.5231956236947,
-        "characters_per_second": 59.67800732960948,
-        "total_samples": 67,
-        "total_words": 4664,
-        "total_characters": 31368,
-        "total_duration_seconds": 1386.6942083333333
+        "words_per_minute": 562.4202424674743,
+        "characters_per_second": 60.14742329006688,
+        "total_samples": 88,
+        "total_words": 5773,
+        "total_characters": 38772,
+        "total_duration_seconds": 1646.8843333333336
       },
       "Alnilam": {
         "voice_name": "Alnilam",
@@ -210,12 +210,12 @@
       },
       "Sadaltager": {
         "voice_name": "Sadaltager",
-        "words_per_minute": 152.29335480267827,
-        "characters_per_second": 18.020349512141905,
-        "total_samples": 686,
-        "total_words": 64037,
-        "total_characters": 432940,
-        "total_duration_seconds": 22746.67741666668
+        "words_per_minute": 159.26185391170011,
+        "characters_per_second": 18.709494690637545,
+        "total_samples": 715,
+        "total_words": 66951,
+        "total_characters": 452809,
+        "total_duration_seconds": 23755.355208333345
       },
       "Schedar": {
         "voice_name": "Schedar",

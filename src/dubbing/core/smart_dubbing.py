@@ -33,6 +33,7 @@ from .cache_manager import CacheManager
 from .segment_optimizer import SegmentOptimizer
 from ..audio.audio_processor import AudioProcessor
 from ..audio.speaker_processor import SpeakerProcessor
+from ..audio.time_stretcher import TimeStretcher
 from ..video.video_processor import VideoProcessor
 from ..debug.performance_tracker import PerformanceTracker
 from ..debug.debug_generator import DebugGenerator
@@ -97,6 +98,10 @@ class SmartDubbing:
         self.audio_processor = AudioProcessor(self.cache_manager, self.performance_tracker)
         self.speaker_processor = SpeakerProcessor(self.cache_manager, self.performance_tracker)
         self.video_processor = VideoProcessor(self.performance_tracker)
+        
+        # Initialize time stretcher with preferred method
+        time_stretch_method = config.get('time_stretch_method', 'auto')
+        self.time_stretcher = TimeStretcher(preferred_method=time_stretch_method)
         
         # Initialize utilities
         self.subtitle_manager = SubtitleManager()
@@ -703,12 +708,12 @@ class SmartDubbing:
             # Use edited segments
             segments = edited_segments
 
-        # Prepare segments for saving (add force_resynthesize field if not present)
+        # Prepare segments for saving (add force_resynthesize field, remove words to reduce size)
         segments_to_save = []
         for seg in segments:
             seg_copy = seg.copy()
-            if "force_resynthesize" not in seg_copy:
-                seg_copy["force_resynthesize"] = False
+            seg_copy["force_resynthesize"] = seg_copy.get("force_resynthesize", False)
+            seg_copy.pop("words", None)
             segments_to_save.append(seg_copy)
         
         metadata = {
@@ -1736,11 +1741,13 @@ class SmartDubbing:
                             for orig_idx, segment in group:
                                 self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
                         
-                        # Apply tempo filter
+                        # Apply high-quality time-stretching
+                        # This preserves pitch and timbre much better than simple speed change
                         tempo = 1.0 / ratio_clamped
-                        cmd = f"ffmpeg -y -i {tmp_in} -filter:a atempo={tempo} -vn {tmp_out}"
-                        result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        if result.returncode == 0:
+                        
+                        success = self.time_stretcher.stretch(tmp_in, tmp_out, tempo)
+                        
+                        if success:
                             adjusted_group_audio = AudioSegment.from_file(tmp_out)
                         else:
                             logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}")

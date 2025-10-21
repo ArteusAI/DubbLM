@@ -25,9 +25,10 @@ use_two_pass_encoding: true  # Use two-pass encoding for better video quality (s
 
 # Text-to-Speech settings
 tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
-tts_model: "gemini-2.5-pro-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
-tts_fallback_model: "gemini-2.5-pro-preview-tts"  # Fallback TTS model if primary fails
-tts_prompt_prefix: "Speak in Russian as an engaged tech podcast guest in a fast-paced interview, with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
+tts_model: "gemini-2.5-pro-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
+tts_fallback_model: "gemini-2.5-pro-tts"  # Fallback TTS model if primary fails
+#tts_prompt_prefix: "Speak in Russian as an engaged tech podcast guest in a fast-paced interview, with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
+tts_prompt_prefix: "Read aloud with the clear, engaging, and authoritative delivery of a professional narrator. Speak in Russian. The prosody must be smooth and authoritative, avoiding any sharp emotional shifts unless explicitly directed by markup tags:"
 
 # Gemini TTS emotion enrichment (adds emotional markup tags to text)
 enable_emotion_enrichment: false  # Enable emotion enrichment using LLM
