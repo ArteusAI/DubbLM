@@ -1,6 +1,7 @@
 """Centralized segment optimization logic for the dubbing pipeline."""
 
 from typing import List, Dict, Any, Optional
+import tiktoken
 from src.dubbing.core.log_config import get_logger
 
 logger = get_logger(__name__)
@@ -21,19 +22,36 @@ class SegmentOptimizer:
         self.opt_cfg = config.get('segments_optimization', {})
         self.tts_system = tts_system or config.get('tts_system', 'coqui')
 
+        # Initialize tiktoken encoding for token counting
+        self.encoding = tiktoken.get_encoding("cl100k_base")
+
         # Load parameters with defaults
         self.post_diarization_merge_gap = self.opt_cfg.get('post_diarization_merge_gap', 0.3)
         self.post_translation_merge_gap = self.opt_cfg.get('post_translation_merge_gap', 1.5)
-        self.max_segment_chars = self.opt_cfg.get('max_segment_chars', 420)
+        self.max_segment_before_translate_chars = self.opt_cfg.get('max_segment_before_translate_chars', 420)
         self.max_segment_duration = self.opt_cfg.get('max_segment_duration', 60)
         self.min_segment_duration = self.opt_cfg.get('min_segment_duration', 0.5)
+        self.max_segment_to_synth_tokens = self.opt_cfg.get('max_segment_to_synth_tokens', 7000)
 
         logger.debug(f"SegmentOptimizer initialized with: "
                     f"tts_system={self.tts_system}, "
                     f"post_diarization_gap={self.post_diarization_merge_gap}s, "
                     f"post_translation_gap={self.post_translation_merge_gap}s, "
-                    f"max_chars={self.max_segment_chars}, "
-                    f"max_duration={self.max_segment_duration}s")
+                    f"max_chars={self.max_segment_before_translate_chars}, "
+                    f"max_duration={self.max_segment_duration}s, "
+                    f"max_tokens={self.max_segment_to_synth_tokens}")
+
+    def _estimate_token_count(self, text: str) -> int:
+        """
+        Count tokens in text using tiktoken.
+
+        Args:
+            text: Input text to count tokens for
+
+        Returns:
+            Actual token count
+        """
+        return len(self.encoding.encode(text))
 
     def _get_translation_separator(self, gap: float) -> str:
         """
@@ -102,6 +120,32 @@ class SegmentOptimizer:
             can_merge = same_speaker and gap <= max_gap
 
             if can_merge:
+                # Check token limits before merging
+                separator = self._get_translation_separator(gap)
+                
+                # Check if merging would exceed token limits for any translation field
+                token_limit_exceeded = False
+                translation_fields = ['translation', 'very_short_translation', 'short_translation', 'long_translation']
+                
+                for field in translation_fields:
+                    if field in segment and field in current_segment:
+                        current_trans = current_segment.get(field, '').strip()
+                        new_trans = segment.get(field, '').strip()
+                        merged_trans = f"{current_trans}{separator}{new_trans}".strip()
+                        token_count = self._estimate_token_count(merged_trans)
+                        
+                        if token_count > self.max_segment_to_synth_tokens:
+                            token_limit_exceeded = True
+                            logger.debug(f"Skipping merge: {field} would exceed token limit "
+                                       f"({token_count} > {self.max_segment_to_synth_tokens} tokens) at "
+                                       f"{current_segment['end']:.2f}s-{segment['start']:.2f}s")
+                            break
+                
+                if token_limit_exceeded:
+                    merged.append(current_segment)
+                    current_segment = segment.copy()
+                    continue
+                
                 # Merge into current segment
                 old_end = current_segment['end']
                 current_segment['end'] = segment['end']
@@ -113,8 +157,6 @@ class SegmentOptimizer:
 
                 # Merge translations with TTS-aware separator
                 if 'translation' in segment and 'translation' in current_segment:
-                    # Use Gemini pause markers for translations
-                    separator = self._get_translation_separator(gap)
                     current_trans = current_segment.get('translation', '').strip()
                     new_trans = segment.get('translation', '').strip()
                     current_segment['translation'] = f"{current_trans}{separator}{new_trans}".strip()
@@ -128,7 +170,6 @@ class SegmentOptimizer:
                 # Merge alternative translation variants (very_short, short, long)
                 for variant_key in ['very_short_translation', 'short_translation', 'long_translation']:
                     if variant_key in segment and variant_key in current_segment:
-                        separator = self._get_translation_separator(gap)
                         current_variant = current_segment.get(variant_key, '').strip()
                         new_variant = segment.get(variant_key, '').strip()
                         current_segment[variant_key] = f"{current_variant}{separator}{new_variant}".strip()
@@ -188,7 +229,7 @@ class SegmentOptimizer:
             List of segments with long ones split
         """
         if max_chars is None:
-            max_chars = self.max_segment_chars
+            max_chars = self.max_segment_before_translate_chars
 
         if not segments:
             return []

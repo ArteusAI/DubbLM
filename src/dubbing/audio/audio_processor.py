@@ -5,6 +5,7 @@ import subprocess
 import shutil
 import json
 import re
+from statistics import median
 from typing import Optional, List
 from pydub import AudioSegment
 from audio_separator.separator import Separator
@@ -390,13 +391,18 @@ class AudioProcessor:
         return self.total_duration
     
     def normalize_segments_to_average(self, segment_files: List[str]) -> None:
-        """Normalize all segments to global average volume with fade-in/fade-out.
+        """Softly align segment loudness and gently level dynamics per segment.
         
-        This method:
-        1. Calculates the average mean volume across all segments
-        2. Normalizes each segment to match the global average
-        3. Applies 100ms fade-in at start and 100ms fade-out at end
-        4. Overwrites original segment files with normalized versions
+        The method performs a robust, gentle normalization across segments and
+        within each segment:
+        - Detects mean loudness of each segment (ffmpeg volumedetect)
+        - Uses median loudness as the global target to reduce influence of outliers
+        - Applies a capped gain per segment (default: +3 dB / -6 dB)
+        - Smooths gain differences between adjacent segments (max step: 2 dB)
+        - Adds mild compression and peak limiting within each segment
+        - Applies short 50 ms fade-in/out to avoid clicks at boundaries
+        
+        Original files are overwritten in-place upon success.
         
         Args:
             segment_files: List of paths to segment audio files
@@ -465,19 +471,47 @@ class AudioProcessor:
             self.performance_tracker.end_timing("segment_normalization")
             return
         
-        # Step 2: Calculate average volume
-        average_volume_db = sum(vol for _, vol in segment_volumes) / len(segment_volumes)
-        logger.info(f"Global average volume: {average_volume_db:.2f} dB (across {len(segment_volumes)} segments)")
-        
-        # Step 3: Normalize each segment to average volume with fading
-        logger.debug("Step 2/3: Normalizing segments to average volume...")
-        
-        def normalize_segment(segment_file: str, current_volume: float) -> bool:
-            """Normalize a single segment and apply fading."""
+        # Step 2: Calculate robust target (median) and build a smoothed gain plan
+        volume_map = {sf: vol for sf, vol in segment_volumes}
+        ordered_volumes = [volume_map[sf] for sf in segment_files if sf in volume_map]
+        if not ordered_volumes:
+            logger.warning("No segments with detected volume in provided order; skipping normalization")
+            self.performance_tracker.end_timing("segment_normalization")
+            return
+
+        target_volume_db = float(median(ordered_volumes))
+        logger.info(
+            f"Global target (median) volume: {target_volume_db:.2f} dB (from {len(ordered_volumes)} segments)"
+        )
+
+        # Gentle caps and smoothing
+        max_gain_up_db = 3.0   # do not boost more than +3 dB to avoid raising noise
+        max_gain_down_db = 6.0 # allow up to -6 dB attenuation
+        max_step_db = 2.0      # limit jump between adjacent segments
+
+        planned_gains: List[tuple[str, float]] = []
+        previous_gain: Optional[float] = None
+        for sf in segment_files:
+            if sf not in volume_map:
+                continue
+            raw_gain = target_volume_db - volume_map[sf]
+            clamped = max(-max_gain_down_db, min(max_gain_up_db, raw_gain))
+            if previous_gain is not None:
+                # Smooth transitions between segments
+                delta = clamped - previous_gain
+                if delta > max_step_db:
+                    clamped = previous_gain + max_step_db
+                elif delta < -max_step_db:
+                    clamped = previous_gain - max_step_db
+            planned_gains.append((sf, clamped))
+            previous_gain = clamped
+
+        # Step 3: Normalize each segment per plan with gentle dynamics and fading
+        logger.debug("Step 2/3: Normalizing segments with soft gains, compression, and fades...")
+
+        def normalize_segment(segment_file: str, planned_gain_db: float) -> bool:
+            """Normalize a single segment with gentle gain, compression, and fades."""
             try:
-                # Calculate volume adjustment needed
-                volume_adjustment_db = average_volume_db - current_volume
-                
                 # Get segment duration for fade-out timing
                 probe_cmd = [
                     'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -486,23 +520,30 @@ class AudioProcessor:
                 probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
                 duration = float(probe_result.stdout.strip())
                 
-                # Calculate fade-out start time (duration - 0.1 seconds, but not less than 0)
-                fade_out_start = max(0, duration - 0.1)
+                # Calculate fade-out start time (duration - 0.05 seconds, but not less than 0)
+                fade_out_start = max(0, duration - 0.05)
                 
                 # Create temporary output file
                 temp_output = f"{segment_file}.temp_normalized.wav"
                 
-                # Build filter chain: fade-in + fade-out + volume adjustment
-                # Only apply fades if duration is sufficient (> 0.2s for both fades)
-                if duration > 0.2:
+                # Build filter chain: gentle volume, compressor, limiter, and fades
+                # Only apply fades if duration is sufficient (> 0.1s for both fades)
+                base_chain = (
+                    f"volume={planned_gain_db}dB,"
+                    # Mild compression for intra-segment leveling
+                    f"acompressor=threshold=-18dB:ratio=1.8:attack=10:release=200:knee=4:makeup=0dB,"
+                    # Soft peak limiting to avoid overs
+                    f"alimiter=limit=0.95:attack=5:release=50"
+                )
+
+                if duration > 0.1:
                     filter_chain = (
-                        f"afade=t=in:st=0:d=0.1,"
-                        f"afade=t=out:st={fade_out_start}:d=0.1,"
-                        f"volume={volume_adjustment_db}dB"
+                        f"{base_chain},"
+                        f"afade=t=in:st=0:d=0.05,"
+                        f"afade=t=out:st={fade_out_start}:d=0.05"
                     )
                 else:
-                    # For very short segments, only apply volume adjustment
-                    filter_chain = f"volume={volume_adjustment_db}dB"
+                    filter_chain = base_chain
                 
                 # Apply normalization and fading
                 cmd = [
@@ -537,17 +578,17 @@ class AudioProcessor:
         
         # Normalize segments in parallel
         success_count = 0
-        with ThreadPoolExecutor(max_workers=min(4, len(segment_volumes))) as executor:
+        with ThreadPoolExecutor(max_workers=min(4, len(planned_gains))) as executor:
             futures = {
-                executor.submit(normalize_segment, seg_file, vol): seg_file 
-                for seg_file, vol in segment_volumes
+                executor.submit(normalize_segment, seg_file, gain_db): seg_file 
+                for seg_file, gain_db in planned_gains
             }
             
             for future in as_completed(futures):
                 if future.result():
                     success_count += 1
         
-        logger.info(f"Step 3/3: Successfully normalized {success_count}/{len(segment_volumes)} segments")
+        logger.info(f"Step 3/3: Successfully normalized {success_count}/{len(planned_gains)} segments")
         
         self.performance_tracker.end_timing("segment_normalization")
         logger.info("Segment normalization and fading complete") 

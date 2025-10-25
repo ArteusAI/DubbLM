@@ -141,6 +141,8 @@ class LLMTranslator(TranslationInterface):
         self.llm = None
         self.refinement_llm = None
         self.cost_tracker = cost_tracker
+        # Stores the most recent context information computed during translate()
+        self.last_context_info = None
         
     def initialize(self) -> None:
         """Initialize the LLM translation system."""
@@ -630,6 +632,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             target_language=target_language,
             **kwargs
         )
+        # Persist context for downstream steps that don't explicitly pass it
+        self.last_context_info = context_info
         
         # Extract source language summary for use in translation
         source_summary = context_info.get("text_summary", "")
@@ -2064,10 +2068,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 """
             logger.debug(f"Using glossary with {len(self.glossary)} entries")
 
-        domain = (context_info or {}).get("domain", "general")
-        tone = (context_info or {}).get("tone", "neutral")
-        themes = ', '.join((context_info or {}).get("themes", []))
-        terminology = ', '.join((context_info or {}).get("terminology", []))
+        # Prefer provided context; fall back to the most recent context from translate()
+        effective_context = (context_info or self.last_context_info) or {}
+        domain = effective_context.get("domain", "general")
+        tone = effective_context.get("tone", "neutral")
+        themes = ', '.join(effective_context.get("themes", []))
+        terminology = ', '.join(effective_context.get("terminology", []))
         
         logger.debug(f"Context info - domain: {domain}, tone: {tone}")
 

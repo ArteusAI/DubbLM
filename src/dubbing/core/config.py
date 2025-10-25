@@ -87,9 +87,10 @@ class DubbingConfig:
                 # Merging after translation (relaxed gap for TTS optimization)
                 'post_translation_merge_gap': 1.5,
                 # Segment length constraints
-                'max_segment_chars': 420,
+                'max_segment_before_translate_chars': 420,
                 'max_segment_duration': 60,
                 'min_segment_duration': 0.5,
+                'max_segment_to_synth_tokens': 2048,
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,

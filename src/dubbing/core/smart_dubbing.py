@@ -34,6 +34,7 @@ from .segment_optimizer import SegmentOptimizer
 from ..audio.audio_processor import AudioProcessor
 from ..audio.speaker_processor import SpeakerProcessor
 from ..audio.time_stretcher import TimeStretcher
+from ..audio.emotion_detector import EmotionDetector, EmotionType
 from ..video.video_processor import VideoProcessor
 from ..debug.performance_tracker import PerformanceTracker
 from ..debug.debug_generator import DebugGenerator
@@ -47,7 +48,6 @@ from .cost_estimator import CostEstimator
 from tts.tts_factory import TTSFactory
 from translation.translator_factory import TranslatorFactory
 from transcription.transcription_factory import TranscriptionFactory
-from speechbrain.inference.interfaces import foreign_class
 
 # Disable warnings
 warnings.filterwarnings("ignore")
@@ -85,6 +85,11 @@ class SmartDubbing:
         if self.muted_speakers:
             logger.info(f"Muted speakers: {sorted(self.muted_speakers)}")
 
+        # Set device
+        device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+        self.torch_device = self._get_torch_device(device)
+
         # Initialize core components
         self.cache_manager = CacheManager(
             use_cache=not config.get('no_cache', False),
@@ -103,15 +108,14 @@ class SmartDubbing:
         time_stretch_method = config.get('time_stretch_method', 'auto')
         self.time_stretcher = TimeStretcher(preferred_method=time_stretch_method)
         
+        # Initialize emotion detector
+        self.emotion_detector = EmotionDetector(device=self.device)
+        
         # Initialize utilities
         self.subtitle_manager = SubtitleManager()
         self.debug_generator = DebugGenerator()
         self.speaker_reporter = SpeakerReporter(self.performance_tracker)
         
-        # Set device
-        device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-        self.device = device
-        self.torch_device = self._get_torch_device(device)
         
         # Initialize debug data container
         self.debug_data = {
@@ -303,8 +307,6 @@ class SmartDubbing:
                 segments_for_output = self.analyze_emotions(segments_for_output, audio_file)
             else:
                 logger.debug("Emotion analysis disabled")
-                for segment in segments_for_output:
-                    segment["emotion"] = "Neutral"
             
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
@@ -601,7 +603,10 @@ class SmartDubbing:
         return translated_segments
     
     def analyze_emotions(self, segments: List[Dict], audio_file: str) -> List[Dict]:
-        """Analyze emotions in the audio for each segment."""
+        """
+        Analyze emotions in the audio using YAMNet audio event detection.
+        Detects emotions at both segment and word level, including gaps between segments.
+        """
         if not segments:
             return []
 
@@ -618,52 +623,19 @@ class SmartDubbing:
                 return cached_segments
             logger.warning("Found corrupted emotion cache, re-analyzing.")
         
-        logger.info("Analyzing speech emotions...")
+        logger.info("Analyzing emotions with YAMNet...")
         self.performance_tracker.start_timing("emotion_analysis")
         
-        # Initialize the emotion classifier
-        classifier = foreign_class(
-            source="speechbrain/emotion-recognition-wav2vec2-IEMOCAP",
-            pymodule_file="custom_interface.py",
-            classname="CustomEncoderWav2vec2Classifier",
-            run_opts={"device": self.torch_device}
-        )
-        
-        # Emotion mapping
-        emotion_dict = {
-            'neu': 'Neutral',
-            'ang': 'Angry',
-            'hap': 'Happy',
-            'sad': 'Sad',
-            'None': None
-        }
-        
-        # Process each segment
-        from pydub import AudioSegment
-        audio = AudioSegment.from_file(audio_file)
-        for segment in segments:
-            try:
-                start = int(segment["start"] * 1000)
-                end = int(segment["end"] * 1000)
-                
-                segment_audio = audio[start:end]
-                segment_audio.export("artifacts/audio/temp_segment.wav", format="wav")
-                
-                out_prob, score, index, text_lab = classifier.classify_file("artifacts/audio/temp_segment.wav")
-                segment["emotion"] = emotion_dict[text_lab[0]]
-                
-                os.remove("artifacts/audio/temp_segment.wav")
-            except Exception as e:
-                logger.warning(f"Error analyzing emotion: {e}")
-                segment["emotion"] = "Neutral"
+        # Use EmotionDetector to analyze segments
+        enriched_segments = self.emotion_detector.analyze_segments(segments, audio_file)
         
         # Save results to cache
-        self.cache_manager.save_to_cache(step_name, cache_key, segments)
+        self.cache_manager.save_to_cache(step_name, cache_key, enriched_segments)
         
         # End timing
         self.performance_tracker.end_timing("emotion_analysis")
         
-        return segments
+        return enriched_segments
     
     def synthesize_speech(self, segments: List[Dict], speakers_rolls: Dict, audio_file: str) -> str:
         """
@@ -713,7 +685,12 @@ class SmartDubbing:
         for seg in segments:
             seg_copy = seg.copy()
             seg_copy["force_resynthesize"] = seg_copy.get("force_resynthesize", False)
-            seg_copy.pop("words", None)
+            # Initialize chosen_text and selected_track_type if not present
+            if "chosen_text" not in seg_copy:
+                seg_copy["chosen_text"] = ""
+            if "selected_track_type" not in seg_copy:
+                seg_copy["selected_track_type"] = ""
+            #seg_copy.pop("words", None)
             segments_to_save.append(seg_copy)
         
         metadata = {
@@ -979,6 +956,8 @@ class SmartDubbing:
                         shutil.copy(segment_cached_file_path, current_segment_output_path)
                         segment_dict['synthesized_speech_len'] = len(cached_audio_info) / 1000.0
                         segment_dict['synthesized_speech_file'] = current_segment_output_path
+                        segment_dict['chosen_text'] = segment_dict.get('translation', '')
+                        segment_dict['selected_track_type'] = 'translation'
                         increment_progress(segment_index, speaker, "cache hit")
                         return None
                     else:
@@ -1089,6 +1068,8 @@ class SmartDubbing:
 
             segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
             segment_dict['synthesized_speech_file'] = current_segment_output_path
+            segment_dict['chosen_text'] = best_text
+            segment_dict['selected_track_type'] = best_track_type
 
             if self.cache_manager.use_cache and len(audio_info) > 0:
                 try:
@@ -1237,6 +1218,29 @@ class SmartDubbing:
 
         # Log completion summary
         logger.info(f"Speech synthesis completed! Processed {total_segments} segments successfully.")
+
+        # Save updated segments with chosen_text and selected_track_type fields
+        segments_to_save = []
+        for seg in segments:
+            seg_copy = seg.copy()
+            seg_copy["force_resynthesize"] = seg_copy.get("force_resynthesize", False)
+            # Ensure chosen_text and selected_track_type are preserved
+            if "chosen_text" not in seg_copy:
+                seg_copy["chosen_text"] = ""
+            if "selected_track_type" not in seg_copy:
+                seg_copy["selected_track_type"] = ""
+            seg_copy.pop("words", None)
+            segments_to_save.append(seg_copy)
+        
+        metadata = {
+            "source_language": self.config.get('source_language'),
+            "target_language": self.config.get('target_language'),
+            "tts_system": self.config.get('tts_system')
+        }
+        updated_path = self.cache_manager.save_segments_json(
+            segments_step_name, cache_key, segments_to_save, metadata, "_editable"
+        )
+        logger.info(f"Updated segments file with synthesis results: {updated_path}")
 
         # End timing
         self.performance_tracker.end_timing("speech_synthesis")
@@ -1566,9 +1570,12 @@ class SmartDubbing:
                 # Persist the adjusted text
                 segment_dict["translation"] = metadata.get("_llm_adjusted_text", segment_dict.get("translation"))
                 metadata["chosen_text"] = segment_dict["translation"]
+                segment_dict["chosen_text"] = segment_dict["translation"]
             else:
                 metadata["chosen_text"] = segment_dict[best_key]
+                segment_dict["chosen_text"] = segment_dict[best_key]
             metadata["selected_track_type"] = best_key  # Update the selected track type
+            segment_dict["selected_track_type"] = best_key
 
             # Update cache if needed
             if self.cache_manager.use_cache and len(audio_info) > 0:

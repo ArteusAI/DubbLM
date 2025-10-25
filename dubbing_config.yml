@@ -12,23 +12,24 @@ debug_diarize_only: false  # Stop after diarization/transcription and generate d
 debug_tts: true  # Save rejected/silent attempts for TTS
 
 #start_time: 1073
-duration: 600
+#duration: 600
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: false  # Preserve background music/sounds in output
+keep_background: true  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
 dubbed_volume: 1.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
 use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
+enable_emotion_analysis: false
 
 # Text-to-Speech settings
 tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
-tts_model: "gemini-2.5-pro-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
-tts_fallback_model: "gemini-2.5-pro-tts"  # Fallback TTS model if primary fails
-#tts_prompt_prefix: "Speak in Russian as an engaged tech podcast guest in a fast-paced interview, with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
-tts_prompt_prefix: "Read aloud with the clear, engaging, and authoritative delivery of a professional narrator. Speak in Russian. The prosody must be smooth and authoritative, avoiding any sharp emotional shifts unless explicitly directed by markup tags:"
+tts_model: "gemini-2.5-pro-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
+tts_fallback_model: "gemini-2.5-pro-preview-tts"  # Fallback TTS model if primary fails
+tts_prompt_prefix: "Speak in Russian as an engaged tech podcast guest in a fast-paced interview, with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
+#tts_prompt_prefix: "Read aloud with the clear, engaging, and authoritative delivery of a professional narrator. Speak in Russian. The prosody must be smooth and authoritative, avoiding any sharp emotional shifts unless explicitly directed by markup tags:"
 
 # Gemini TTS emotion enrichment (adds emotional markup tags to text)
 enable_emotion_enrichment: false  # Enable emotion enrichment using LLM
@@ -42,13 +43,12 @@ max_workers: 4  # Number of parallel workers for segment synthesis (higher=faste
 segments_optimization:
   post_diarization_merge_gap: 0.3  # Max gap (seconds) to merge adjacent segments from same speaker after diarization
   post_translation_merge_gap: 1.5  # Max gap (seconds) to merge adjacent segments from same speaker after translation (for TTS optimization)
-  max_segment_chars: 800  # Maximum characters per segment (longer segments will be split)
   max_segment_duration: 240  # Maximum segment duration in seconds
   min_segment_duration: 0.5  # Minimum segment duration in seconds (shorter segments filtered out)
 
 # Transcription settings
 transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
-speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
+#speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
 
 # Translation engine configuration
 translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
@@ -60,7 +60,7 @@ llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
 refinement_llm_provider: "openrouter"  # AI provider for style refinement
 refinement_model_name: "anthropic/claude-sonnet-4.5"  # Model for translation polishing
 refinement_temperature: 1.0  # Refinement creativity level
-refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
+refinement_persona: "ai_buddy"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
 
 # Subtitle generation
 save_original_subtitles: true  # Generate .srt file with original language
@@ -68,7 +68,7 @@ save_translated_subtitles: true  # Generate .srt file with translated text
 
 # Voice configuration
 # voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
-voice_auto_selection: false  # Auto-match voices to speakers based on audio characteristics
+voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
 
 # Advanced audio processing
 # Optional: Preserve original audio for specific time ranges
@@ -85,10 +85,15 @@ voice_auto_selection: false  # Auto-match voices to speakers based on audio char
 # Andrej Karpathy : rasalgethi
 # LEx Fridman : algieba
 
+# Stable:
+# - Alnilam (man, middle-low pitch)
+# - Puck (man, nerd, middle pitch)
+# - Fenrir (man, middle pitch)
+
 # Per-speaker voice mapping
-voice_name:
-  SPEAKER_A: "algieba"
-  SPEAKER_B: "sadaltager"      # Assign specific voice to speaker A
+#voice_name:
+#  SPEAKER_A: "algieba"
+#  SPEAKER_B: "sadaltager"      # Assign specific voice to speaker A
 
 # Per-speaker voice style instructions
 #voice_prompt:
@@ -146,6 +151,9 @@ pricing:
           input_per_1m_tokens: 0.50
           output_per_1m_tokens: 10.00
         gemini-2.5-pro-preview-tts:
+          input_per_1m_tokens: 1.00
+          output_per_1m_tokens: 20.00
+        gemini-2.5-pro-tts:
           input_per_1m_tokens: 1.00
           output_per_1m_tokens: 20.00
       per_audio_min: null

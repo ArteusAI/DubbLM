@@ -758,6 +758,15 @@ class VideoProcessor:
                 final_audio_stream_label = "[final_mixed_audio]"
         else:
             final_audio_stream_label = processed_dubbed_audio_stream_label
+        
+        # Apply final normalization to bring the entire mix to optimal loudness
+        all_filter_complex_parts.append(
+            f"{self._format_filter_input_label(final_audio_stream_label)}"
+            f"loudnorm=I=-14:TP=-1:LRA=11,"
+            f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
+        )
+        final_audio_stream_label = "[final_normalized]"
+        logger.debug("Applied final normalization to bring mix to optimal loudness")
             
         if all_filter_complex_parts:
             command.extend(["-filter_complex", ";".join(all_filter_complex_parts)])
@@ -1285,6 +1294,14 @@ class VideoProcessor:
                     filter_parts.append(f"{self._format_filter_input_label(current_audio_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]")
                     filter_parts.append("[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_audio]")
                     current_audio_label = "[final_audio]"
+            
+            # Apply final normalization to bring the entire mix to optimal loudness
+            filter_parts.append(
+                f"{self._format_filter_input_label(current_audio_label)}"
+                f"loudnorm=I=-14:TP=-1:LRA=11,"
+                f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
+            )
+            current_audio_label = "[final_normalized]"
             
             # Add filter complex if we have filters
             if filter_parts:
