@@ -11,12 +11,12 @@ debug_info: false  # Generate debug video with speaker labels and timing info
 debug_diarize_only: false  # Stop after diarization/transcription and generate debug video
 debug_tts: true  # Save rejected/silent attempts for TTS
 
-#start_time: 1073
-#duration: 600
+#start_time: 4077
+#duration: 300
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: true  # Preserve background music/sounds in output
+keep_background: false  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
@@ -28,13 +28,11 @@ enable_emotion_analysis: false
 tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
 tts_model: "gemini-2.5-pro-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
 tts_fallback_model: "gemini-2.5-pro-preview-tts"  # Fallback TTS model if primary fails
-tts_prompt_prefix: "Speak in Russian as an engaged tech podcast guest in a fast-paced interview, with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
-#tts_prompt_prefix: "Read aloud with the clear, engaging, and authoritative delivery of a professional narrator. Speak in Russian. The prosody must be smooth and authoritative, avoiding any sharp emotional shifts unless explicitly directed by markup tags:"
+tts_prompt_prefix: "Speak in Russian with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
 
-# Gemini TTS emotion enrichment (adds emotional markup tags to text)
-enable_emotion_enrichment: false  # Enable emotion enrichment using LLM
-emotion_enrichment_model: "gemini-2.5-pro"  # Model for emotion analysis and enrichment
-emotion_enrichment_temperature: 0.7  # Temperature for emotion enrichment (0.0-2.0, higher=more creative)
+enable_emotion_enrichment: true
+emotion_enrichment_model: gemini-3-pro-preview
+emotion_enrichment_temperature: 0.7
 
 # Parallel processing settings for TTS
 max_workers: 4  # Number of parallel workers for segment synthesis (higher=faster but more API usage)
@@ -42,18 +40,18 @@ max_workers: 4  # Number of parallel workers for segment synthesis (higher=faste
 # Segment optimization settings
 segments_optimization:
   post_diarization_merge_gap: 0.3  # Max gap (seconds) to merge adjacent segments from same speaker after diarization
-  post_translation_merge_gap: 1.5  # Max gap (seconds) to merge adjacent segments from same speaker after translation (for TTS optimization)
-  max_segment_duration: 240  # Maximum segment duration in seconds
+  post_translation_merge_gap: 3.5  # Max gap (seconds) to merge adjacent segments from same speaker after translation (for TTS optimization)
+  max_segment_duration: 280  # Maximum segment duration in seconds
   min_segment_duration: 0.5  # Minimum segment duration in seconds (shorter segments filtered out)
 
 # Transcription settings
 transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
-#speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
+#speakers_expected: 1  # Expected number of speakers for diarization (optional, auto-detect if not specified)
 
 # Translation engine configuration
 translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
 llm_provider: "gemini"  # AI provider: gemini, openrouter
-llm_model_name: "gemini-2.5-pro"  # Specific model for translation
+llm_model_name: "gemini-3-pro-preview"  # Specific model for translation
 llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
 
 # Translation refinement settings
@@ -84,20 +82,29 @@ voice_auto_selection: true  # Auto-match voices to speakers based on audio chara
 # Per-speaker voice mapping
 # Andrej Karpathy : rasalgethi
 # LEx Fridman : algieba
+# Yann Lecun : iapetus
+# Bjarne Stoustrup: sadaltager
 
 # Stable:
 # - Alnilam (man, middle-low pitch)
 # - Puck (man, nerd, middle pitch)
 # - Fenrir (man, middle pitch)
+# - Sadaltager (man, old, middle pitch)
 
 # Per-speaker voice mapping
 #voice_name:
-#  SPEAKER_A: "algieba"
-#  SPEAKER_B: "sadaltager"      # Assign specific voice to speaker A
+  #SPEAKER_A: "English_Honest_Man"
+#  SPEAKER_A: "English_ManWithDeepVoice"
+#  SPEAKER_B: "alnilam"
+#  SPEAKER_C: "umbriel"
+#  SPEAKER_D: "enceladus"
+#  SPEAKER_E: "achird"
+#  SPEAKER_F: "erinome"
+#  SPEAKER_G: "iapetus"
 
 # Per-speaker voice style instructions
 #voice_prompt:
-#  SPEAKER_A: ""     # Voice characteristics for speaker 1
+#  SPEAKER_A: "Andrew_Ng"     # Voice characteristics for speaker 1
 #  SPEAKER_B: "Read aloud with the energy of a coach and the vision of a leader:"
 #  SPEAKER_C: "Read aloud in a warm and friendly tone:" # Voice characteristics for speaker 3
 
@@ -117,6 +124,7 @@ glossary:
   "AI": "ИИ"
   "Lex Fridman": "Алексей Федотов"
   "Linus Torvalds": "Линус Торвальдсов"
+  "Andrew Ng": "Андрю Ын"
   "embedding": "эмбеддинг"
   "AGI": "ЭйДжиАй"
   "ASI": "ЭйСиАй"
@@ -128,6 +136,7 @@ glossary:
   "Andrej Karpathy": "Андрей Каррпатый"
   "C++": "Си плюс плюс"
   "clang": "си-лэнг"
+  "symbolic AI": "символьный ИИ"
 
 pricing:
   transcription:

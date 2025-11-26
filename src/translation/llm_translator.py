@@ -2047,7 +2047,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             persona = "normal"
 
         # Clamp ratio to reasonable bounds to avoid extreme prompts
-        safe_ratio = max(0.2, min(desired_ratio, 2.0))
+        safe_ratio = max(0.1, min(desired_ratio, 2.0))
         approx_target_chars = target_char_count if target_char_count is not None else max(1, int(len(original_text) * safe_ratio))
         
         logger.debug(f"Safe ratio: {safe_ratio:.2f} (clamped from {desired_ratio:.2f})")
@@ -2114,6 +2114,22 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
             lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts."
             logger.debug("Using standard lengthening guidance without pause markers")
 
+        if safe_ratio < 1.0:
+            if safe_ratio <= 0.6:
+                shortening_guidance = (
+                    "If shortening: aggressively compress the text. Preserve the core message and indispensable facts, "
+                    "but feel free to remove supporting examples, modifiers, and secondary details to reach the target length."
+                )
+            else:
+                shortening_guidance = (
+                    "If shortening: focus on the primary idea. Remove redundancy, filler, hedging, and minor nuances. "
+                    "It is acceptable to drop secondary details when needed to satisfy the requested length."
+                )
+        else:
+            shortening_guidance = (
+                "If shortening is requested, remove redundancy, filler, and hedging while keeping the key meaning intact."
+            )
+
         prompt = LENGTH_ADJUST_PROMPT.format(
             source_language=source_language,
             target_language=target_language,
@@ -2121,6 +2137,7 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
             target_char_count=approx_target_chars,
             pause_markers_section=pause_markers_section,
             lengthening_guidance=lengthening_guidance,
+            shortening_guidance=shortening_guidance,
             glossary_section=glossary_section,
             domain=domain,
             tone=tone,

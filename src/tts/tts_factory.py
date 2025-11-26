@@ -5,12 +5,14 @@ from .tts_interface import TTSInterface
 from .f5_tts_wrapper import F5TTSWrapper
 from .openai_tts_wrapper import OpenAITTSWrapper
 from .gemini_tts_wrapper import GeminiTTSWrapper
+from .minimax_tts_wrapper import MinimaxTTSWrapper
 
 # Define available TTS providers
 TTS_PROVIDERS: Dict[str, Type[TTSInterface]] = {
     "f5": F5TTSWrapper,
     "openai": OpenAITTSWrapper,
     "gemini": GeminiTTSWrapper,
+    "minimax": MinimaxTTSWrapper,
 }
 
 class TTSConfig:
@@ -24,6 +26,7 @@ class TTSConfig:
         voice_prompt_mapping: Optional[Dict[str, str]] = None,
         prompt_prefix: Optional[str] = None,
         cost_tracker: Optional[Any] = None,
+        translator: Optional[Any] = None,
         **kwargs: Any
     ):
         self.provider = provider
@@ -33,6 +36,7 @@ class TTSConfig:
         self.voice_prompt_mapping = voice_prompt_mapping if voice_prompt_mapping is not None else {}
         self.prompt_prefix = prompt_prefix
         self.cost_tracker = cost_tracker
+        self.translator = translator
         self.kwargs = kwargs # Store any additional provider-specific args
 
 class TTSFactory:
@@ -58,7 +62,9 @@ class TTSFactory:
                                        or a mapping of speaker IDs to voice names (Dict) for voice_mapping.
             voice_prompt: Dictionary mapping speaker IDs to voice prompts for detailed speech style.
             prompt_prefix: Global prompt prefix for TTS generation instructions (mainly for Gemini TTS).
-            **kwargs: Additional arguments for specific TTS providers (e.g., model).
+            **kwargs: Additional arguments for specific TTS providers (e.g., model, translator).
+                     translator: Optional LLMTranslator instance for Gemini TTS to enable automatic
+                                text rephrasing when segments have excessive silence.
             
         Returns:
             An instance of a TTS class implementing TTSInterface
@@ -78,10 +84,11 @@ class TTSFactory:
             "voice_prompt_mapping": voice_prompt,
             "prompt_prefix": prompt_prefix,
         }
-        # Provider-specific kwargs filtering (drop None values)
-        filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None and k != "cost_tracker"}
+        # Provider-specific kwargs filtering (drop None values, but keep cost_tracker and translator separate)
+        filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None and k not in ("cost_tracker", "translator")}
         config_args.update(filtered_kwargs)  # Pass through other kwargs like model
         config_args["cost_tracker"] = kwargs.get("cost_tracker")
+        config_args["translator"] = kwargs.get("translator")
 
         if isinstance(voice_config, str):
             config_args["default_voice"] = voice_config
@@ -129,13 +136,15 @@ class TTSFactory:
             init_args["model"] = config.model
         if config.default_voice is not None:
             init_args["default_voice"] = config.default_voice
-        if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini"):
+        if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini", "minimax"):
             init_args["cost_tracker"] = config.cost_tracker
         
         # Add provider-specific args
         if provider_name_lower == "gemini":
             if config.prompt_prefix is not None:
                 init_args["prompt_prefix"] = config.prompt_prefix
+            if config.translator is not None:
+                init_args["translator"] = config.translator
             # Allow passing fallback_model specifically for Gemini
             fallback = config.kwargs.get("fallback_model") if isinstance(config.kwargs, dict) else None
             if fallback is not None:

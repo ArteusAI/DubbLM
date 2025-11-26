@@ -1071,7 +1071,7 @@ You are an expert dialogue editor optimizing text for audio dubbing. Rewrite the
 
 # Adjustment Strategy
 {lengthening_guidance}
-If shortening: remove redundancy, filler, hedging, and minor asides without losing essential information.
+{shortening_guidance}
 
 **Orthography and Diacritics:** Apply correct target-language orthography and diacritics. For example: in Russian, prefer the 'ё' - 'yo' letter where standard usage requires (not the plain 'e'); preserve accents in Romance languages (e.g., é, è, ñ, ç); use umlauts and ß in German; respect dotted/dotless I rules in Turkish (İ/i vs I/ı). Do not strip diacritics; use language-appropriate casing.
 

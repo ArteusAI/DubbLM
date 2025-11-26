@@ -219,11 +219,13 @@ class SmartDubbing:
                 emotion_enrichment_model=self.config.get('emotion_enrichment_model'),
                 emotion_enrichment_temperature=self.config.get('emotion_enrichment_temperature'),
                 max_workers=self.config.get('max_workers', 4),
-                cost_tracker=self.cost_tracker
+                cost_tracker=self.cost_tracker,
+                translator=self.translator,
+                target_language=self.config.get('target_language', 'en')  # Pass target language for language-specific TTS configuration
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance
-            logger.debug(f"Initialized {self.config.get('tts_system', 'coqui')} TTS system")
+            logger.debug(f"Initialized {self.config.get('tts_system', 'coqui')} TTS system with target language: {self.config.get('target_language', 'en')}")
         except Exception as e:
             logger.warning(f"Failed to initialize TTS: {e}")
     
@@ -283,6 +285,23 @@ class SmartDubbing:
             
             # Extract audio for each speaker
             self.speaker_processor.extract_speaker_audio(audio_file, speakers_rolls)
+            
+            # Clone voices if requested
+            if self.config.get('clone_voice'):
+                voice_mapping = self.clone_speakers_voices(speakers_rolls, audio_file)
+                logger.info("=" * 70)
+                logger.info("VOICE CLONING COMPLETED")
+                logger.info("=" * 70)
+                logger.info(f"Voice mapping saved to: artifacts/cloned_voices/voice_mapping.json")
+                logger.info(f"Test samples saved to: artifacts/cloned_voices/")
+                logger.info("")
+                logger.info("To use cloned voices in future runs:")
+                logger.info("  1. Note the cloned voice IDs from the mapping file")
+                logger.info("  2. Use them with --voice_name option or in your config file")
+                logger.info("=" * 70)
+                
+                # Exit early after cloning
+                return ""
             
             # Translate segments
             translated_segments = self.translate_segments(transcription, audio_file)
@@ -549,6 +568,176 @@ class SmartDubbing:
         
         return speakers_rolls, transcription
     
+    def clone_speakers_voices(self, speakers_rolls: Dict, audio_file: str) -> Dict[str, str]:
+        """
+        Clone voices for specified speakers.
+        
+        Args:
+            speakers_rolls: Dictionary mapping time ranges to speaker IDs
+            audio_file: Path to the audio file
+            
+        Returns:
+            Dictionary mapping speaker IDs to cloned voice IDs
+        """
+        import json
+        
+        # Parse comma-separated speaker list
+        clone_voice_config = self.config.get('clone_voice')
+        if not clone_voice_config:
+            logger.warning("No speakers specified for voice cloning")
+            return {}
+        
+        speakers_to_clone = [s.strip() for s in clone_voice_config.split(',') if s.strip()]
+        if not speakers_to_clone:
+            logger.warning("No valid speakers found in clone_voice config")
+            return {}
+        
+        # Parse custom voice names if provided
+        custom_voice_names = []
+        voice_names_config = self.config.get('voice_names')
+        if voice_names_config:
+            custom_voice_names = [n.strip() for n in voice_names_config.split(',') if n.strip()]
+            if len(custom_voice_names) != len(speakers_to_clone):
+                logger.warning(
+                    f"Number of voice names ({len(custom_voice_names)}) does not match "
+                    f"number of speakers ({len(speakers_to_clone)}). "
+                    f"Auto-generating voice IDs instead."
+                )
+                custom_voice_names = []
+            else:
+                logger.info(f"Using custom voice names: {', '.join(custom_voice_names)}")
+        
+        logger.info(f"Starting voice cloning for speakers: {', '.join(speakers_to_clone)}")
+        
+        # Get all unique speakers from diarization
+        all_speakers = set(speakers_rolls.values())
+        
+        # Verify requested speakers exist
+        missing_speakers = [s for s in speakers_to_clone if s not in all_speakers]
+        if missing_speakers:
+            logger.warning(f"Speakers not found in diarization: {', '.join(missing_speakers)}")
+            logger.info(f"Available speakers: {', '.join(sorted(all_speakers))}")
+        
+        # Filter to only speakers that exist
+        speakers_to_clone = [s for s in speakers_to_clone if s in all_speakers]
+        if not speakers_to_clone:
+            logger.error("None of the requested speakers were found in the diarization")
+            return {}
+        
+        # Get the TTS system to use for cloning
+        tts_system = self.config.get('tts_system', 'minimax')
+        if tts_system != 'minimax':
+            logger.warning(f"Voice cloning is only supported with Minimax TTS. Current TTS system: {tts_system}")
+            logger.info("Please set --tts_system minimax to use voice cloning")
+            return {}
+        
+        tts_instance = self.tts_systems.get(tts_system)
+        if not tts_instance:
+            logger.error(f"TTS system {tts_system} not initialized")
+            return {}
+        
+        # Create output directory for cloned voices
+        output_dir = Path("artifacts/cloned_voices")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        voice_mapping = {}
+        
+        # Clone each speaker's voice
+        for idx, speaker in enumerate(speakers_to_clone):
+            try:
+                logger.info(f"Cloning voice for {speaker}...")
+                
+                # Get speaker audio file
+                speaker_audio_path = f"artifacts/speakers_audio/{speaker}.wav"
+                if not os.path.exists(speaker_audio_path):
+                    logger.error(f"Speaker audio file not found: {speaker_audio_path}")
+                    continue
+                
+                # Generate voice_id - use custom name if provided, otherwise auto-generate
+                if custom_voice_names and idx < len(custom_voice_names):
+                    voice_id = custom_voice_names[idx]
+                    logger.info(f"Using custom voice ID: {voice_id}")
+                else:
+                    voice_id = f"cloned_{speaker}"
+                    logger.info(f"Using auto-generated voice ID: {voice_id}")
+                
+                # Clone the voice
+                try:
+                    cloned_voice_id = tts_instance.clone_voice(speaker_audio_path, voice_id)
+                    logger.info(f"Successfully cloned voice for {speaker} with ID: {cloned_voice_id}")
+                    voice_mapping[speaker] = cloned_voice_id
+                except Exception as clone_error:
+                    logger.error(f"Failed to clone voice for {speaker}: {clone_error}")
+                    continue
+                
+                # Generate test sample
+                test_text = self._get_test_text_for_language(speaker)
+                test_output_path = output_dir / f"{speaker}_test_sample.mp3"
+                
+                try:
+                    from tts.models import TTSSegmentData
+                    
+                    test_segment = TTSSegmentData(
+                        speaker=speaker,
+                        text=test_text,
+                        voice=cloned_voice_id,
+                        output_path=str(test_output_path)
+                    )
+                    
+                    logger.info(f"Generating test sample for {speaker}...")
+                    tts_instance.synthesize(
+                        segments_data=[test_segment],
+                        language=self.config.get('target_language', 'en')
+                    )
+                    
+                    if test_output_path.exists():
+                        logger.info(f"Test sample saved to: {test_output_path}")
+                    else:
+                        logger.warning(f"Test sample generation may have failed for {speaker}")
+                        
+                except Exception as synth_error:
+                    logger.error(f"Failed to generate test sample for {speaker}: {synth_error}")
+                
+            except Exception as e:
+                logger.error(f"Error processing speaker {speaker}: {e}")
+        
+        # Save voice mapping to JSON
+        if voice_mapping:
+            mapping_file = output_dir / "voice_mapping.json"
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(voice_mapping, f, indent=2)
+            logger.info(f"Voice mapping saved to: {mapping_file}")
+            
+            # Also log the mapping for easy reference
+            logger.info("Voice cloning completed successfully!")
+            logger.info("Cloned voice IDs:")
+            for speaker, voice_id in voice_mapping.items():
+                logger.info(f"  {speaker} -> {voice_id}")
+        else:
+            logger.warning("No voices were successfully cloned")
+        
+        return voice_mapping
+    
+    def _get_test_text_for_language(self, speaker_name: str) -> str:
+        """Generate test text based on target language."""
+        target_lang = self.config.get('target_language', 'en')
+        
+        # Map of language codes to test phrases
+        test_phrases = {
+            'en': f"Hello, this is a test of the cloned voice for {speaker_name}.",
+            'es': f"Hola, esta es una prueba de la voz clonada para {speaker_name}.",
+            'fr': f"Bonjour, ceci est un test de la voix clonée pour {speaker_name}.",
+            'de': f"Hallo, dies ist ein Test der geklonten Stimme für {speaker_name}.",
+            'it': f"Ciao, questo è un test della voce clonata per {speaker_name}.",
+            'pt': f"Olá, este é um teste da voz clonada para {speaker_name}.",
+            'ru': f"Привет, это тест клонированного голоса для {speaker_name}.",
+            'zh': f"你好，这是{speaker_name}克隆语音的测试。",
+            'ja': f"こんにちは、これは{speaker_name}のクローン音声のテストです。",
+            'ko': f"안녕하세요, 이것은 {speaker_name}의 복제된 음성 테스트입니다."
+        }
+        
+        return test_phrases.get(target_lang, test_phrases['en'])
+    
     def translate_segments(self, transcription: List[Dict], audio_file: str) -> List[Dict]:
         """Translate segments using the translator."""
         cache_key = f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}_{self.config.get('target_language')}"
@@ -750,7 +939,7 @@ class SmartDubbing:
         
         # Define comfort ratio constants
         # Allow comfort zone override from config (optionally language-specific)
-        COMFORT_MIN_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_min_adjustment_ratio', 0.75)
+        COMFORT_MIN_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_min_adjustment_ratio', 0.85)
         COMFORT_MAX_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_max_adjustment_ratio', 1.15)
         
         # Iteratively estimate and synthesize segments to leverage dynamic duration stats
@@ -940,33 +1129,69 @@ class SmartDubbing:
                         "tts_system": tts_system
                     }
 
-            translation_hash = hashlib.md5(segment_dict["translation"].encode()).hexdigest()[:8]
+            # Prefer previously chosen text for cache key to maximize cache hits across edits
+            preferred_text = (segment_dict.get("chosen_text") or segment_dict.get("translation", ""))
             voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
-            segment_cache_key = f"{base_cache_prefix}_{tts_system}_{segment_index}_{speaker}_{translation_hash}_{voice_prompt_hash}"
+
+            def make_cache_key(text_value: str) -> str:
+                text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
+                return f"{base_cache_prefix}_{tts_system}_{segment_index}_{speaker}_{text_hash}_{voice_prompt_hash}"
+
+            # Default cache key/path (used when saving new audio)
+            segment_cache_key = make_cache_key(preferred_text)
             current_segment_output_path = f"artifacts/audio_chunks/{segment_index}.wav"
             os.makedirs(os.path.dirname(current_segment_output_path), exist_ok=True)
             segment_cached_file_path = segment_cache_path / f"{segment_cache_key}.wav"
 
-            # Check cache only if force_resynthesize is not set
+            # Build candidate cached paths to allow reuse of prior variants (chosen/translation/short/long/very_short)
+            candidate_texts = []
+            if segment_dict.get("chosen_text"):
+                candidate_texts.append(segment_dict.get("chosen_text", ""))
+            # If a specific track type was selected earlier, include its text
+            selected_track_type = segment_dict.get("selected_track_type")
+            if selected_track_type and isinstance(selected_track_type, str) and segment_dict.get(selected_track_type):
+                candidate_texts.append(segment_dict.get(selected_track_type, ""))
+            # Fallbacks
+            for key in ("translation", "short_translation", "long_translation", "very_short_translation"):
+                if segment_dict.get(key):
+                    candidate_texts.append(segment_dict.get(key, ""))
+            # De-duplicate while preserving order
+            seen_texts = set()
+            candidate_texts = [t for t in candidate_texts if not (t in seen_texts or seen_texts.add(t))]
+
+            # Check cache only if force_resynthesize is not set; try multiple candidate keys to maximize hits
             force_resynth = segment_dict.get("force_resynthesize", False)
-            if self.cache_manager.use_cache and not force_resynth and segment_cached_file_path.exists():
-                try:
-                    cached_audio_info = AudioSegment.from_file(segment_cached_file_path)
-                    if len(cached_audio_info) > 0:
-                        shutil.copy(segment_cached_file_path, current_segment_output_path)
-                        segment_dict['synthesized_speech_len'] = len(cached_audio_info) / 1000.0
-                        segment_dict['synthesized_speech_file'] = current_segment_output_path
-                        segment_dict['chosen_text'] = segment_dict.get('translation', '')
+            if self.cache_manager.use_cache and not force_resynth:
+                cached_path_to_use = None
+                for text_variant in candidate_texts:
+                    candidate_key = make_cache_key(text_variant)
+                    candidate_path = segment_cache_path / f"{candidate_key}.wav"
+                    if candidate_path.exists():
+                        try:
+                            cached_audio_info = AudioSegment.from_file(candidate_path)
+                            if len(cached_audio_info) > 0:
+                                cached_path_to_use = candidate_path
+                                break
+                            else:
+                                os.remove(candidate_path)
+                        except Exception:
+                            try:
+                                os.remove(candidate_path)
+                            except Exception:
+                                pass
+
+                if cached_path_to_use is not None:
+                    shutil.copy(cached_path_to_use, current_segment_output_path)
+                    cached_audio_info = AudioSegment.from_file(current_segment_output_path)
+                    segment_dict['synthesized_speech_len'] = len(cached_audio_info) / 1000.0
+                    segment_dict['synthesized_speech_file'] = current_segment_output_path
+                    # Keep existing chosen_text/selected_track_type if present; otherwise infer from preferred_text
+                    if not segment_dict.get('chosen_text'):
+                        segment_dict['chosen_text'] = preferred_text
+                    if not segment_dict.get('selected_track_type'):
                         segment_dict['selected_track_type'] = 'translation'
-                        increment_progress(segment_index, speaker, "cache hit")
-                        return None
-                    else:
-                        os.remove(segment_cached_file_path)
-                except Exception:
-                    try:
-                        os.remove(segment_cached_file_path)
-                    except Exception:
-                        pass
+                    increment_progress(segment_index, speaker, "cache hit")
+                    return None
 
             tts_segment_data_args = {
                 "speaker": speaker,

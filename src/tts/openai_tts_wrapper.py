@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import Counter
 
 from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment 
+from .voice_sample_manager import VoiceSampleManager, AudioFileUtils
 from tts.tts_interface import TTSInterface
 from src.utils.sent_split import greedy_sent_split
 from src.utils.audio_embedder import AudioEmbedder
@@ -70,11 +71,12 @@ class OpenAITTSWrapper(TTSInterface):
     
     def __init__(
         self,
-        model: str = "tts-1", # OpenAI models: tts-1, tts-1-hd
-        default_voice: str = "alloy", # OpenAI voices: alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer
+        model: str = "tts-1",
+        default_voice: str = "alloy",
         embedding_model_device: Optional[str] = None,
         enable_voice_matching: bool = True,
         cost_tracker: Optional[Any] = None,
+        target_language: Optional[str] = None,
         **kwargs: Any
     ):
         if not OPENAI_AVAILABLE:
@@ -84,11 +86,11 @@ class OpenAITTSWrapper(TTSInterface):
             
         self.model = model
         self.default_voice = self._validate_voice_name(default_voice)
+        self.target_language = target_language or "en"
         self.client: Optional[OpenAI] = None
         self.voice_mapping: Dict[str, str] = {}
-        self.voice_prompt_mapping: Dict[str, str] = {} # OpenAI TTS API v1 doesn't directly use text prompts for voice style like Gemini.
-                                                       # Emotion can be hinted in the input text if model supports it implicitly.
-        self._audio_cache: Dict[str, tuple[str, float]] = {}  # Maps cache_key to (file_path, duration)
+        self.voice_prompt_mapping: Dict[str, str] = {}
+        self._audio_cache: Dict[str, tuple[str, float]] = {}
         self._cache_dir = None
         self.cost_tracker = cost_tracker
 
@@ -97,6 +99,7 @@ class OpenAITTSWrapper(TTSInterface):
         self.embedding_model_device = embedding_model_device
         self.audio_embedder: Optional[AudioEmbedder] = None
         self.voice_matcher: Optional[VoiceMatcher] = None
+        self.voice_sample_manager: Optional[VoiceSampleManager] = None
 
     def _register_usage(
         self,
@@ -183,99 +186,51 @@ class OpenAITTSWrapper(TTSInterface):
                     )
                     logger.debug("Voice matching enabled with AudioEmbedder")
                     
+                    # Initialize VoiceSampleManager
+                    self.voice_sample_manager = VoiceSampleManager(
+                        tts_provider="openai",
+                        voice_list=ALL_OPENAI_VOICES,
+                        samples_dir=DEFAULT_SAMPLES_DIR,
+                        stats_file=EMBEDDING_CACHE_FILE,  # OpenAI uses the same file for embeddings and stats
+                        adjustments_file=DEFAULT_SAMPLES_DIR / "openai_duration_adjustments.json",
+                        sample_text=VOICE_SAMPLE_TEXT,
+                        audio_embedder=self.audio_embedder,
+                        voice_matcher=self.voice_matcher,
+                        enable_voice_matching=True,
+                        enable_audio_validation=False,  # OpenAI samples don't need validation
+                    )
+                    
+                    # Set up sample generation callback
+                    def generate_openai_sample(voice_name: str, output_path: str) -> bool:
+                        """Callback for VoiceSampleManager to generate OpenAI samples."""
+                        try:
+                            response = self.client.audio.speech.create(
+                                model=self.model,
+                                voice=voice_name,
+                                input=VOICE_SAMPLE_TEXT,
+                                response_format="mp3"
+                            )
+                            response.write_to_file(output_path)
+                            return True
+                        except Exception as e:
+                            logger.error(f"Error generating sample for {voice_name}: {e}")
+                            return False
+                    
+                    self.voice_sample_manager.set_sample_generator(generate_openai_sample)
+                    
                     # Load or generate voice samples and embeddings
-                    self._initialize_voice_samples()
+                    self.voice_sample_manager.generate_all_samples()
                 except Exception as e:
                     logger.warning(f"Warning: Failed to initialize voice matching: {e}")
                     self.enable_voice_matching = False
                     self.audio_embedder = None
                     self.voice_matcher = None
+                    self.voice_sample_manager = None
             else:
                 logger.info("Voice matching disabled by configuration.")
                 
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {str(e)}")
-    
-    def _initialize_voice_samples(self) -> None:
-        """Initialize voice samples and embeddings for voice matching."""
-        DEFAULT_SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # Try to load existing embeddings
-        if EMBEDDING_CACHE_FILE.exists():
-            try:
-                with open(EMBEDDING_CACHE_FILE, 'r') as f:
-                    cache_data = json.load(f)
-                    # Convert lists back to numpy arrays
-                    embeddings = {
-                        voice: np.array(embedding) 
-                        for voice, embedding in cache_data.items()
-                    }
-                    if self.voice_matcher:
-                        self.voice_matcher.set_sample_embeddings(embeddings)
-                    logger.debug(f"Loaded {len(embeddings)} voice embeddings from cache")
-                    return
-            except Exception as e:
-                logger.error(f"Error loading embeddings cache: {e}. Will regenerate.")
-        
-        # Generate samples and embeddings
-        logger.debug("Generating voice samples and embeddings...")
-        self._generate_voice_samples()
-    
-    def _generate_voice_samples(self, force_regenerate: bool = False) -> bool:
-        """Generate voice samples and compute embeddings for all OpenAI voices."""
-        if not self.client:
-            raise RuntimeError("OpenAI client not initialized.")
-        
-        if not self.voice_matcher:
-            logger.error("VoiceMatcher not available. Cannot generate embeddings.")
-            return False
-        
-        embeddings = {}
-        
-        for voice_name in ALL_OPENAI_VOICES:
-            sample_path = DEFAULT_SAMPLES_DIR / f"{voice_name}.mp3"
-            
-            # Generate sample if it doesn't exist or force regenerate
-            if force_regenerate or not sample_path.exists():
-                logger.debug(f"Generating sample for voice: {voice_name}")
-                try:
-                    response = self.client.audio.speech.create(
-                        model=self.model,
-                        voice=voice_name,
-                        input=VOICE_SAMPLE_TEXT,
-                        response_format="mp3"
-                    )
-                    response.write_to_file(str(sample_path))
-                except Exception as e:
-                    logger.error(f"Error generating sample for {voice_name}: {e}")
-                    continue
-            
-            # Extract embedding if sample exists
-            if sample_path.exists():
-                embedding = self.voice_matcher.extract_embedding_for_audio_file(sample_path)
-                if embedding is not None:
-                    embeddings[voice_name] = embedding
-                    logger.debug(f"Extracted embedding for {voice_name}")
-                else:
-                    logger.error(f"Failed to extract embedding for {voice_name}")
-        
-        # Save embeddings to cache
-        if embeddings:
-            self.voice_matcher.set_sample_embeddings(embeddings)
-            
-            try:
-                # Convert numpy arrays to lists for JSON serialization
-                cache_data = {
-                    voice: embedding.tolist() 
-                    for voice, embedding in embeddings.items()
-                }
-                with open(EMBEDDING_CACHE_FILE, 'w') as f:
-                    json.dump(cache_data, f, indent=2)
-                logger.info(f"Saved {len(embeddings)} embeddings to cache")
-            except Exception as e:
-                logger.error(f"Error saving embeddings cache: {e}")
-        
-        return True
     
     def find_and_pin_voice_for_speaker(self, speaker_id: str, reference_audio_path: Union[str, Path],
                                      force_search: bool = False,
@@ -331,8 +286,12 @@ class OpenAITTSWrapper(TTSInterface):
         if not self.is_available():
             raise RuntimeError("OpenAI TTS not initialized.")
         
+        if not self.voice_sample_manager:
+            logger.warning("VoiceSampleManager not initialized.")
+            return False
+        
         logger.info("Regenerating OpenAI voice samples and embeddings...")
-        return self._generate_voice_samples(force_regenerate)
+        return self.voice_sample_manager.generate_all_samples(force_regenerate)
     
     def _get_cache_key(self, segment_data: TTSSegmentData, language: str) -> str:
         """Generate a unique cache key for a segment based on its properties."""
@@ -457,7 +416,7 @@ class OpenAITTSWrapper(TTSInterface):
     def synthesize(
         self,
         segments_data: List[TTSSegmentData],
-        language: str = "en", # Global language hint, OpenAI mostly auto-detects
+        language: Optional[str] = None,
         **kwargs: Any
     ) -> List[SegmentAlignment]:
         if not self.client:
@@ -465,6 +424,8 @@ class OpenAITTSWrapper(TTSInterface):
         if not segments_data:
             logger.warning("Warning: No segments provided to OpenAITTSWrapper.synthesize.")
             return []
+        
+        language = language or self.target_language
 
         assigned_voices: List[str] = [] # Keep track of voices assigned to speakers
 
@@ -614,6 +575,10 @@ class OpenAITTSWrapper(TTSInterface):
         info["missing_samples"] = [v for v in ALL_OPENAI_VOICES if v not in existing_samples]
         
         return info
+    
+    def clone_voice(self, audio_path: str, voice_id: str) -> str:
+        """Voice cloning is not supported by OpenAI TTS API."""
+        raise NotImplementedError("Voice cloning is not supported by OpenAI TTS. Use Minimax TTS for voice cloning capabilities.")
         
     def cleanup(self) -> None:
         # No specific cloud resources to clean other than local temp files handled by synthesize.
@@ -635,82 +600,45 @@ class OpenAITTSWrapper(TTSInterface):
     def estimate_audio_segment_length(
         self,
         segment_data: TTSSegmentData,
-        language: str = "en"
+        language: Optional[str] = None
     ) -> Optional[float]:
         """
-        Generate audio for the segment and return its actual duration.
-        The generated audio is cached for reuse in synthesize() method.
+        Estimate audio segment length using unified Gemini duration estimation algorithm.
         
         Args:
             segment_data: TTSSegmentData object containing text and voice parameters
-            language: Target language code (e.g., "en")
+            language: Target language code (uses target_language from init if not specified)
             
         Returns:
-            Actual duration in seconds of the generated audio
+            Estimated duration in seconds
         """
         if not segment_data.text or not segment_data.text.strip():
             return 0.0
         
-        if not self.client:
-            raise RuntimeError("OpenAI client not initialized. Call initialize() first.")
+        language = language or self.target_language
         
-        # Check cache first
-        cache_key = self._get_cache_key(segment_data, language)
-        if cache_key in self._audio_cache:
-            cached_path, duration = self._audio_cache[cache_key]
-            if os.path.exists(cached_path):
-                logger.debug(f"OpenAI: Returning cached duration for speaker {segment_data.speaker}: {duration:.2f}s")
-                return duration
+        # Use VoiceSampleManager for unified estimation if available
+        if self.voice_sample_manager:
+            voice_name = segment_data.voice or self.voice_mapping.get(segment_data.speaker, self.default_voice)
+            voice_name = self._validate_voice_name(voice_name)
+            
+            return self.voice_sample_manager.estimate_duration(
+                text=segment_data.text,
+                voice_name=voice_name,
+                language=language,
+                style_prompt=segment_data.style_prompt,
+                emotion=segment_data.emotion,
+                speed=segment_data.speed,
+                speaker_id=segment_data.speaker,
+                apply_biases=True
+            )
         
-        # Generate audio to get actual duration
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
-                temp_path = tmp_file.name
-            
-            logger.debug(f"OpenAI: Generating audio to estimate duration for speaker {segment_data.speaker}")
-            usage_tracker: Dict[str, Any] = {"models": {}}
-            self._synthesize_single_segment(segment_data, temp_path, language, usage_tracker=usage_tracker)
-            
-            # Get actual duration
-            audio_segment = AudioSegment.from_mp3(temp_path)
-            duration = len(audio_segment) / 1000.0  # Convert to seconds
-            self._register_usage(usage_tracker, self.model, audio_seconds=duration)
-
-            if self.cost_tracker:
-                for model_name, metrics in usage_tracker.get("models", {}).items():
-                    input_tok = metrics.get("input_tokens", 0.0)
-                    output_tok = metrics.get("output_tokens", 0.0)
-                    audio_sec = metrics.get("audio_seconds", 0.0)
-                    if input_tok or output_tok or audio_sec:
-                        self.cost_tracker.add_tts_actual(
-                            "openai",
-                            model=model_name,
-                            input_tokens=input_tok,
-                            output_tokens=output_tok,
-                            audio_seconds=audio_sec
-                        )
-            
-            # Cache the generated audio
-            if self._cache_dir:
-                cache_path = os.path.join(self._cache_dir, f"{cache_key}.mp3")
-                shutil.copy(temp_path, cache_path)
-                self._audio_cache[cache_key] = (cache_path, duration)
-                logger.debug(f"OpenAI: Cached generated audio. Actual duration: {duration:.2f}s")
-            
-            return duration
-            
-        except Exception as e:
-            logger.error(f"Error estimating audio length: {e}")
-            # Fall back to estimation if generation fails
-            import re
-            words = re.findall(r'\b\w+\b', segment_data.text.lower())
-            word_count = len(words)
-            base_wpm = 175.0
-            estimated_duration = (word_count / base_wpm) * 60
-            if segment_data.speed and segment_data.speed > 0:
-                estimated_duration /= segment_data.speed
-            return max(0.1, estimated_duration)
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path) 
+        # Fallback if VoiceSampleManager not available
+        import re
+        words = re.findall(r'\b\w+\b', segment_data.text.lower())
+        word_count = len(words)
+        base_wpm = 175.0
+        estimated_duration = (word_count / base_wpm) * 60
+        if segment_data.speed and segment_data.speed > 0:
+            estimated_duration /= segment_data.speed
+        return max(0.1, estimated_duration) 

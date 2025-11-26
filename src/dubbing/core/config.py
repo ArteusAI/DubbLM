@@ -80,6 +80,8 @@ class DubbingConfig:
             'estimate_cost': False,
             'speakers_expected': None,
             'exit_before_synthesis': False,
+            'clone_voice': None,
+            'voice_names': None,
             # Segment optimization settings (grouped)
             'segments_optimization': {
                 # Merging after diarization (tight gap for better transcription/translation)
@@ -310,6 +312,10 @@ class DubbingConfig:
         parser.add_argument('--speakers_expected', type=int, help='Expected number of speakers for diarization (if not specified, auto-detect)')
         parser.add_argument('--exit_before_synthesis', action='store_true', default=argparse.SUPPRESS, 
                             help='Save translated segments to JSON and exit before speech synthesis. Edit the file, rename it to *_edited.json, and rerun to use edited translations.')
+        parser.add_argument('--clone_voice', type=str, default=None,
+                            help='Comma-separated list of speakers to clone (e.g., SPEAKER_A,SPEAKER_B). Voices will be cloned after diarization and test samples generated.')
+        parser.add_argument('--voice_names', type=str, default=None,
+                            help='Comma-separated list of custom voice names for cloned voices (e.g., alice_voice,bob_voice). Must match the order of --clone_voice. If not provided, auto-generates as cloned_{SPEAKER_ID}.')
         
         return parser
 

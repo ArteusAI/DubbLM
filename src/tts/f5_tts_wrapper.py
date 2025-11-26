@@ -100,7 +100,8 @@ class F5TTSWrapper(TTSInterface):
         config_path: str = "F5_tts/configs/base.json", 
         model_path: str = "F5_tts/logs/base/pretrained_base.pth", 
         device: str = "cuda",
-        whisper_model_name: str = "medium", # For transcribing reference audio if text not provided
+        whisper_model_name: str = "medium",
+        target_language: Optional[str] = None,
         **kwargs: Any
     ):
         if not F5TTS_AVAILABLE:
@@ -111,15 +112,16 @@ class F5TTSWrapper(TTSInterface):
         self.config_path = config_path
         self.model_path = model_path
         self.device = device if torch.cuda.is_available() and device == "cuda" else "cpu"
+        self.target_language = target_language or "ru"
         
         self.synthesizer: Optional[CSynthesizer] = None
         self.hps: Optional[Any] = None 
-        self.voice_mapping: Dict[str, Tuple[str, str]] = {} # speaker_id -> (ref_audio_path, ref_text)
-        self.voice_prompt_mapping: Dict[str, str] = {} # F5 doesn't use text prompts for style
+        self.voice_mapping: Dict[str, Tuple[str, str]] = {}
+        self.voice_prompt_mapping: Dict[str, str] = {}
 
         self.whisper_model_name = whisper_model_name
         self.asr_model: Optional[Any] = None
-        self._temp_files_created: List[str] = [] # Track files for cleanup
+        self._temp_files_created: List[str] = []
 
     def set_voice_mapping(self, mapping: Dict[str, str]) -> None:
         # Adapting to store tuple (ref_audio_path, ref_text_path_or_literal_text)
@@ -308,7 +310,7 @@ class F5TTSWrapper(TTSInterface):
     def synthesize(
         self,
         segments_data: List[TTSSegmentData],
-        language: str = "ru", # F5 default is often Russian, ensure this matches model
+        language: Optional[str] = None,
         **kwargs: Any
     ) -> List[SegmentAlignment]:
         if not self.synthesizer:
@@ -316,6 +318,8 @@ class F5TTSWrapper(TTSInterface):
         if not segments_data:
             logger.warning("Warning: No segments provided to F5TTSWrapper.synthesize.")
             return []
+        
+        language = language or self.target_language
 
         alignments = []
         # Ensure dubbing_tool provides these if it wants per-segment ref audio creation by F5 wrapper
@@ -394,6 +398,10 @@ class F5TTSWrapper(TTSInterface):
     
     def is_available(self) -> bool:
         return F5TTS_AVAILABLE and WHISPER_AVAILABLE and self.synthesizer is not None
+    
+    def clone_voice(self, audio_path: str, voice_id: str) -> str:
+        """Voice cloning is not supported by F5 TTS wrapper."""
+        raise NotImplementedError("Voice cloning is not supported by F5 TTS. Use Minimax TTS for voice cloning capabilities.")
 
     def cleanup(self) -> None:
         if self.synthesizer is not None:
@@ -421,20 +429,22 @@ class F5TTSWrapper(TTSInterface):
     def estimate_audio_segment_length(
         self,
         segment_data: TTSSegmentData,
-        language: str = "ru"
+        language: Optional[str] = None
     ) -> Optional[float]:
         """
         Estimate the duration in seconds for a given text segment.
         
         Args:
             segment_data: TTSSegmentData object containing text and voice parameters
-            language: Target language code (e.g., "ru")
+            language: Target language code (uses target_language from init if not specified)
             
         Returns:
             Estimated duration in seconds, or None if estimation is not possible
         """
         if not segment_data.text or not segment_data.text.strip():
             return 0.0
+        
+        language = language or self.target_language
 
         # Simple estimation based on character count and average speaking rate
         # F5 TTS typically speaks at around 120-180 words per minute depending on language
