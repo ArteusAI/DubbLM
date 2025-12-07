@@ -1,0 +1,7 @@
+name: None
+description: No post-processing, raw translation only
+
+---
+
+This persona skips the refinement step entirely. Raw translation output is used directly without any post-processing.
+

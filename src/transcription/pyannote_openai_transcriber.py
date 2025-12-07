@@ -22,7 +22,7 @@ from speechbrain.pretrained import EncoderClassifier
 from scipy.spatial.distance import cosine
 from speechbrain.dataio.dataio import read_audio
 from src.utils.sent_split import greedy_sent_split
-from transcription.transcription_interface import BaseTranscriber
+from src.transcription.transcription_interface import BaseTranscriber
 from src.utils.audio_embedder import AudioEmbedder
 from src.dubbing.core.log_config import get_logger
 
@@ -654,12 +654,18 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
                 for attempt in range(max_attempts):
                     try:
                         with open(temp_mp3_path, "rb") as audio:
+                            # Build transcription params - skip language for auto-detection
+                            transcription_params = {
+                                "model": "whisper-1",
+                                "file": audio,
+                                "response_format": "verbose_json",
+                                "timestamp_granularities": ["word"]
+                            }
+                            if self.source_language != 'auto':
+                                transcription_params["language"] = self.source_language
+                            
                             transcript = self.openai_client.audio.transcriptions.create(
-                                model="whisper-1",
-                                file=audio,
-                                language=self.source_language,
-                                response_format="verbose_json",
-                                timestamp_granularities=["word"]
+                                **transcription_params
                             )
                         break
                     except Exception as e:

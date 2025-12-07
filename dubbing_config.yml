@@ -16,7 +16,7 @@ debug_tts: true  # Save rejected/silent attempts for TTS
 
 # Audio/Video processing
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: false  # Preserve background music/sounds in output
+keep_background: true  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: true  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
@@ -26,12 +26,12 @@ enable_emotion_analysis: false
 
 # Text-to-Speech settings
 tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
-tts_model: "gemini-2.5-pro-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
-tts_fallback_model: "gemini-2.5-pro-preview-tts"  # Fallback TTS model if primary fails
+tts_model: "gemini-2.5-flash-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
+tts_fallback_model: "gemini-2.5-flash-preview-tts"  # Fallback TTS model if primary fails
 tts_prompt_prefix: "Speak in Russian with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
 
 enable_emotion_enrichment: true
-emotion_enrichment_model: gemini-3-pro-preview
+emotion_enrichment_model: gemini-2.5-pro
 emotion_enrichment_temperature: 0.7
 
 # Parallel processing settings for TTS
@@ -46,19 +46,19 @@ segments_optimization:
 
 # Transcription settings
 transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
-#speakers_expected: 1  # Expected number of speakers for diarization (optional, auto-detect if not specified)
+#speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
 
 # Translation engine configuration
 translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
 llm_provider: "gemini"  # AI provider: gemini, openrouter
-llm_model_name: "gemini-3-pro-preview"  # Specific model for translation
+llm_model_name: "gemini-2.5-pro"  # Specific model for translation
 llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
 
 # Translation refinement settings
 refinement_llm_provider: "openrouter"  # AI provider for style refinement
 refinement_model_name: "anthropic/claude-sonnet-4.5"  # Model for translation polishing
 refinement_temperature: 1.0  # Refinement creativity level
-refinement_persona: "ai_buddy"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
+refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
 
 # Subtitle generation
 save_original_subtitles: true  # Generate .srt file with original language
@@ -93,7 +93,7 @@ voice_auto_selection: true  # Auto-match voices to speakers based on audio chara
 
 # Per-speaker voice mapping
 #voice_name:
-  #SPEAKER_A: "English_Honest_Man"
+#  SPEAKER_A: "charon"
 #  SPEAKER_A: "English_ManWithDeepVoice"
 #  SPEAKER_B: "alnilam"
 #  SPEAKER_C: "umbriel"

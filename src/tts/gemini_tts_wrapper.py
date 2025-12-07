@@ -19,7 +19,7 @@ from .models import (
     DiarizationSegment
 )
 from .voice_sample_manager import VoiceSampleManager, AudioFileUtils, TextAnalysisUtils, AudioValidator
-from tts.tts_interface import TTSInterface
+from src.tts.tts_interface import TTSInterface
 from src.utils.sent_split import greedy_sent_split
 from src.utils.audio_embedder import AudioEmbedder
 from src.utils.voice_matcher import VoiceMatcher
@@ -66,7 +66,8 @@ ALL_GEMINI_VOICES: List[str] = [
     "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia", "Sadaltager",
     "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi"
 ]
-DEFAULT_SAMPLES_DIR = Path("tts/samples/gemini")
+# Resolve samples directory relative to this file's location (src/tts/)
+DEFAULT_SAMPLES_DIR = (Path(__file__).parent / "samples" / "gemini").resolve()
 
 # Duration analysis sample texts combined into one comprehensive text
 DURATION_SAMPLE_TEXTS = [

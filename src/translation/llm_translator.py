@@ -13,8 +13,8 @@ try:
 except ImportError:
     json_repair = None
 
-from translation.translation_interface import TranslationInterface
-from translation.prompts import (
+from src.translation.translation_interface import TranslationInterface
+from src.translation.prompts import (
     REFINEMENT_PROMPTS,
     LENGTH_ADJUST_PROMPT,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
@@ -77,10 +77,11 @@ class LLMTranslator(TranslationInterface):
         cache_dir: Optional[str] = "cache/translation_cache",
         enable_cache: bool = True,
         glossary: Optional[Dict[str, str]] = None,
-        refinement_persona: str = "manager",
+        refinement_persona: str = "normal",
         cache_manager: Optional['CacheManager'] = None,
         prompt_prefix: Optional[str] = None,
         cost_tracker: Optional[Any] = None,
+        enable_emotion_enrichment: bool = False,
     ):
         """
         Initialize LLM translator.
@@ -100,7 +101,7 @@ class LLMTranslator(TranslationInterface):
             cache_dir: Directory to store translation cache (deprecated, use cache_manager instead)
             enable_cache: Whether to enable translation caching
             glossary: Dictionary mapping source terms to their desired translations
-            refinement_persona: The persona to use for the refinement prompt ("manager", "child", "tractor_driver")
+            refinement_persona: Persona for refinement prompt. Use "none" to skip refinement.
             cache_manager: Cache manager instance for organized caching
             cost_tracker: Optional cost tracker for recording LLM usage
         """
@@ -108,14 +109,15 @@ class LLMTranslator(TranslationInterface):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.debug = debug
+        self.refinement_persona = refinement_persona
         
         # Set default model names based on provider
         if model_name:
             self.model_name = model_name
         elif llm_provider == "gemini":
-            self.model_name = "models/gemini-2.5-flash-preview-04-17"
+            self.model_name = "gemini-2.5-pro"
         elif llm_provider == "openrouter":
-            self.model_name = "anthropic/claude-3.7-sonnet:thinking"
+            self.model_name = "anthropic/claude-sonnet-4.5"
         
         # Configure refinement model settings
         self.refinement_llm_provider = refinement_llm_provider or llm_provider
@@ -132,9 +134,6 @@ class LLMTranslator(TranslationInterface):
         # Initialize glossary
         self.glossary = glossary or {}
         
-        # Set refinement persona
-        self.refinement_persona = refinement_persona
-        
         # Optional custom prompt prefix to inject additional context
         self.prompt_prefix = (prompt_prefix or "").strip() or None
         
@@ -143,6 +142,156 @@ class LLMTranslator(TranslationInterface):
         self.cost_tracker = cost_tracker
         # Stores the most recent context information computed during translate()
         self.last_context_info = None
+        self.enable_emotion_enrichment = enable_emotion_enrichment
+
+    def _enrich_text_with_llm(
+        self,
+        text_map: Dict[str, str],
+        previous_lines: List[str],
+        target_language: str,
+        debug: bool = False
+    ) -> Dict[str, str]:
+        """
+        Enrich one segment's variants with lightweight markup tags.
+
+        Args:
+            text_map: Mapping of variant key -> text (e.g., {"translation": "...", "short_translation": "..."})
+            previous_lines: Recent translated lines for context
+            target_language: Target language code for prompt clarity
+            debug: Whether to log more detail
+
+        Returns:
+            Mapping of variant key -> enriched text (falls back to originals on failure)
+        """
+        if not text_map:
+            return {}
+
+        if not self.enable_emotion_enrichment:
+            return text_map
+
+        if not self.refinement_llm:
+            logger.warning("Emotion enrichment enabled but refinement LLM is unavailable. Skipping enrichment.")
+            return text_map
+
+        # Build the prompt payload
+        context_section = ""
+        if previous_lines:
+            joined_context = "\n".join(previous_lines[-5:])
+            context_section = f"Previous lines (most recent last):\n{joined_context}\n\n"
+
+        # Keep original order for deterministic output
+        input_order = [k for k, v in text_map.items() if v]
+        input_texts = {k: v for k, v in text_map.items() if v}
+
+        if not input_texts:
+            return text_map
+
+        prompt = f"""You enhance translated dialogue lines with subtle markup tags for text-to-speech.
+Tags (use sparingly and only when they help delivery):
+- Non-speech sounds: [sigh], [uhm]
+- Style modifiers: [sarcasm], [shouting], [whispering], [extremely fast]
+- Pauses: [short pause], [medium pause], [long pause]
+
+Rules:
+- Preserve the original words and meaning; only add lightweight tags.
+- Keep length close to the input; avoid doubling length.
+- Use tags sparingly - they work best when text content already implies the emotion/style.
+- Do NOT use emotional adjectives like "scared" or "curious" as tags (they get vocalized as words).
+- Respect existing punctuation and speaker intent in {target_language}.
+- Return JSON with the same keys you received, enriched text as values.
+- Do NOT add explanations.
+
+{context_section}Input JSON:
+{json.dumps(input_texts, ensure_ascii=False)}
+"""
+
+        try:
+            response = self.refinement_llm.complete(prompt)
+            if hasattr(response, "text"):
+                response_text = response.text
+            else:
+                response_text = str(response)
+
+            self._record_llm_cost(
+                self.refinement_llm_provider,
+                self.refinement_model_name,
+                prompt,
+                response_text,
+                response
+            )
+
+            if not response_text:
+                logger.debug("Emotion enrichment returned empty response; using originals.")
+                return text_map
+
+            try:
+                parsed = json_repair.loads(response_text) if json_repair else json.loads(response_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Parsed enrichment response is not a dict")
+
+                enriched = {}
+                for key in input_order:
+                    val = parsed.get(key, input_texts.get(key, ""))
+                    if not val:
+                        val = input_texts.get(key, "")
+                    # Basic guard against runaway outputs
+                    if len(val) > len(input_texts.get(key, "")) * 3:
+                        val = input_texts.get(key, "")
+                    enriched[key] = val
+
+                return enriched
+            except Exception as parse_err:
+                logger.warning(f"Failed to parse enrichment response, using originals: {parse_err}")
+                return text_map
+
+        except Exception as e:
+            logger.error(f"Emotion enrichment call failed: {e}", exc_info=debug)
+            return text_map
+
+    def _enrich_segments_with_emotion(
+        self,
+        segments: List[Dict],
+        target_language: str,
+        debug: bool = False
+    ) -> List[Dict]:
+        """
+        Apply optional emotion enrichment to translated segments.
+        """
+        if not self.enable_emotion_enrichment or not segments:
+            return segments
+
+        enriched_segments: List[Dict] = []
+        for idx, segment in enumerate(segments):
+            segment_copy = segment.copy()
+
+            # Collect available variants for this segment
+            variant_map = {}
+            for key in ["translation", "very_short_translation", "short_translation", "long_translation"]:
+                if segment.get(key):
+                    variant_map[key] = segment[key]
+
+            # Build lightweight conversational context (previous translations)
+            previous_lines = []
+            start_context = max(0, idx - 3)
+            for prev in segments[start_context:idx]:
+                if prev.get("translation"):
+                    previous_lines.append(f"{prev.get('speaker', 'UNK')}: {prev['translation']}")
+
+            enriched_map = self._enrich_text_with_llm(
+                variant_map,
+                previous_lines,
+                target_language,
+                debug=debug
+            )
+
+            # Store enriched variants under explicit keys to keep originals intact
+            for key, val in enriched_map.items():
+                target_key = f"emotion_enriched_{key}"
+                segment_copy[target_key] = val
+
+            enriched_segments.append(segment_copy)
+
+        return enriched_segments
         
     def initialize(self) -> None:
         """Initialize the LLM translation system."""
@@ -669,16 +818,20 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             report_path=report_path
         )
         
-        # 6. Refine the full translation for coherence and flow
-        logger.info("Refining the full translation using source language summary...")
-        refined_chunks = self._refine_translation(
-            translated_chunks=translated_chunks,
-            context_info=context_info,
-            source_language=source_language,
-            target_language=target_language,
-            dialogue_summary=source_summary,  # Use source language summary directly
-            **kwargs
-        )
+        # 6. Refine the full translation for coherence and flow (skip if persona is "none")
+        if self.refinement_persona == "none":
+            logger.info("Skipping refinement step (refinement_persona='none')")
+            refined_chunks = translated_chunks
+        else:
+            logger.info("Refining the full translation using source language summary...")
+            refined_chunks = self._refine_translation(
+                translated_chunks=translated_chunks,
+                context_info=context_info,
+                source_language=source_language,
+                target_language=target_language,
+                dialogue_summary=source_summary,  # Use source language summary directly
+                **kwargs
+            )
         
         # 7. Segment refined translations back to individual segments
         logger.debug("Decomposing refined translated chunks back to segment level...")
@@ -688,10 +841,23 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         max_chars = 600
         logger.debug(f"Second optimization pass - merging translated segments (max_chars={max_chars})...")
         final_segments = self._optimize_segments(translated_segments, max_gap_seconds=0.3, max_chars=max_chars)
+
+        # 9. Optional emotion enrichment (kept alongside originals)
+        enrichment_enabled = kwargs.get("enable_emotion_enrichment", self.enable_emotion_enrichment)
+        if enrichment_enabled:
+            logger.info("Applying optional emotion enrichment to translated segments...")
+            final_segments = self._enrich_segments_with_emotion(
+                final_segments,
+                target_language=target_language,
+                debug=kwargs.get("debug", self.debug)
+            )
+        else:
+            logger.debug("Emotion enrichment disabled; skipping enrichment step.")
         
         # Report performance metrics
         elapsed_time = time.perf_counter() - start_time
-        logger.debug(f"Completed translation pipeline (including refinement) in {elapsed_time:.2f} seconds")
+        refinement_note = "without refinement" if self.refinement_persona == "none" else f"with refinement (persona={self.refinement_persona})"
+        logger.debug(f"Completed translation pipeline ({refinement_note}) in {elapsed_time:.2f} seconds")
 
         return final_segments
     
@@ -893,6 +1059,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             chunk["text"] = chunk_text
             chunk["original_speaker_texts"] = original_speaker_texts
         
+        progress_callback = kwargs.get("progress_callback")
+        
         for i, chunk in enumerate(chunks):
             self._translate_single_chunk(
                 chunk=chunk,
@@ -909,6 +1077,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             )
             
             logger.info(f"Translated chunk {i+1}/{len(chunks)} in {chunk.get('execution_time', 0):.2f}s")
+            
+            if progress_callback:
+                # Get first translated text for preview
+                translated_pairs = chunk.get("translated_pairs", [])
+                preview_text = translated_pairs[0].get("text", "") if translated_pairs else ""
+                progress_callback("translation", i + 1, len(chunks), preview_text)
             
         # Print cache statistics
         if enable_cache:
@@ -1425,8 +1599,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         # Determine which persona to use
         persona = refinement_persona or self.refinement_persona
         if persona not in REFINEMENT_PROMPTS:
-            logger.warning(f"Warning: Persona '{persona}' not found. Defaulting to 'manager'.")
-            persona = "manager"
+            logger.warning(f"Warning: Persona '{persona}' not found. Defaulting to 'normal'.")
+            persona = "normal"
         
         # Add a depth parameter to track recursion depth for split operations
         depth = kwargs.get("_depth", 0)
@@ -1704,6 +1878,16 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 refined_chunks.extend(refined_first_half)
                 refined_chunks.extend(refined_second_half)
                 
+                # Report progress after batch processing
+                progress_callback = kwargs.get("progress_callback")
+                if progress_callback:
+                    # Get first refined text for preview
+                    first_refined = refined_first_half[0] if refined_first_half else None
+                    preview = ""
+                    if first_refined and first_refined.get("translated_pairs"):
+                        preview = first_refined["translated_pairs"][0].get("text", "")
+                    progress_callback("refinement", batch_idx + 1, len(batches), preview)
+                
                 # Skip the rest of the loop for this batch
                 continue
                 
@@ -1711,6 +1895,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             if not refinement_success:
                 logger.error(f"Refinement failed for batch {batch_idx+1}. Using original translations.")
                 refined_chunks.extend(batch)
+                
+                # Report progress even for failed batch
+                progress_callback = kwargs.get("progress_callback")
+                if progress_callback:
+                    progress_callback("refinement", batch_idx + 1, len(batches), "")
+                
                 continue
 
             # Record end time for batch refinement
@@ -1824,6 +2014,16 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 
             # Add refined chunks from this batch to the overall results
             refined_chunks.extend(batch_refined_chunks)
+            
+            # Report progress after batch processing
+            progress_callback = kwargs.get("progress_callback")
+            if progress_callback:
+                # Get first refined text for preview
+                first_chunk = batch_refined_chunks[0] if batch_refined_chunks else None
+                preview = ""
+                if first_chunk and first_chunk.get("translated_pairs"):
+                    preview = first_chunk["translated_pairs"][0].get("text", "")
+                progress_callback("refinement", batch_idx + 1, len(batches), preview)
 
         # Final check: Ensure the number of output chunks matches input
         if len(refined_chunks) != len(translated_chunks):

@@ -10,8 +10,8 @@ from pathlib import Path
 from collections import Counter
 
 from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment 
-from .voice_sample_manager import VoiceSampleManager, AudioFileUtils
-from tts.tts_interface import TTSInterface
+from .voice_sample_manager import VoiceSampleManager, AudioFileUtils, AudioValidator
+from src.tts.tts_interface import TTSInterface
 from src.utils.sent_split import greedy_sent_split
 from src.utils.audio_embedder import AudioEmbedder
 from src.utils.voice_matcher import VoiceMatcher
@@ -43,7 +43,6 @@ logger = get_logger(__name__)
 ALL_OPENAI_VOICES: List[str] = [
     "alloy", 
     "ash", 
-    "ballad", 
     "coral", 
     "echo",
     "fable", 
@@ -51,10 +50,10 @@ ALL_OPENAI_VOICES: List[str] = [
     "nova", 
     "sage", 
     "shimmer", 
-    "verse"
 ]
 
-DEFAULT_SAMPLES_DIR = Path("tts/samples/openai")
+# Resolve samples directory relative to this file's location (src/tts/)
+DEFAULT_SAMPLES_DIR = (Path(__file__).parent / "samples" / "openai").resolve()
 EMBEDDING_CACHE_FILE = DEFAULT_SAMPLES_DIR / "openai_voice_embeddings.json"
 
 # Sample text for voice analysis - shorter than Gemini's as we'll generate actual audio
@@ -77,6 +76,12 @@ class OpenAITTSWrapper(TTSInterface):
         enable_voice_matching: bool = True,
         cost_tracker: Optional[Any] = None,
         target_language: Optional[str] = None,
+        enable_audio_validation: bool = True,
+        max_silence_ratio: float = 0.5,
+        fade_detection_enabled: bool = True,
+        fade_window_size_ms: int = 500,
+        min_fade_db: float = 10.0,
+        fade_detection_percentile: int = 75,
         **kwargs: Any
     ):
         if not OPENAI_AVAILABLE:
@@ -93,6 +98,14 @@ class OpenAITTSWrapper(TTSInterface):
         self._audio_cache: Dict[str, tuple[str, float]] = {}
         self._cache_dir = None
         self.cost_tracker = cost_tracker
+
+        # Audio validation settings
+        self.enable_audio_validation = enable_audio_validation
+        self.max_silence_ratio = max_silence_ratio
+        self.fade_detection_enabled = fade_detection_enabled
+        self.fade_window_size_ms = fade_window_size_ms
+        self.min_fade_db = min_fade_db
+        self.fade_detection_percentile = fade_detection_percentile
 
         # Voice matching components
         self.enable_voice_matching = enable_voice_matching
@@ -342,76 +355,132 @@ class OpenAITTSWrapper(TTSInterface):
         voice_name = segment_data.voice or self.voice_mapping.get(speaker_id, self.default_voice)
         voice_name = self._validate_voice_name(voice_name)  # Ensure it's a valid OpenAI voice
         
-        # OpenAI tts-1 doesn't use explicit style prompts. Emotion/style is part of input text.
-        # However, if a style_prompt is provided in TTSSegmentData or via global mapping,
-        # we can prepend it to the text as a hint, though its effect varies.
         final_text = text_to_synthesize
-        # style_hint = segment_data.style_prompt or self.voice_prompt_mapping.get(speaker_id)
-        # if style_hint:
-        #     final_text = f"{style_hint.strip()} {text_to_synthesize}"
-        #     logger.info(f"  OpenAI: Prepending style hint for speaker {speaker_id}: '{style_hint.strip()}'")
-        # elif segment_data.emotion and segment_data.emotion != "Neutral":
-        #     # Basic emotion hinting by prepending (effect is model-dependent)
-        #     final_text = f"(Speaking in a {segment_data.emotion.lower()} tone) {text_to_synthesize}"
-        #     logger.info(f"  OpenAI: Prepending emotion hint for speaker {speaker_id}: '{segment_data.emotion.lower()}'")
 
         # OpenAI API character limit is 4096 for tts-1 models.
-        # If text is longer, it needs to be chunked.
         MAX_CHAR_LIMIT = 4096
         text_chunks_for_openai: List[str] = []
 
         if len(final_text) > MAX_CHAR_LIMIT:
             logger.warning(f"  OpenAI: Text for speaker {speaker_id} ({len(final_text)} chars) exceeds limit. Splitting into chunks.")
-            # greedy_sent_split aims for MAX_CHAR_LIMIT per chunk
             text_chunks_for_openai = greedy_sent_split(final_text, MAX_CHAR_LIMIT)
         else:
             text_chunks_for_openai.append(final_text)
         
-        segment_audio_files = []
-        temp_dir_for_chunks = tempfile.mkdtemp(prefix="openai_chunks_")
+        # Retry loop for audio validation
+        max_validation_retries = 3 if self.enable_audio_validation else 1
+        best_attempt_path: Optional[str] = None
+        best_silence_ratio = float('inf')
+        
+        for validation_attempt in range(max_validation_retries):
+            segment_audio_files = []
+            temp_dir_for_chunks = tempfile.mkdtemp(prefix="openai_chunks_")
+            temp_attempt_path = f"{temp_output_path}_attempt_{validation_attempt}.mp3"
 
-        try:
-            for i, chunk_text in enumerate(text_chunks_for_openai):
-                chunk_file_path = os.path.join(temp_dir_for_chunks, f"chunk_{i}.mp3")
-                max_attempts = 3
-                for attempt in range(max_attempts):
+            try:
+                for i, chunk_text in enumerate(text_chunks_for_openai):
+                    chunk_file_path = os.path.join(temp_dir_for_chunks, f"chunk_{i}.mp3")
+                    max_attempts = 3
+                    for attempt in range(max_attempts):
+                        try:
+                            response = self.client.audio.speech.create(
+                                model=self.model,
+                                voice=voice_name,
+                                input=chunk_text,
+                                response_format="mp3",
+                            )
+                            response.write_to_file(chunk_file_path)
+                            token_count = self._count_tokens(chunk_text)
+                            self._register_usage(usage_tracker, self.model, input_tokens=token_count)
+                            segment_audio_files.append(chunk_file_path)
+                            if len(text_chunks_for_openai) > 1:
+                                logger.debug(f"    OpenAI: Synthesized chunk {i+1}/{len(text_chunks_for_openai)} for {speaker_id}")
+                            break
+                        except Exception as e_chunk:
+                            logger.error(f"    OpenAI: Attempt {attempt + 1}/{max_attempts} for chunk {i+1} failed: {e_chunk}")
+                            if attempt + 1 >= max_attempts:
+                                raise RuntimeError(f"OpenAI TTS failed for chunk {i+1} after {max_attempts} attempts: {e_chunk}")
+                            time.sleep(1.5 ** attempt)
+                
+                if not segment_audio_files:
+                    raise RuntimeError(f"No audio chunks were generated for speaker {speaker_id}.")
+                
+                # Combine chunks
+                if len(segment_audio_files) == 1:
+                    shutil.copy(segment_audio_files[0], temp_attempt_path)
+                else:
+                    combined_chunk_audio = AudioSegment.empty()
+                    for audio_file_path in segment_audio_files:
+                        combined_chunk_audio += AudioSegment.from_mp3(audio_file_path)
+                    combined_chunk_audio.export(temp_attempt_path, format="mp3")
+                    logger.debug(f"  OpenAI: Combined {len(segment_audio_files)} chunks for speaker {speaker_id}")
+
+            finally:
+                if os.path.exists(temp_dir_for_chunks):
+                    shutil.rmtree(temp_dir_for_chunks, ignore_errors=True)
+
+            # Validate audio if enabled
+            if self.enable_audio_validation:
+                fade_config = {
+                    'enabled': self.fade_detection_enabled,
+                    'window_size_ms': self.fade_window_size_ms,
+                    'min_fade_db': self.min_fade_db,
+                    'percentile': self.fade_detection_percentile
+                }
+                is_valid, reason, silence_ratio = AudioValidator.validate_audio_sample(
+                    temp_attempt_path,
+                    max_silence_ratio=self.max_silence_ratio,
+                    fade_detection_config=fade_config
+                )
+
+                # Track best attempt
+                if silence_ratio < best_silence_ratio:
+                    if best_attempt_path and os.path.exists(best_attempt_path):
+                        try:
+                            os.remove(best_attempt_path)
+                        except OSError:
+                            pass
+                    best_silence_ratio = silence_ratio
+                    best_attempt_path = temp_attempt_path
+                elif os.path.exists(temp_attempt_path) and temp_attempt_path != best_attempt_path:
                     try:
-                        response = self.client.audio.speech.create(
-                            model=self.model,
-                            voice=voice_name,
-                            input=chunk_text,
-                            response_format="mp3", # OpenAI supports mp3, opus, aac, flac
-                            # speed=segment_data.speed # OpenAI tts-1 supports speed from 0.25 to 4.0
-                        )
-                        response.write_to_file(chunk_file_path)
-                        token_count = self._count_tokens(chunk_text)
-                        self._register_usage(usage_tracker, self.model, input_tokens=token_count)
-                        segment_audio_files.append(chunk_file_path)
-                        if len(text_chunks_for_openai) > 1:
-                            logger.debug(f"    OpenAI: Synthesized chunk {i+1}/{len(text_chunks_for_openai)} for {speaker_id}")
-                        break # Success for this chunk
-                    except Exception as e_chunk:
-                        logger.error(f"    OpenAI: Attempt {attempt + 1}/{max_attempts} for chunk {i+1} failed: {e_chunk}")
-                        if attempt + 1 >= max_attempts:
-                            raise RuntimeError(f"OpenAI TTS failed for chunk {i+1} after {max_attempts} attempts: {e_chunk}")
-                        time.sleep(1.5 ** attempt)
-            
-            # Concatenate chunks if multiple were created for this segment
-            if not segment_audio_files:
-                raise RuntimeError(f"No audio chunks were generated for speaker {speaker_id}.")
-            
-            if len(segment_audio_files) == 1:
-                shutil.copy(segment_audio_files[0], temp_output_path)
-            else:
-                combined_chunk_audio = AudioSegment.empty()
-                for audio_file_path in segment_audio_files:
-                    combined_chunk_audio += AudioSegment.from_mp3(audio_file_path)
-                combined_chunk_audio.export(temp_output_path, format="mp3")
-                logger.debug(f"  OpenAI: Combined {len(segment_audio_files)} chunks for speaker {speaker_id} into {temp_output_path}")
+                        os.remove(temp_attempt_path)
+                    except OSError:
+                        pass
 
-        finally:
-            if os.path.exists(temp_dir_for_chunks):
-                shutil.rmtree(temp_dir_for_chunks, ignore_errors=True)
+                if is_valid:
+                    logger.debug(f"  OpenAI: Audio validation passed for speaker {speaker_id} (silence ratio: {silence_ratio:.2%})")
+                    shutil.copy(best_attempt_path, temp_output_path)
+                    if best_attempt_path and os.path.exists(best_attempt_path):
+                        try:
+                            os.remove(best_attempt_path)
+                        except OSError:
+                            pass
+                    return
+                else:
+                    logger.warning(f"  OpenAI: Audio validation failed for speaker {speaker_id} (attempt {validation_attempt + 1}/{max_validation_retries}): {reason}")
+                    if validation_attempt + 1 < max_validation_retries:
+                        time.sleep(1.0)
+            else:
+                # No validation, just use the generated audio
+                shutil.copy(temp_attempt_path, temp_output_path)
+                if os.path.exists(temp_attempt_path):
+                    try:
+                        os.remove(temp_attempt_path)
+                    except OSError:
+                        pass
+                return
+
+        # All validation attempts failed, use the best one
+        if best_attempt_path and os.path.exists(best_attempt_path):
+            logger.warning(f"  OpenAI: Using best attempt for speaker {speaker_id} with silence ratio {best_silence_ratio:.2%}")
+            shutil.copy(best_attempt_path, temp_output_path)
+            try:
+                os.remove(best_attempt_path)
+            except OSError:
+                pass
+        else:
+            raise RuntimeError(f"OpenAI TTS failed to generate valid audio for speaker {speaker_id} after {max_validation_retries} attempts")
 
     def synthesize(
         self,

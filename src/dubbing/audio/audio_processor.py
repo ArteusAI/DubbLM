@@ -6,7 +6,7 @@ import shutil
 import json
 import re
 from statistics import median
-from typing import Optional, List
+from typing import Optional, List, Callable
 from pydub import AudioSegment
 from audio_separator.separator import Separator
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..core.cache_manager import CacheManager
 from ..debug.performance_tracker import PerformanceTracker
 from ..core.log_config import get_logger
+from ..utils.progress_utils import tqdm_progress_callback
 
 logger = get_logger(__name__)
 
@@ -117,12 +118,18 @@ class AudioProcessor:
             logger.warning(f"Warning: Could not determine video duration: {e}")
             self.total_duration = None
     
-    def process_background_audio(self, audio_file: str, voice_denoising: bool = True) -> Optional[str]:
+    def process_background_audio(
+        self, 
+        audio_file: str, 
+        voice_denoising: bool = True,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> Optional[str]:
         """Process and extract background audio if needed.
         
         Args:
             audio_file: Path to the audio file
             voice_denoising: Whether to perform voice denoising
+            progress_callback: Optional callback(current, total, message) for progress updates
             
         Returns:
             Path to the background audio file or None
@@ -146,6 +153,8 @@ class AudioProcessor:
         output_path = "artifacts/audio/background.wav"
         if self.cache_manager.load_file_from_cache(step_name, cache_key, f"{cache_key}.wav", output_path):
             logger.debug("Loading background audio from cache...")
+            if progress_callback:
+                progress_callback(1, 1, "Loaded from cache")
             self.performance_tracker.end_timing("background_audio")
             return output_path
         
@@ -155,8 +164,9 @@ class AudioProcessor:
         separator = Separator()
         separator.load_model(model_filename='2_HP-UVR.pth')
         
-        # Separate vocals and background
-        output_file_paths = separator.separate(audio_file)[0]
+        # Separate vocals and background with progress tracking
+        with tqdm_progress_callback(progress_callback, "Separating audio"):
+            output_file_paths = separator.separate(audio_file)[0]
         
         # Move the background audio to our audio directory
         background_audio_path = "artifacts/audio/background.wav"

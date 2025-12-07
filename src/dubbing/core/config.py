@@ -35,13 +35,13 @@ class DubbingConfig:
             'start_time': None,
             'duration': None,
             'no_cache': False,
-            'tts_system': 'coqui',
-            'tts_model': None,
-            'tts_fallback_model': None,
-            'transcription_system': 'whisper',
+            'tts_system': 'gemini',
+            'tts_model': 'gemini-2.5-flash-preview-tts',
+            'tts_fallback_model': 'gemini-2.5-flash-preview-tts',
+            'transcription_system': 'assemblyai',
             'translator_type': 'llm',
             'llm_provider': 'gemini',
-            'llm_model_name': None,
+            'llm_model_name': 'gemini-2.5-pro',
             'llm_temperature': 0.5,
             'refinement_llm_provider': None,
             'refinement_model_name': None,
@@ -68,7 +68,7 @@ class DubbingConfig:
             'keep_original_audio_ranges': None,
             'tts_system_mapping': None,
             'tts_prompt_prefix': None,
-            'remove_pauses': False,
+            'pause_removal': 'disabled',  # 'cut', 'speedup', or 'disabled'
             'use_two_pass_encoding': True,
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
@@ -96,6 +96,10 @@ class DubbingConfig:
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,
+                # Video speed limits for 'speedup' pause_removal mode
+                'video_speed_min': 0.75,
+                'video_speed_comfortable': 1.25,  # First phase: comfortable speedup
+                'video_speed_max': 1.5,  # Second phase: extended speedup for remainder
                 # TTS grouping
                 'group_overflow_tolerance': 1.0,
             }
@@ -304,7 +308,8 @@ class DubbingConfig:
                             help='Estimate pipeline cost using configured pricing and exit without running dubbing.')
         parser.add_argument('--tts_system_mapping', type=str, help='JSON string mapping speakers to TTS systems')
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
-        parser.add_argument('--remove_pauses', type=lambda x: (str(x).lower() == 'true'), help='Remove small pauses from video while preserving keyframes (True/False)')
+        parser.add_argument('--pause_removal', type=str, choices=['cut', 'speedup', 'disabled'], 
+                            help='Pause removal mode: "cut" (remove pauses), "speedup" (speed up video segments), "disabled" (no processing)')
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')

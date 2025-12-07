@@ -3,10 +3,10 @@ Factory for creating transcription and diarization services.
 """
 from typing import Optional, Literal, Dict, Any
 
-from transcription.transcription_interface import TranscriptionInterface
-from transcription.pyannote_openai_transcriber import PyAnnoteOpenAITranscriber
-from transcription.whisperx_transcriber import WhisperXTranscriber
-from transcription.assemblyai_transcriber import AssemblyAITranscriber
+from src.transcription.transcription_interface import TranscriptionInterface
+from src.transcription.pyannote_openai_transcriber import PyAnnoteOpenAITranscriber
+from src.transcription.whisperx_transcriber import WhisperXTranscriber
+from src.transcription.assemblyai_transcriber import AssemblyAITranscriber
 
 class TranscriptionFactory:
     """Factory for creating transcription and diarization services."""

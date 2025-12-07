@@ -5,7 +5,7 @@ import os
 import time
 from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
-from transcription.transcription_interface import BaseTranscriber
+from src.transcription.transcription_interface import BaseTranscriber
 from src.dubbing.core.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -97,24 +97,33 @@ class WhisperXTranscriber(BaseTranscriber):
         logger.debug(f"Using model: {self.whisperx_model} on {self.device} device")
         
         try:
+            # Handle auto-detection: pass None for language to enable auto-detect
+            transcribe_language = None if self.source_language == 'auto' else self.source_language
+            
             # Step 1: Transcribe with WhisperX
             model = self.whisperx.load_model(
                 self.whisperx_model,
                 self.device,
                 compute_type="float16" if self.device == "cuda" else "float32",
-                language=self.source_language
+                language=transcribe_language
             )
             
             # Transcribe audio
             result = model.transcribe(
                 audio_file,
                 batch_size=16,
-                language=self.source_language
+                language=transcribe_language
             )
+            
+            # Get detected language for alignment model (WhisperX returns this in result)
+            detected_language = result.get("language", self.source_language)
+            if detected_language == 'auto':
+                detected_language = 'en'  # Fallback to English if still auto
+            logger.info(f"Detected language: {detected_language}")
             
             # Step 2: Align whisper output
             model_a, metadata = self.whisperx.load_align_model(
-                language_code=self.source_language,
+                language_code=detected_language,
                 device=self.device
             )
             

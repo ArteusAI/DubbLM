@@ -9,7 +9,7 @@ import tempfile
 import hashlib
 from datetime import datetime, timezone
 
-from tts.tts_interface import TTSInterface
+from src.tts.tts_interface import TTSInterface
 from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment
 from src.dubbing.core.log_config import get_logger
 

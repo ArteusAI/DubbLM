@@ -1,0 +1,132 @@
+"""Project management routes."""
+
+from typing import List
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from ..database.session import get_db
+from ..database.models import Project, Segment, ProjectStatus
+from ..models.schemas import (
+    ProjectCreate,
+    ProjectResponse,
+    ProjectListResponse,
+    ProjectConfig,
+    ProjectConfigUpdate,
+    SegmentResponse,
+)
+from ..services.project_manager import ProjectManager
+
+router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+def _project_to_response(project: Project, include_segments: bool = False) -> dict:
+    """Convert project model to response dict."""
+    config = project.config or {}
+    response = {
+        "id": project.id,
+        "name": project.name,
+        "status": project.status.value,
+        "createdAt": project.created_at,
+        "updatedAt": project.updated_at,
+        "config": ProjectConfig(
+            sourceLang=config.get("sourceLang"),
+            targetLang=config.get("targetLang"),
+            personaId=config.get("personaId"),
+            speakerCount=config.get("speakerCount"),
+            keepBackground=config.get("keepBackground", True),
+            pauseRemoval=config.get("pauseRemoval", "disabled"),
+            apiKeys=None,  # Never expose API keys
+        ),
+        "sourceFile": project.source_file,
+        "sourceFilename": project.source_filename,
+        "sourceSize": project.source_size,
+    }
+    
+    if include_segments:
+        response["segments"] = [
+            SegmentResponse(**seg.to_dict()) 
+            for seg in project.segments
+        ]
+    
+    return response
+
+
+@router.get("", response_model=List[ProjectListResponse])
+async def list_projects(db: Session = Depends(get_db)):
+    """Get list of all projects."""
+    projects = db.query(Project).order_by(Project.updated_at.desc()).all()
+    return [_project_to_response(p) for p in projects]
+
+
+@router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+async def create_project(project_data: ProjectCreate, db: Session = Depends(get_db)):
+    """Create a new project."""
+    project = Project(name=project_data.name)
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+    
+    # Initialize project directories
+    pm = ProjectManager(project.id)
+    pm.ensure_directories()
+    
+    return _project_to_response(project)
+
+
+@router.get("/{project_id}", response_model=ProjectResponse)
+async def get_project(project_id: str, db: Session = Depends(get_db)):
+    """Get project details including segments."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    return _project_to_response(project, include_segments=True)
+
+
+@router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_project(project_id: str, db: Session = Depends(get_db)):
+    """Delete a project and all associated data."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Delete project files
+    ProjectManager.cleanup_project(project_id)
+    
+    # Delete from database
+    db.delete(project)
+    db.commit()
+    
+    return None
+
+
+@router.patch("/{project_id}/config", response_model=ProjectResponse)
+async def update_project_config(
+    project_id: str,
+    config_update: ProjectConfigUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update project configuration."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Get current config
+    current_config = project.config or {}
+    
+    # Update only provided fields
+    update_data = config_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        if value is not None:
+            # Convert camelCase to snake_case for storage
+            current_config[key] = value
+    
+    project.config = current_config
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(project)
+    
+    return _project_to_response(project)
+

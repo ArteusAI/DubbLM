@@ -95,14 +95,19 @@ class CostTracker:
         self.audio_duration_sec = seconds
 
     def _get_translation_rates(self, provider: str, model: Optional[str]) -> Tuple[float, float, float]:
-        """Retrieve input/output/reasoning pricing (per million tokens) for a translation provider/model combo."""
+        """Retrieve input/output/reasoning pricing (per million tokens) for a translation provider/model combo.
+        
+        Returns (0.0, 0.0, 0.0) if pricing configuration is missing.
+        """
         translation_cfg = self.pricing.get("translation")
         if not isinstance(translation_cfg, dict):
-            raise ValueError("Translation pricing configuration is missing.")
+            logger.debug(f"Translation pricing configuration is missing, costs will be 0")
+            return (0.0, 0.0, 0.0)
 
         provider_cfg = translation_cfg.get(provider)
         if not isinstance(provider_cfg, dict):
-            raise ValueError(f"Missing translation pricing for provider '{provider}'.")
+            logger.debug(f"Missing translation pricing for provider '{provider}', costs will be 0")
+            return (0.0, 0.0, 0.0)
 
         if model:
             models_cfg = provider_cfg.get("models")
@@ -115,28 +120,27 @@ class CostTracker:
                     in_rate = model_cfg.get("input_per_1m_tokens")
                     out_rate = model_cfg.get("output_per_1m_tokens")
                     reasoning_rate = model_cfg.get("reasoning_per_1m_tokens", provider_cfg.get("reasoning_per_1m_tokens"))
-                    if in_rate is None or out_rate is None:
-                        raise ValueError(
-                            f"Translation pricing for {provider} model '{model}' must define input/output per_1m_tokens."
-                        )
-                    return float(in_rate), float(out_rate), float(reasoning_rate or 0.0)
+                    return float(in_rate or 0.0), float(out_rate or 0.0), float(reasoning_rate or 0.0)
 
         in_rate = provider_cfg.get("input_per_1m_tokens")
         out_rate = provider_cfg.get("output_per_1m_tokens")
         reasoning_rate = provider_cfg.get("reasoning_per_1m_tokens")
-        if in_rate is None or out_rate is None:
-            raise ValueError(f"Translation pricing for provider '{provider}' must define input/output per_1m_tokens.")
-        return float(in_rate), float(out_rate), float(reasoning_rate or 0.0)
+        return float(in_rate or 0.0), float(out_rate or 0.0), float(reasoning_rate or 0.0)
 
     def _get_tts_rates(self, provider: str, model: Optional[str]) -> Tuple[float, float, Optional[float]]:
-        """Retrieve TTS pricing (per million tokens and per audio minute)."""
+        """Retrieve TTS pricing (per million tokens and per audio minute).
+        
+        Returns (0.0, 0.0, None) if pricing configuration is missing.
+        """
         tts_cfg = self.pricing.get("tts")
         if not isinstance(tts_cfg, dict):
-            raise ValueError("TTS pricing configuration is missing.")
+            logger.debug(f"TTS pricing configuration is missing, costs will be 0")
+            return (0.0, 0.0, None)
 
         provider_cfg = tts_cfg.get(provider)
         if not isinstance(provider_cfg, dict):
-            raise ValueError(f"Missing TTS pricing for provider '{provider}'.")
+            logger.debug(f"Missing TTS pricing for provider '{provider}', costs will be 0")
+            return (0.0, 0.0, None)
 
         input_rate = provider_cfg.get("input_per_1m_tokens")
         output_rate = provider_cfg.get("output_per_1m_tokens")
@@ -152,8 +156,6 @@ class CostTracker:
                     input_rate = model_cfg.get("input_per_1m_tokens", input_rate)
                     output_rate = model_cfg.get("output_per_1m_tokens", output_rate)
 
-        if input_rate is None and output_rate is None:
-            raise ValueError(f"TTS pricing for provider '{provider}' must define at least one of input_per_1m_tokens or output_per_1m_tokens.")
         per_audio_min = provider_cfg.get("per_audio_min")
         return (
             float(input_rate or 0.0),

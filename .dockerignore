@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+.cursor
+
+# Build
+build
+dist
+*.egg-info
+
+# Test
+.pytest_cache
+.coverage
+htmlcov
+
+# Project artifacts (will be mounted as volumes)
+projects/
+cache/
+artifacts/
+*.db
+
+# Large media files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+*.wav
+*.mp3
+
+# Docs and misc
+*.md
+docs/
+*.log
+

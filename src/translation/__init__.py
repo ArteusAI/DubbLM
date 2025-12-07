@@ -1,6 +1,6 @@
-from translation.translation_interface import TranslationInterface
-from translation.llm_translator import LLMTranslator
-from translation.translator_factory import TranslatorFactory
+from src.translation.translation_interface import TranslationInterface
+from src.translation.llm_translator import LLMTranslator
+from src.translation.translator_factory import TranslatorFactory
 
 __all__ = [
     'TranslationInterface',

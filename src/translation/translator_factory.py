@@ -1,11 +1,11 @@
 from typing import Optional, Dict, Any, Union
 import os
 
-from translation.translation_interface import TranslationInterface
-from translation.llm_translator import LLMTranslator
+from src.translation.translation_interface import TranslationInterface
+from src.translation.llm_translator import LLMTranslator
 
 # Import additional translator classes as they are developed
-# from translation.other_translator import OtherTranslator
+# from src.translation.other_translator import OtherTranslator
 
 
 class TranslatorFactory:
@@ -58,6 +58,8 @@ class TranslatorFactory:
             
             # Get cache manager if provided
             cache_manager = kwargs.get("cache_manager")
+
+            enable_emotion_enrichment = kwargs.get("enable_emotion_enrichment", False)
             
             translator = LLMTranslator(
                 llm_provider=llm_provider,
@@ -72,7 +74,8 @@ class TranslatorFactory:
                 refinement_persona=refinement_persona,
                 prompt_prefix=translation_prompt_prefix,
                 cache_manager=cache_manager,
-                cost_tracker=cost_tracker
+                cost_tracker=cost_tracker,
+                enable_emotion_enrichment=enable_emotion_enrichment,
             )
                 
             # Initialize the translator

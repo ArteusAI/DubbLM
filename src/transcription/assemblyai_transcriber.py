@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, TYPE_CHECKING
 
-from transcription.transcription_interface import BaseTranscriber
+from src.transcription.transcription_interface import BaseTranscriber
 from src.dubbing.core.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -26,7 +26,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         speech_model: str = "best",
         cache_manager: Optional['CacheManager'] = None,
         convert_to_mp3: bool = True,
-        mp3_bitrate: str = "128k",
+        mp3_bitrate: str = "256k",
         mp3_size_threshold_mb: int = 20,
         cost_tracker: Optional[Any] = None,
         speakers_expected: Optional[int] = None,
@@ -130,6 +130,7 @@ class AssemblyAITranscriber(BaseTranscriber):
                 '-i', str(input_path),
                 '-codec:a', 'libmp3lame',
                 '-b:a', self.mp3_bitrate,
+                '-ac', '1',  # Convert to mono
                 '-y',  # Overwrite output file
                 temp_mp3_path
             ]
@@ -234,10 +235,13 @@ class AssemblyAITranscriber(BaseTranscriber):
         
         try:
             # Configure transcription settings
+            # Use None for language_code when auto-detect is enabled
+            language_code = None if self.source_language == 'auto' else self.source_language
+            
             config_params = {
                 'speech_model': getattr(self.aai.SpeechModel, self.speech_model),
                 'speaker_labels': True,  # Enable speaker diarization
-                'language_code': self.source_language,
+                'language_code': language_code,
                 'word_boost': None,  # Can be configured if needed
                 'boost_param': "default"  # Can be configured if needed
             }

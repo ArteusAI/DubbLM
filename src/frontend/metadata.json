@@ -1,0 +1,5 @@
+{
+  "name": "DubbLM UI",
+  "description": "A modern web interface for the DubbLM video dubbing pipeline, featuring advanced translation refinement, voice assignment, and precise timeline editing.",
+  "requestFramePermissions": []
+}

@@ -125,7 +125,16 @@ class SegmentOptimizer:
                 
                 # Check if merging would exceed token limits for any translation field
                 token_limit_exceeded = False
-                translation_fields = ['translation', 'very_short_translation', 'short_translation', 'long_translation']
+                translation_fields = [
+                    'translation',
+                    'very_short_translation',
+                    'short_translation',
+                    'long_translation',
+                    'emotion_enriched_translation',
+                    'emotion_enriched_very_short_translation',
+                    'emotion_enriched_short_translation',
+                    'emotion_enriched_long_translation'
+                ]
                 
                 for field in translation_fields:
                     if field in segment and field in current_segment:
@@ -167,8 +176,21 @@ class SegmentOptimizer:
                         logger.debug(f"Added {pause_type} (gap={gap:.2f}s) merging segments at "
                                     f"{old_end:.2f}s-{segment['start']:.2f}s, speaker={segment.get('speaker', 'unknown')}")
 
+                # Merge enriched translations (kept separate from originals)
+                if 'emotion_enriched_translation' in segment and 'emotion_enriched_translation' in current_segment:
+                    current_enriched = current_segment.get('emotion_enriched_translation', '').strip()
+                    new_enriched = segment.get('emotion_enriched_translation', '').strip()
+                    current_segment['emotion_enriched_translation'] = f"{current_enriched}{separator}{new_enriched}".strip()
+
                 # Merge alternative translation variants (very_short, short, long)
-                for variant_key in ['very_short_translation', 'short_translation', 'long_translation']:
+                for variant_key in [
+                    'very_short_translation',
+                    'short_translation',
+                    'long_translation',
+                    'emotion_enriched_very_short_translation',
+                    'emotion_enriched_short_translation',
+                    'emotion_enriched_long_translation'
+                ]:
                     if variant_key in segment and variant_key in current_segment:
                         current_variant = current_segment.get(variant_key, '').strip()
                         new_variant = segment.get(variant_key, '').strip()

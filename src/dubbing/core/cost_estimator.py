@@ -9,7 +9,7 @@ import tiktoken
 
 from ..debug.cost_tracker import CostTracker
 from .log_config import get_logger
-from translation.prompts import (
+from src.translation.prompts import (
     REFINEMENT_PROMPTS,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
     TRANSLATION_PROMPT_TEMPLATE,
@@ -394,7 +394,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
     @staticmethod
     def _default_model_for_provider(provider: str) -> Optional[str]:
         if provider == "gemini":
-            return "models/gemini-2.5-flash-preview-04-17"
+            return "gemini-2.5-pro"
         if provider == "openrouter":
             return "anthropic/claude-sonnet-4.5"
         return None

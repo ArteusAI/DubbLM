@@ -34,7 +34,6 @@ from .segment_optimizer import SegmentOptimizer
 from ..audio.audio_processor import AudioProcessor
 from ..audio.speaker_processor import SpeakerProcessor
 from ..audio.time_stretcher import TimeStretcher
-from ..audio.emotion_detector import EmotionDetector, EmotionType
 from ..video.video_processor import VideoProcessor
 from ..debug.performance_tracker import PerformanceTracker
 from ..debug.debug_generator import DebugGenerator
@@ -45,9 +44,9 @@ from .log_config import get_logger
 from .cost_estimator import CostEstimator
 
 # Import existing factories and interfaces
-from tts.tts_factory import TTSFactory
-from translation.translator_factory import TranslatorFactory
-from transcription.transcription_factory import TranscriptionFactory
+from src.tts.tts_factory import TTSFactory
+from src.translation.translator_factory import TranslatorFactory
+from src.transcription.transcription_factory import TranscriptionFactory
 
 # Disable warnings
 warnings.filterwarnings("ignore")
@@ -107,9 +106,6 @@ class SmartDubbing:
         # Initialize time stretcher with preferred method
         time_stretch_method = config.get('time_stretch_method', 'auto')
         self.time_stretcher = TimeStretcher(preferred_method=time_stretch_method)
-        
-        # Initialize emotion detector
-        self.emotion_detector = EmotionDetector(device=self.device)
         
         # Initialize utilities
         self.subtitle_manager = SubtitleManager()
@@ -193,7 +189,8 @@ class SmartDubbing:
                 translation_prompt_prefix=self.config.get('translation_prompt_prefix'),
                 glossary=self.config.get('glossary'),
                 cache_manager=self.cache_manager,
-                cost_tracker=self.cost_tracker
+                cost_tracker=self.cost_tracker,
+                enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
             )
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
@@ -312,20 +309,14 @@ class SmartDubbing:
             # Save debug TSV
             self.subtitle_manager.save_debug_tsv(segments_for_output)
             
-            # Save subtitles if requested (only if pause removal is disabled)
-            remove_pauses_enabled = self.config.get('remove_pauses', True)
-            if not remove_pauses_enabled:
+            # Save subtitles if requested (only if pause processing is disabled)
+            pause_removal_mode = self.config.get('pause_removal', 'disabled')
+            if pause_removal_mode == 'disabled':
                 if save_original_subtitles:
                     self.subtitle_manager.save_subtitles(segments_for_output, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                 
                 if save_translated_subtitles:
                     self.subtitle_manager.save_subtitles(segments_for_output, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
-            
-            # Analyze emotions (if enabled)
-            if self.config.get('enable_emotion_analysis', True):
-                segments_for_output = self.analyze_emotions(segments_for_output, audio_file)
-            else:
-                logger.debug("Emotion analysis disabled")
             
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
@@ -381,7 +372,8 @@ class SmartDubbing:
                     # Fallback silently if structure is unexpected
                     keep_original_audio_ranges = self.config.get('keep_original_audio_ranges')
 
-            # Combine with video (includes pause removal if enabled)
+            # Combine with video (includes pause processing if enabled)
+            segments_opt = self.config.get('segments_optimization', {})
             output_video_path, pause_adjustments = self.video_processor.combine_audio_with_video(
                 video_path=self.config.get('input'),
                 translated_audio_path=translated_audio_path,
@@ -397,9 +389,13 @@ class SmartDubbing:
                 target_language=self.config.get('target_language'),
                 normalize_audio=self.config.get('normalize_audio', True),
                 use_two_pass_encoding=self.config.get('use_two_pass_encoding', True),
-                remove_pauses=self.config.get('remove_pauses', True),
-                min_pause_duration=self.config.get('segments_optimization', {}).get('min_pause_duration', 3),
-                preserve_pause_duration=self.config.get('segments_optimization', {}).get('preserve_pause_duration', 1.5),
+                pause_removal=self.config.get('pause_removal', 'disabled'),
+                min_pause_duration=segments_opt.get('min_pause_duration', 3),
+                preserve_pause_duration=segments_opt.get('preserve_pause_duration', 1.5),
+                video_speed_min=segments_opt.get('video_speed_min', 0.75),
+                video_speed_comfortable=segments_opt.get('video_speed_comfortable', 1.25),
+                video_speed_max=segments_opt.get('video_speed_max', 1.5),
+                segment_positions=self.real_segment_positions,
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
                 ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
                 dubbed_volume=self.config.get('dubbed_volume', 1.0),
@@ -411,8 +407,8 @@ class SmartDubbing:
             # Store pause adjustments for potential future use
             self.pause_adjustments = pause_adjustments
             
-            # Save subtitles after pause processing if pause removal is enabled
-            if remove_pauses_enabled and (save_original_subtitles or save_translated_subtitles):
+            # Save subtitles after pause processing if pause removal/speedup is enabled
+            if pause_removal_mode != 'disabled' and (save_original_subtitles or save_translated_subtitles):
                 if pause_adjustments:
                     logger.info("Adjusting subtitle timestamps based on pause modifications...")
                     
@@ -675,7 +671,7 @@ class SmartDubbing:
                 test_output_path = output_dir / f"{speaker}_test_sample.mp3"
                 
                 try:
-                    from tts.models import TTSSegmentData
+                    from src.tts.models import TTSSegmentData
                     
                     test_segment = TTSSegmentData(
                         speaker=speaker,
@@ -738,7 +734,12 @@ class SmartDubbing:
         
         return test_phrases.get(target_lang, test_phrases['en'])
     
-    def translate_segments(self, transcription: List[Dict], audio_file: str) -> List[Dict]:
+    def translate_segments(
+        self, 
+        transcription: List[Dict], 
+        audio_file: str,
+        progress_callback: callable = None
+    ) -> List[Dict]:
         """Translate segments using the translator."""
         cache_key = f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}_{self.config.get('target_language')}"
         step_name = "translation"
@@ -763,7 +764,9 @@ class SmartDubbing:
                     source_language=self.config.get('source_language'),
                     target_language=self.config.get('target_language'),
                     refinement_persona=self.config.get('refinement_persona', 'normal'),
-                    debug=self.debug_data
+                    debug=self.debug_data,
+                    enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                    progress_callback=progress_callback
                 )
             else:
                 raise ValueError("No translator available")
@@ -791,42 +794,14 @@ class SmartDubbing:
 
         return translated_segments
     
-    def analyze_emotions(self, segments: List[Dict], audio_file: str) -> List[Dict]:
-        """
-        Analyze emotions in the audio using YAMNet audio event detection.
-        Detects emotions at both segment and word level, including gaps between segments.
-        """
-        if not segments:
-            return []
-
-        cache_key = self.cache_manager.generate_cache_key(
-            audio_file, "", "", ""  # Simple cache key for emotions
-        )
-        step_name = "emotions"
-        
-        # Check if results are cached
-        if self.cache_manager.cache_exists(step_name, cache_key):
-            logger.debug("Loading emotion analysis from cache...")
-            cached_segments = self.cache_manager.load_from_cache(step_name, cache_key)
-            if cached_segments is not None:
-                return cached_segments
-            logger.warning("Found corrupted emotion cache, re-analyzing.")
-        
-        logger.info("Analyzing emotions with YAMNet...")
-        self.performance_tracker.start_timing("emotion_analysis")
-        
-        # Use EmotionDetector to analyze segments
-        enriched_segments = self.emotion_detector.analyze_segments(segments, audio_file)
-        
-        # Save results to cache
-        self.cache_manager.save_to_cache(step_name, cache_key, enriched_segments)
-        
-        # End timing
-        self.performance_tracker.end_timing("emotion_analysis")
-        
-        return enriched_segments
-    
-    def synthesize_speech(self, segments: List[Dict], speakers_rolls: Dict, audio_file: str) -> str:
+    def synthesize_speech(
+        self, 
+        segments: List[Dict], 
+        speakers_rolls: Dict, 
+        audio_file: str,
+        progress_callback: callable = None,
+        grouping_progress_callback: callable = None
+    ) -> str:
         """
         Synthesize speech for translated segments with optimized batching and estimation.
         
@@ -834,6 +809,8 @@ class SmartDubbing:
             segments: List of transcript segments with translations
             speakers_rolls: Dictionary mapping time ranges to speaker IDs
             audio_file: Path to the audio file for cache key
+            progress_callback: Optional callback for TTS progress updates (current, total, text)
+            grouping_progress_callback: Optional callback for grouping/overlay progress (current, total, message)
             
         Returns:
             Path to the output audio file
@@ -935,12 +912,13 @@ class SmartDubbing:
             raise ValueError("No TTS systems are initialized properly")
         
         # Import TTSSegmentData for synthesis
-        from tts.models import TTSSegmentData
+        from src.tts.models import TTSSegmentData
         
         # Define comfort ratio constants
         # Allow comfort zone override from config (optionally language-specific)
         COMFORT_MIN_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_min_adjustment_ratio', 0.85)
         COMFORT_MAX_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_max_adjustment_ratio', 1.15)
+        use_enriched_for_tts = self.config.get('enable_emotion_enrichment', False)
         
         # Iteratively estimate and synthesize segments to leverage dynamic duration stats
         segments_metadata: List[Dict[str, Any]] = []
@@ -984,7 +962,7 @@ class SmartDubbing:
                 setattr(tts_instance, "_synthesis_lock", lock)
             tts_locks[system_name] = lock
 
-        def increment_progress(segment_index: int, speaker_id: str, note: str) -> None:
+        def increment_progress(segment_index: int, speaker_id: str, note: str, text: str = "") -> None:
             with progress_lock:
                 progress_state["completed"] += 1
                 completed = progress_state["completed"]
@@ -992,6 +970,8 @@ class SmartDubbing:
                 f"Completed segment {segment_index+1}/{total_segments} for speaker '{speaker_id}' "
                 f"- {note}"
             )
+            if progress_callback:
+                progress_callback(completed, total_segments, text)
 
         def select_best_text_variant(
             segment_index: int,
@@ -1129,9 +1109,22 @@ class SmartDubbing:
                         "tts_system": tts_system
                     }
 
+            active_segment = segment_dict.copy()
             # Prefer previously chosen text for cache key to maximize cache hits across edits
-            preferred_text = (segment_dict.get("chosen_text") or segment_dict.get("translation", ""))
+            preferred_text = (segment_dict.get("chosen_text") or active_segment.get("translation", ""))
             voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
+
+            if use_enriched_for_tts:
+                enrichment_overrides = {
+                    "translation": "emotion_enriched_translation",
+                    "very_short_translation": "emotion_enriched_very_short_translation",
+                    "short_translation": "emotion_enriched_short_translation",
+                    "long_translation": "emotion_enriched_long_translation",
+                }
+                for base_key, enriched_key in enrichment_overrides.items():
+                    enriched_val = segment_dict.get(enriched_key)
+                    if enriched_val:
+                        active_segment[base_key] = enriched_val
 
             def make_cache_key(text_value: str) -> str:
                 text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
@@ -1149,12 +1142,12 @@ class SmartDubbing:
                 candidate_texts.append(segment_dict.get("chosen_text", ""))
             # If a specific track type was selected earlier, include its text
             selected_track_type = segment_dict.get("selected_track_type")
-            if selected_track_type and isinstance(selected_track_type, str) and segment_dict.get(selected_track_type):
-                candidate_texts.append(segment_dict.get(selected_track_type, ""))
+            if selected_track_type and isinstance(selected_track_type, str) and active_segment.get(selected_track_type):
+                candidate_texts.append(active_segment.get(selected_track_type, ""))
             # Fallbacks
             for key in ("translation", "short_translation", "long_translation", "very_short_translation"):
-                if segment_dict.get(key):
-                    candidate_texts.append(segment_dict.get(key, ""))
+                if active_segment.get(key):
+                    candidate_texts.append(active_segment.get(key, ""))
             # De-duplicate while preserving order
             seen_texts = set()
             candidate_texts = [t for t in candidate_texts if not (t in seen_texts or seen_texts.add(t))]
@@ -1190,12 +1183,12 @@ class SmartDubbing:
                         segment_dict['chosen_text'] = preferred_text
                     if not segment_dict.get('selected_track_type'):
                         segment_dict['selected_track_type'] = 'translation'
-                    increment_progress(segment_index, speaker, "cache hit")
+                    increment_progress(segment_index, speaker, "cache hit", preferred_text)
                     return None
 
             tts_segment_data_args = {
                 "speaker": speaker,
-                "text": segment_dict["translation"],
+                "text": active_segment["translation"],
                 "emotion": segment_dict.get("emotion", "Neutral"),
                 "style_prompt": segment_style_prompt,
                 "reference_audio_path": None,
@@ -1212,7 +1205,7 @@ class SmartDubbing:
 
             best_text, best_ratio, best_deviation, best_track_type = select_best_text_variant(
                 segment_index,
-                segment_dict,
+                active_segment,
                 tts_segment_data_args,
                 tts_instance,
                 tts_system,
@@ -1227,7 +1220,7 @@ class SmartDubbing:
             if self.config.get('enable_emotion_enrichment', False):
                 for j in range(max(0, segment_index - 5), segment_index):
                     prev_segment = segments[j]
-                    prev_text = prev_segment.get('translation', '')
+                    prev_text = prev_segment.get('emotion_enriched_translation') or prev_segment.get('translation', '')
                     if prev_text:
                         previous_texts.append(prev_text)
 
@@ -1247,7 +1240,7 @@ class SmartDubbing:
             with metadata_lock:
                 segments_metadata.append(metadata)
 
-            text = segment_dict["translation"]
+            text = active_segment["translation"]
             text_snippet = f"{text[:20]}...{text[-20:]}" if len(text) > 80 else text
             seg_info = "segment" if total_segments == 1 else f"segment {segment_index+1}/{total_segments}"
             logger.info(f"Processing {seg_info} (Speaker: {speaker}, TTS: {tts_system}): \"{text_snippet}\"")
@@ -1270,7 +1263,7 @@ class SmartDubbing:
                 segment_dict['synthesized_speech_len'] = 0
                 segment_dict['synthesized_speech_file'] = None
                 AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "synthesis failed")
+                increment_progress(segment_index, speaker, "synthesis failed", best_text)
                 return metadata
 
             if not os.path.exists(current_segment_output_path):
@@ -1278,7 +1271,7 @@ class SmartDubbing:
                 segment_dict['synthesized_speech_len'] = 0
                 segment_dict['synthesized_speech_file'] = None
                 AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "missing output")
+                increment_progress(segment_index, speaker, "missing output", best_text)
                 return metadata
 
             try:
@@ -1288,7 +1281,7 @@ class SmartDubbing:
                 segment_dict['synthesized_speech_len'] = 0
                 segment_dict['synthesized_speech_file'] = None
                 AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "audio load failed")
+                increment_progress(segment_index, speaker, "audio load failed", best_text)
                 return metadata
 
             segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
@@ -1341,7 +1334,7 @@ class SmartDubbing:
                     f"Ratio={ratio:.2f}, Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s"
                 )
 
-            increment_progress(segment_index, speaker, "synthesized")
+            increment_progress(segment_index, speaker, "synthesized", best_text)
             return metadata
 
         def process_speaker_segments(speaker_id: str) -> None:
@@ -1383,7 +1376,10 @@ class SmartDubbing:
             logger.warning("No valid segment files found for normalization")
         
         # Adjust timing and combine audio segments
-        combined_audio, real_segment_positions = self._adjust_and_combine_audio_grouped(segments)
+        combined_audio, real_segment_positions = self._adjust_and_combine_audio_grouped(
+            segments, 
+            progress_callback=grouping_progress_callback
+        )
         output_path = "artifacts/audio/output.wav"
         combined_audio.export(output_path, format="wav")
         
@@ -1588,12 +1584,16 @@ class SmartDubbing:
             segments: Optional list of all segments for context extraction.
         """
 
-        from tts.models import TTSSegmentData
+        from src.tts.models import TTSSegmentData
 
         segment_dict = metadata["segment_dict"]
         original_duration = segment_dict["end"] - segment_dict["start"]
         output_path = metadata["output_path"]
         base_args = metadata["segment_data_args"]
+
+        def get_variant_text(key: str) -> str:
+            enriched_key = f"emotion_enriched_{key}"
+            return segment_dict.get(enriched_key) or segment_dict.get(key) or ""
         
         # Log resynthesis attempt
         logger.info(f"Resynthesizing segment {metadata['index']+1} (Speaker: {segment_dict['speaker']}) for better duration matching...")
@@ -1625,8 +1625,8 @@ class SmartDubbing:
         best_ratio = None
         best_key = None
 
-        # Preference for shorter audio when pause removal is enabled
-        prefer_shorter = self.config.get('remove_pauses', True)
+        # Preference for shorter audio when pause removal/speedup is enabled
+        prefer_shorter = self.config.get('pause_removal', 'disabled') != 'disabled'
         def deviation_key(dev: float) -> tuple:
             # Primary: minimal absolute deviation; Secondary: prefer negative when enabled
             return (abs(dev), 0 if (prefer_shorter and dev < 0) else 1)
@@ -1636,12 +1636,9 @@ class SmartDubbing:
 
         # Try all alternatives and find the one with minimum deviation from target range
         for key in candidate_keys:
-            if key not in segment_dict:
-                continue
-
-            alt_text = segment_dict[key]
-            # Skip already used text or duplicate text
-            if alt_text in tried_texts:
+            alt_text = get_variant_text(key)
+            # Skip empty text or already used text
+            if not alt_text or not alt_text.strip() or alt_text in tried_texts:
                 continue
             
             # Add this text to tried set
@@ -1733,12 +1730,11 @@ class SmartDubbing:
                     if adjusted_text and adjusted_text.strip() and adjusted_text.strip() != baseline_text.strip():
                         logger.debug(f"LLM adjustment successful: '{adjusted_text[:80]}{'...' if len(adjusted_text) > 80 else ''}' "
                                    f"(length: {len(baseline_text)} → {len(adjusted_text)} chars)")
-                    else:
-                        logger.debug(f"LLM adjustment produced no change or empty result")
-                        # Estimate duration and synthesize to temp file with unique identifier
+                        
+                        # Synthesize the adjusted text to evaluate its duration
                         unique_id = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
                         temp_output_path = f"{output_path}.temp_llm_adjusted_{unique_id}"
-                        from tts.models import TTSSegmentData
+                        from src.tts.models import TTSSegmentData
                         new_segment_data = TTSSegmentData(**{**base_args, "text": adjusted_text, "output_path": temp_output_path})
 
                         try:
@@ -1777,6 +1773,8 @@ class SmartDubbing:
                                     os.remove(temp_output_path)
                                 except Exception:
                                     pass
+                    else:
+                        logger.debug(f"LLM adjustment produced no change or empty result, skipping synthesis")
         except Exception as e:
             logger.warning(f"LLM adjustment step encountered an error: {e}")
 
@@ -1797,8 +1795,9 @@ class SmartDubbing:
                 metadata["chosen_text"] = segment_dict["translation"]
                 segment_dict["chosen_text"] = segment_dict["translation"]
             else:
-                metadata["chosen_text"] = segment_dict[best_key]
-                segment_dict["chosen_text"] = segment_dict[best_key]
+                chosen_val = get_variant_text(best_key)
+                metadata["chosen_text"] = chosen_val
+                segment_dict["chosen_text"] = chosen_val
             metadata["selected_track_type"] = best_key  # Update the selected track type
             segment_dict["selected_track_type"] = best_key
 
@@ -1824,7 +1823,11 @@ class SmartDubbing:
 
 
     
-    def _adjust_and_combine_audio_grouped(self, segments: List[Dict]) -> Tuple[AudioSegment, List[Dict]]:
+    def _adjust_and_combine_audio_grouped(
+        self, 
+        segments: List[Dict],
+        progress_callback: callable = None
+    ) -> Tuple[AudioSegment, List[Dict]]:
         """
         Adjusts timing and combines audio segments with optimizations for speaker continuity.
         
@@ -1836,6 +1839,7 @@ class SmartDubbing:
         
         Args:
             segments: List of transcript segments with translations and speaker info
+            progress_callback: Optional callback for progress updates (current, total, message)
             
         Returns:
             Tuple of (Combined AudioSegment with proper timing, List of real segment positions)
@@ -1865,6 +1869,34 @@ class SmartDubbing:
         
         # For debug: store all speaker groups for later use in debug video
         speaker_groups_info = {}
+        
+        # First pass: count total groups for progress tracking
+        total_groups = 0
+        for speaker in sorted(all_speakers):
+            speaker_segments = [(idx, segment) for idx, segment in enumerate(segments) if segment["speaker"] == speaker]
+            current_group = []
+            for i, (orig_idx, segment) in enumerate(speaker_segments):
+                start_new_group = False
+                if not current_group:
+                    start_new_group = True
+                elif i > 0:
+                    prev_orig_idx, prev_segment = speaker_segments[i-1]
+                    pause_duration = segment["start"] - prev_segment["end"]
+                    if pause_duration > SPLITTING_PAUSE_THRESHOLD_SECONDS:
+                        start_new_group = True
+                if current_group and segment["end"] - current_group[0][1]["start"] > MAX_GROUP_DURATION_SECONDS:
+                    start_new_group = True
+                if start_new_group and current_group:
+                    total_groups += 1
+                    current_group = []
+                current_group.append((orig_idx, segment))
+            if current_group:
+                total_groups += 1
+        
+        logger.info(f"Adjusting timing for {total_groups} segment groups...")
+        
+        # Track progress through groups
+        processed_groups = 0
         
         # Process each speaker's segments separately
         for speaker in sorted(all_speakers):
@@ -1932,7 +1964,7 @@ class SmartDubbing:
                             segment_start_in_group_ms = len(combined_group_audio)
                     
                     # Load segment audio
-                    segment_file = segment.get('synthesized_speech_file', f"artifacts/audio_chunks/{orig_idx}.wav")
+                    segment_file = segment.get('synthesized_speech_file') or f"artifacts/audio_chunks/{orig_idx}.wav"
                     if os.path.exists(segment_file):
                         segment_audio = AudioSegment.from_file(segment_file)
                     else:
@@ -2045,6 +2077,14 @@ class SmartDubbing:
                       f"{len(group)} segments, Speed ratio: {ratio_clamped:.2f}, "
                       f"Time: {format_seconds_to_srt(group_start_time_ms / 1000)}-{format_seconds_to_srt((group_start_time_ms + duration_ms) / 1000)}, "
                       f"Duration: {duration_minutes:.2f} minutes")
+                
+                # Update progress (report only at 25%, 50%, 75% milestones)
+                processed_groups += 1
+                if progress_callback and total_groups > 0:
+                    progress_pct = (processed_groups * 100) // total_groups
+                    prev_pct = ((processed_groups - 1) * 100) // total_groups
+                    if progress_pct // 25 > prev_pct // 25 or processed_groups == total_groups:
+                        progress_callback(processed_groups, total_groups, "Adjusting segment timing...")
         
         # Mix all speaker tracks together
         logger.info("Mixing all speaker tracks together...")
