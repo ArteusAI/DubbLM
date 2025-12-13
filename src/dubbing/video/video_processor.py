@@ -611,7 +611,10 @@ class VideoProcessor:
                                 background_volume: float = 0.562341,
                                 upscale_factor: float = 1.0,
                                 upscale_sharpen: bool = True,
-                                progress_callback: Optional[callable] = None) -> Tuple[str, List[Dict[str, float]]]:
+                                progress_callback: Optional[callable] = None,
+                                log_callback: Optional[callable] = None,
+                                segments_with_video_speed: Optional[List[Dict]] = None,
+                                video_segment_speed_min: float = 0.75) -> Tuple[str, List[Dict[str, float]]]:
         """Combine the translated audio with the original video, optionally adding a watermark and processing pauses.
 
         Args:
@@ -642,18 +645,26 @@ class VideoProcessor:
             upscale_factor: Video scale factor (>1.0 to upscale; default 1.0 disables)
             upscale_sharpen: Apply mild sharpening after scaling
             progress_callback: Optional callback(current, total, message) for progress updates
+            log_callback: Optional callback(message) for logging to external systems
+            segments_with_video_speed: List of segments with 'video_speed_required' for per-segment speed adjustment
+            video_segment_speed_min: Minimum video speed for per-segment adjustment (triggers minterpolate)
 
         Returns:
             Tuple of (Path to the output video file, List of pause adjustments for subtitle timing)
         """
+        def log(message: str):
+            logger.info(message)
+            if log_callback:
+                log_callback(message)
+        
         # Start timing
         self.performance_tracker.start_timing("video_creation")
 
-        logger.info("Combining audio with video with smart quality preservation...")
-        logger.info("Video processing strategy:")
-        logger.info("• Stream copy (lossless) when no video filters needed")
-        logger.info("• Conservative re-encoding only when necessary")
-        logger.info("• Original bitrate preservation when possible")
+        log("Combining audio with video with smart quality preservation...")
+        log("Video processing strategy:")
+        log("• Stream copy (lossless) when no video filters needed")
+        log("• Conservative re-encoding only when necessary")
+        log("• Original bitrate preservation when possible")
         
         output_video_path = output_file if output_file else "artifacts/output_video.mp4"
         # Ensure output directory exists
@@ -875,11 +886,11 @@ class VideoProcessor:
         # Video encoding strategy
         if not need_video_reencode:
             # No video filters applied – use stream copy (LOSSLESS)
-            logger.info("No video processing needed - using lossless stream copy")
+            log("No video processing needed - using lossless stream copy")
             command.extend(["-c:v", "copy"])
         else:
             # Video filters applied – need to re-encode with high quality
-            logger.info("Video filters detected - using high-quality re-encoding")
+            log("Video filters detected - using high-quality re-encoding")
             
             # Check if we should use two-pass encoding
             # Disable two-pass encoding for complex filter operations that can cause frame count mismatches
@@ -976,6 +987,49 @@ class VideoProcessor:
         # Handle pause processing based on mode
         pause_adjustments = []
         temp_files_to_cleanup = []
+        
+        # Apply per-segment video speed adjustments if segments have video_speed_required
+        video_speed_segments = [
+            seg for seg in (segments_with_video_speed or []) 
+            if seg.get('video_speed_required') is not None
+        ]
+        
+        if video_speed_segments:
+            log(f"Applying per-segment video speed adjustments ({len(video_speed_segments)} segments)...")
+            
+            # Create temporary video with per-segment speed adjustments
+            temp_speed_video = "artifacts/temp_per_segment_speed_video.mp4"
+            temp_files_to_cleanup.append(temp_speed_video)
+            
+            try:
+                _, speed_adjustments = self._apply_per_segment_video_speed(
+                    video_path,
+                    video_speed_segments,
+                    temp_speed_video,
+                    video_min_speed=video_segment_speed_min,
+                    use_minterpolate_for_slowdown=True,
+                    progress_callback=progress_callback,
+                    log_callback=log_callback
+                )
+                
+                if os.path.exists(temp_speed_video):
+                    # Replace video_path in the command with the speed-adjusted video
+                    for i, arg in enumerate(command):
+                        if arg == video_path:
+                            command[i] = temp_speed_video
+                    
+                    # Also update the video_path variable for any downstream processing
+                    video_path = temp_speed_video
+                    
+                    # Merge speed adjustments into pause_adjustments if any
+                    if speed_adjustments:
+                        pause_adjustments.extend(speed_adjustments)
+                        logger.info(f"Per-segment video speed adjustments applied: {len(speed_adjustments)} timing changes")
+                else:
+                    logger.warning("Per-segment speed video was not created, continuing without speed adjustments")
+            except Exception as e:
+                logger.error(f"Failed to apply per-segment video speed: {e}")
+                logger.warning("Continuing without per-segment speed adjustments")
         
         logger.info(f"Pause removal mode: {pause_removal}")
         
@@ -2254,3 +2308,225 @@ class VideoProcessor:
                 })
         
         return adjustments
+    
+    def _build_minterpolate_filter(self, speed_factor: float, target_fps: int = 30) -> str:
+        """Build minterpolate filter for smooth video slowdown.
+        
+        minterpolate creates interpolated frames for smoother slow motion effect.
+        This is used when slowing down video beyond the comfort zone.
+        
+        Args:
+            speed_factor: Speed factor (< 1.0 for slowdown)
+            target_fps: Target frame rate for output
+            
+        Returns:
+            FFmpeg filter string for minterpolate + setpts
+        """
+        # minterpolate interpolates frames for smoother slow motion
+        # mi_mode=mci: Motion Compensated Interpolation
+        # mc_mode=aobmc: Adaptive Overlapped Block Motion Compensation
+        # me_mode=bidir: Bidirectional motion estimation
+        pts_factor = 1.0 / speed_factor  # PTS multiplier for slowdown
+        
+        return (
+            f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir,"
+            f"setpts={pts_factor}*PTS"
+        )
+    
+    def _build_setpts_filter(self, speed_factor: float) -> str:
+        """Build setpts filter for video speed change.
+        
+        Args:
+            speed_factor: Speed factor (> 1.0 for speedup, < 1.0 for slowdown)
+            
+        Returns:
+            FFmpeg setpts filter string
+        """
+        pts_factor = 1.0 / speed_factor
+        return f"setpts={pts_factor}*PTS"
+    
+    def _apply_per_segment_video_speed(
+        self,
+        video_path: str,
+        segments_with_speed: List[Dict],
+        output_path: str,
+        video_min_speed: float = 0.75,
+        use_minterpolate_for_slowdown: bool = True,
+        progress_callback: Optional[callable] = None,
+        log_callback: Optional[callable] = None
+    ) -> Tuple[str, List[Dict[str, float]]]:
+        """Apply per-segment video speed adjustments based on dubbed audio timing.
+        
+        This method processes segments that have 'video_speed_required' attribute
+        and applies variable speed changes to sync video with dubbed audio.
+        
+        Args:
+            video_path: Path to the original video file
+            segments_with_speed: List of segment dicts with 'video_speed_required' field
+            output_path: Path for the output video
+            video_min_speed: Minimum video speed (slowdown threshold for minterpolate)
+            use_minterpolate_for_slowdown: Use minterpolate for smooth slowdown
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            Tuple of (output video path, timing adjustments for subtitles)
+        """
+        def log(message: str):
+            logger.info(message)
+            if log_callback:
+                log_callback(message)
+        
+        # Filter segments that have video speed requirements
+        speed_segments = [
+            seg for seg in segments_with_speed 
+            if seg.get('video_speed_required') is not None
+        ]
+        
+        if not speed_segments:
+            log("No segments require video speed adjustment")
+            return video_path, []
+        
+        log(f"Applying video speed adjustment to {len(speed_segments)} segments...")
+        
+        # Get video info
+        video_info = self._get_video_info(video_path)
+        video_duration = self._get_video_duration(video_path)
+        
+        # Get target FPS from video info
+        video_stream = video_info.get('video_stream', {})
+        fps_str = video_stream.get('r_frame_rate', '30/1')
+        try:
+            if '/' in fps_str:
+                num, den = fps_str.split('/')
+                target_fps = int(float(num) / float(den))
+            else:
+                target_fps = int(float(fps_str))
+        except (ValueError, ZeroDivisionError):
+            target_fps = 30
+        
+        # Sort segments by start time
+        sorted_segments = sorted(speed_segments, key=lambda x: x.get('video_sync_start', x.get('start', 0)))
+        
+        # Build speed segment list with gaps filled
+        full_speed_segments = []
+        prev_end = 0.0
+        
+        for seg in sorted_segments:
+            seg_start = seg.get('video_sync_start', seg.get('start', 0))
+            seg_end = seg.get('video_sync_end', seg.get('end', 0))
+            speed_factor = seg.get('video_speed_required', 1.0)
+            
+            # Add gap before this segment at normal speed
+            if seg_start > prev_end + 0.01:
+                full_speed_segments.append({
+                    "start": prev_end,
+                    "end": seg_start,
+                    "speed_factor": 1.0,
+                    "is_gap": True
+                })
+            
+            # Add the speed-adjusted segment
+            full_speed_segments.append({
+                "start": seg_start,
+                "end": seg_end,
+                "speed_factor": speed_factor,
+                "is_gap": False,
+                "use_minterpolate": use_minterpolate_for_slowdown and speed_factor < video_min_speed
+            })
+            
+            prev_end = seg_end
+        
+        # Add final gap if video continues after last segment
+        if prev_end < video_duration - 0.01:
+            full_speed_segments.append({
+                "start": prev_end,
+                "end": video_duration,
+                "speed_factor": 1.0,
+                "is_gap": True
+            })
+        
+        # Log the speed segments
+        speedup_count = sum(1 for s in full_speed_segments if s["speed_factor"] > 1.0)
+        slowdown_count = sum(1 for s in full_speed_segments if s["speed_factor"] < 1.0 and not s.get("is_gap"))
+        minterpolate_count = sum(1 for s in full_speed_segments if s.get("use_minterpolate", False))
+        
+        log(f"Video speed adjustments: {speedup_count} speedup, {slowdown_count} slowdown "
+            f"({minterpolate_count} using minterpolate for smooth slowdown)")
+        
+        # Build FFmpeg filter for variable speed
+        filter_parts = []
+        video_labels = []
+        audio_labels = []
+        
+        for i, seg in enumerate(full_speed_segments):
+            start = seg["start"]
+            end = seg["end"]
+            speed = seg["speed_factor"]
+            
+            # Video processing
+            if seg.get("use_minterpolate", False):
+                # Use minterpolate for smooth slowdown
+                video_filter = self._build_minterpolate_filter(speed, target_fps)
+                filter_parts.append(
+                    f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,{video_filter}[v{i}]"
+                )
+            else:
+                # Use simple setpts for speedup or regular slowdown
+                pts_factor = 1.0 / speed
+                filter_parts.append(
+                    f"[0:v]trim=start={start}:end={end},setpts=(PTS-STARTPTS)*{pts_factor}[v{i}]"
+                )
+            video_labels.append(f"[v{i}]")
+            
+            # Audio processing
+            atempo_filters = self._build_atempo_chain(speed)
+            filter_parts.append(
+                f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS,{atempo_filters}[a{i}]"
+            )
+            audio_labels.append(f"[a{i}]")
+        
+        # Concat all segments
+        n_segments = len(full_speed_segments)
+        concat_video = "".join(video_labels)
+        concat_audio = "".join(audio_labels)
+        filter_parts.append(
+            f"{concat_video}concat=n={n_segments}:v=1:a=0[outv]"
+        )
+        filter_parts.append(
+            f"{concat_audio}concat=n={n_segments}:v=0:a=1[outa]"
+        )
+        
+        filter_complex = ";".join(filter_parts)
+        
+        # Build FFmpeg command
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+            "-c:a", "aac", "-b:a", "192k",
+            output_path
+        ]
+        
+        logger.debug(f"Creating per-segment speed video: {' '.join(cmd)}")
+        
+        # Calculate expected output duration for progress tracking
+        total_output_duration = sum(
+            (seg["end"] - seg["start"]) / seg["speed_factor"]
+            for seg in full_speed_segments
+        )
+        
+        try:
+            self._run_ffmpeg_with_progress(
+                cmd, total_output_duration, progress_callback, "Per-segment video speed"
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to apply per-segment video speed: {e.stderr}")
+            raise
+        
+        # Calculate timing adjustments for subtitles
+        timing_adjustments = self._calculate_speedup_adjustments(full_speed_segments)
+        
+        logger.info(f"Per-segment video speed adjustment completed. Output: {output_path}")
+        
+        return output_path, timing_adjustments

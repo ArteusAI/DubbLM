@@ -19,6 +19,10 @@ from src.translation.prompts import (
     LENGTH_ADJUST_PROMPT,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
     TRANSLATION_PROMPT_TEMPLATE,
+    ALTERNATIVE_VERSIONS_FULL,
+    ALTERNATIVE_VERSIONS_LONG_ONLY,
+    JSON_OUTPUT_FORMAT_FULL,
+    JSON_OUTPUT_FORMAT_LONG_ONLY,
 )
 from src.dubbing.core.log_config import get_logger
 
@@ -82,6 +86,7 @@ class LLMTranslator(TranslationInterface):
         prompt_prefix: Optional[str] = None,
         cost_tracker: Optional[Any] = None,
         enable_emotion_enrichment: bool = False,
+        segment_stretch: str = "audio_and_video",
     ):
         """
         Initialize LLM translator.
@@ -143,6 +148,8 @@ class LLMTranslator(TranslationInterface):
         # Stores the most recent context information computed during translate()
         self.last_context_info = None
         self.enable_emotion_enrichment = enable_emotion_enrichment
+        # Segment stretch mode: determines which alternative versions to generate
+        self.segment_stretch = segment_stretch
 
     def _enrich_text_with_llm(
         self,
@@ -1717,6 +1724,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             # Build the refinement prompt
             base_prompt = REFINEMENT_PROMPTS[persona]
             
+            # Select alternative versions instructions based on segment_stretch mode
+            if self.segment_stretch in ("video", "audio_and_video"):
+                alternative_versions_section = ALTERNATIVE_VERSIONS_LONG_ONLY
+                json_output_format = JSON_OUTPUT_FORMAT_LONG_ONLY
+            else:
+                alternative_versions_section = ALTERNATIVE_VERSIONS_FULL
+                json_output_format = JSON_OUTPUT_FORMAT_FULL
+            
             refinement_prompt = base_prompt.format(
                 dialogue_summary=dialogue_summary or "No summary available.",
                 glossary_section=glossary_section,
@@ -1729,7 +1744,9 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 next_chunk_context=next_chunk_context,
                 translated_conversation_text=translated_conversation_text,
                 source_language=source_language,
-                target_language=target_language
+                target_language=target_language,
+                alternative_versions_section=alternative_versions_section,
+                json_output_format=json_output_format
             )
 
             # Start timer for batch refinement
@@ -1789,11 +1806,20 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                                 refined_pairs[i]["speaker"] = all_translated_pairs[i]["speaker"] # Enforce original speaker
                                 has_invalid_pairs = True # Consider it invalid for retry logic
                                 
-                            # Validate shorter versions exist, or create them
-                            if "short" not in pair or not pair["short"]:
-                                logger.debug(f"Missing 'short' version at index {i}. Using main text as fallback.")
-                                refined_pairs[i]["short"] = pair.get("text", "")
-                                has_invalid_pairs = True
+                            # Validate alternative versions exist, or create fallbacks
+                            # In video/audio_and_video modes, only "long" is required
+                            skip_short_variants = self.segment_stretch in ("video", "audio_and_video")
+                            
+                            if not skip_short_variants:
+                                if "short" not in pair or not pair["short"]:
+                                    logger.debug(f"Missing 'short' version at index {i}. Using main text as fallback.")
+                                    refined_pairs[i]["short"] = pair.get("text", "")
+                                    has_invalid_pairs = True
+                                    
+                                if "very_short" not in pair or not pair["very_short"]:
+                                    logger.debug(f"Missing 'very_short' version at index {i}. Using main text as fallback.")
+                                    refined_pairs[i]["very_short"] = pair.get("text", "")
+                                    has_invalid_pairs = True
 
                             if "long" not in pair or not pair["long"]:
                                 logger.debug(f"Missing 'long' version at index {i}. Using main text as fallback.")
@@ -1999,13 +2025,17 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 refined_chunk["translation"] = formatted_translation
                 
                 # Add alternative versions in separate format for easy access
-                formatted_very_short_translation = "\n".join([f"{pair['speaker']}: {pair.get('very_short', pair['text'])}" for pair in chunk_refined_pairs])
-                refined_chunk["very_short_translation"] = formatted_very_short_translation
+                # In video/audio_and_video modes, skip short variants as they are not generated
+                skip_short_variants = self.segment_stretch in ("video", "audio_and_video")
                 
-                formatted_short_translation = "\n".join([f"{pair['speaker']}: {pair.get('short', pair['text'])}" for pair in chunk_refined_pairs])
-                refined_chunk["short_translation"] = formatted_short_translation
+                if not skip_short_variants:
+                    formatted_very_short_translation = "\n".join([f"{pair['speaker']}: {pair.get('very_short', pair['text'])}" for pair in chunk_refined_pairs])
+                    refined_chunk["very_short_translation"] = formatted_very_short_translation
+                    
+                    formatted_short_translation = "\n".join([f"{pair['speaker']}: {pair.get('short', pair['text'])}" for pair in chunk_refined_pairs])
+                    refined_chunk["short_translation"] = formatted_short_translation
                 
-                # Add long version
+                # Add long version (always generated regardless of mode)
                 formatted_long_translation = "\n".join([f"{pair['speaker']}: {pair.get('long', pair['text'])}" for pair in chunk_refined_pairs])
                 refined_chunk["long_translation"] = formatted_long_translation
                                 

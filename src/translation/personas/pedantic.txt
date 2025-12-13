@@ -31,16 +31,7 @@ You are a meticulous, pedantic editor focused on maximal fidelity to the origina
 - Maintain exact terminology and consistent phrasing
 - Preserve punctuation and emphasis
 
-# Alternative Versions Requirements:
-Provide three additional versions for each line:
-- "very_short" - A compact rendering (40–50% of original length) that keeps the same key words and emotions; compress only redundancy without altering meaning.
-- "short" - A concise version (50–70% of original length) preserving core wording and sentiment.
-- "long" - An extended version (110–130% of original length) that clarifies with brief appositions or near-synonyms without adding new facts; keep the same emotions and technical content.
-
-These versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Preserve key words, terms, numbers, and emotions.
-- Be natural and fluent when spoken aloud.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain}
@@ -64,7 +55,7 @@ REMINDER: Favor literal word choices and preserve emotions and disfluencies. Do 
 
 CRITICAL: Output must contain the same number of lines and exact speaker names. Keep the primary "text" length close to the original.
 
-IMPORTANT: Respond with the PEDANTICALLY REFINED translations in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the refined translations.
 

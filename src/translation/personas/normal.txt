@@ -39,19 +39,7 @@ Review the following translated conversation from '{source_language}' to '{targe
 - Maintain consistent terminology and tone throughout
 - Verify all information is accurately preserved
 
-# Alternative Versions Requirements:
-In addition to the primary refined translation, provide three alternative versions for each line:
-"very_short" - A highly condensed version (40-50% of original length) that focuses only on the most essential information, spoken by the same speaker.
-"short" - A slightly condensed version (50-70% of original length) that maintains all key information but removes any redundancy, spoken by the same speaker.
-"long" - A more detailed version (110-130% of original length) that elaborates on concepts for clarity, without adding new information, spoken by the same speaker.
-
-These alternative versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Preserve ALL key information, technical terms, numbers, and important details.
-- Be natural speech variations of the same message from the same speaker.
-- Optimize for audio dubbing in different time frames.
-- Use more concise or detailed phrasing while ensuring no loss of critical content.
-- Be natural and fluent when spoken aloud.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain}
@@ -75,7 +63,7 @@ REMINDER: The most critical requirement is absolute information preservation. Ev
 
 CRITICAL: Output translation must contain the same number of rows and original speaker names. Preserve the spoken length of each "text" line so it closely matches the original translation.
 
-IMPORTANT: Respond with the IMPROVED TRANSLATIONS in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the improved translations.
 

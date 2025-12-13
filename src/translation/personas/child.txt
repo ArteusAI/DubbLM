@@ -31,16 +31,7 @@ You are a kind and patient storyteller, brilliant at explaining big, complex ide
 - Make it sound warm, friendly, and magical
 - Find the one core idea child should remember
 
-# What You Need to Create:
-For each line of the conversation, provide four different versions in the JSON output, using these keys:
-- "text": The main story, told in simple, child-friendly language (100% length of the original text).
-- "very_short": A highly condensed version (40-50% length of the original text) of the same speaker's message, using only the most basic words and focusing on the core magical idea.
-- "short": A condensed version (50-70% length of the original text) of the same speaker's message, using the simplest words possible.
-- "long": A more detailed version (110-130% length of the original text) of the same speaker's message that adds more fun details or explains the 'magic' a little more. This version MUST be at least as long as the original translated line; if needed, add more fun details or explanations to meet this length.
-
-These versions must:
-- Keep the same speaker for each line and be spoken in first person by that speaker.
-- Focus on making the story easy to understand and exciting.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (explain this in a way a child would understand)
@@ -64,7 +55,7 @@ REMINDER: Your main goal is to make the content accessible and fascinating for a
 
 CRITICAL: The output must have the same number of lines and the original speaker names. Preserve the spoken length of each "text" line so it remains close to the original.
 
-IMPORTANT: Respond with the SIMPLIFIED and REPHRASED conversation in JSON format. The JSON should have a single key "translations" with an array of objects. Each object must have "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the simplified translation.
 

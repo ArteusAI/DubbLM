@@ -448,6 +448,9 @@ export interface ProjectConfig {
   minSegmentDuration?: number;
   comfortMinAdjustmentRatio?: number;
   comfortMaxAdjustmentRatio?: number;
+  segmentStretch?: 'audio' | 'audio_and_video' | 'video';
+  videoSegmentSpeedMin?: number;
+  videoSegmentSpeedMax?: number;
   minPauseDuration?: number;
   preservePauseDuration?: number;
 }

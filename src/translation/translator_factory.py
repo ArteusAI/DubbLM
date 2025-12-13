@@ -61,6 +61,9 @@ class TranslatorFactory:
 
             enable_emotion_enrichment = kwargs.get("enable_emotion_enrichment", False)
             
+            # Segment stretch mode for alternative version generation
+            segment_stretch = kwargs.get("segment_stretch", "audio_and_video")
+            
             translator = LLMTranslator(
                 llm_provider=llm_provider,
                 model_name=model_name,
@@ -76,6 +79,7 @@ class TranslatorFactory:
                 cache_manager=cache_manager,
                 cost_tracker=cost_tracker,
                 enable_emotion_enrichment=enable_emotion_enrichment,
+                segment_stretch=segment_stretch,
             )
                 
             # Initialize the translator

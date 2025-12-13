@@ -1,9 +1,12 @@
 """Processing routes for transcription and dubbing."""
 
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from ..database.session import get_db
 from ..database.models import Project, Job, JobType, JobStatus, ProjectStatus, generate_job_id
@@ -18,6 +21,9 @@ router = APIRouter(prefix="/projects", tags=["process"])
 @router.post("/{project_id}/process/transcribe", response_model=JobResponse, status_code=202)
 async def start_transcription(project_id: str, db: Session = Depends(get_db)):
     """Start transcription pipeline."""
+    # Force session to expire cached data and re-read from DB
+    db.expire_all()
+    
     # Get project
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -31,6 +37,8 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
     
     # Check for required config
     config = project.config or {}
+    logger.debug(f"start_transcription config: sourceLang={config.get('sourceLang')}, speakerCount={config.get('speakerCount')}")
+    
     if not config.get("sourceLang") or not config.get("targetLang"):
         raise HTTPException(
             status_code=400,

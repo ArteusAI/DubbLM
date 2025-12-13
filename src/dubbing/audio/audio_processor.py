@@ -122,7 +122,8 @@ class AudioProcessor:
         self, 
         audio_file: str, 
         voice_denoising: bool = True,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None
     ) -> Optional[str]:
         """Process and extract background audio if needed.
         
@@ -130,10 +131,15 @@ class AudioProcessor:
             audio_file: Path to the audio file
             voice_denoising: Whether to perform voice denoising
             progress_callback: Optional callback(current, total, message) for progress updates
+            log_callback: Optional callback(message) for logging to external systems
             
         Returns:
             Path to the background audio file or None
         """
+        def log(message: str):
+            logger.info(message)
+            if log_callback:
+                log_callback(message)
         # Start timing
         self.performance_tracker.start_timing("background_audio")
         
@@ -158,7 +164,7 @@ class AudioProcessor:
             self.performance_tracker.end_timing("background_audio")
             return output_path
         
-        logger.info("Extracting background audio...")
+        log("Extracting background audio...")
         
         # Initialize audio separator
         separator = Separator()
@@ -167,6 +173,8 @@ class AudioProcessor:
         # Separate vocals and background with progress tracking
         with tqdm_progress_callback(progress_callback, "Separating audio"):
             output_file_paths = separator.separate(audio_file)[0]
+        
+        log("Audio separation complete")
         
         # Move the background audio to our audio directory
         background_audio_path = "artifacts/audio/background.wav"

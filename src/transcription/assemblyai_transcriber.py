@@ -196,14 +196,16 @@ class AssemblyAITranscriber(BaseTranscriber):
             - List of transcription segments with timing information
         """
         # If no cache_key is provided, generate one
+        # Include speakers_expected in cache key to differentiate results
         if cache_key is None:
-            cache_key = self._generate_cache_key(audio_file, f"_{self.speech_model}")
+            speakers_suffix = f"_spk{self.speakers_expected}" if self.speakers_expected else ""
+            cache_key = self._generate_cache_key(audio_file, f"_{self.speech_model}{speakers_suffix}")
             
         step_name = "assemblyai_diarization_transcription"
         
         # Check if results are cached
         if use_cache and self.cache_manager and self.cache_manager.cache_exists(step_name, cache_key):
-            logger.debug("Loading AssemblyAI diarization and transcription from cache...")
+            logger.info(f"Loading AssemblyAI diarization and transcription from cache (key includes lang={self.source_language}, speakers={self.speakers_expected})...")
             cached_results = self.cache_manager.load_from_cache(step_name, cache_key)
             
             # Store for debug
@@ -214,6 +216,7 @@ class AssemblyAITranscriber(BaseTranscriber):
         
         logger.info(f"Running AssemblyAI transcription and diarization on {audio_file}...")
         logger.debug(f"Using speech model: {self.speech_model}")
+        logger.debug(f"Source language configured: {self.source_language}")
         
         # Convert to MP3 if enabled to reduce upload size
         processed_audio_file = audio_file
@@ -237,6 +240,11 @@ class AssemblyAITranscriber(BaseTranscriber):
             # Configure transcription settings
             # Use None for language_code when auto-detect is enabled
             language_code = None if self.source_language == 'auto' else self.source_language
+            logger.info(f"AssemblyAI language_code: {language_code} (source_language={self.source_language})")
+            
+            # Warn if auto-detecting language (might fail for some languages)
+            if language_code is None:
+                logger.debug("Language auto-detection enabled. If transcription quality is poor, try specifying the source language explicitly.")
             
             config_params = {
                 'speech_model': getattr(self.aai.SpeechModel, self.speech_model),

@@ -82,6 +82,8 @@ class DubbingConfig:
             'exit_before_synthesis': False,
             'clone_voice': None,
             'voice_names': None,
+            # Segment stretch mode: audio | audio_and_video | video
+            'segment_stretch': 'audio_and_video',
             # Segment optimization settings (grouped)
             'segments_optimization': {
                 # Merging after diarization (tight gap for better transcription/translation)
@@ -100,6 +102,13 @@ class DubbingConfig:
                 'video_speed_min': 0.75,
                 'video_speed_comfortable': 1.25,  # First phase: comfortable speedup
                 'video_speed_max': 1.5,  # Second phase: extended speedup for remainder
+                # Per-segment video speed limits for segment_stretch modes
+                'video_segment_speed_min': 0.75,  # Min video speed (slowdown limit with minterpolate)
+                'video_segment_speed_comfortable': 1.25,  # Comfortable speedup limit
+                'video_segment_speed_max': 1.5,  # Max video speedup
+                # Audio comfort zone for segment_stretch
+                'comfort_min_adjustment_ratio': 0.85,  # Audio slowdown comfort limit
+                'comfort_max_adjustment_ratio': 1.15,  # Audio speedup comfort limit
                 # TTS grouping
                 'group_overflow_tolerance': 1.0,
             }
@@ -310,6 +319,8 @@ class DubbingConfig:
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
         parser.add_argument('--pause_removal', type=str, choices=['cut', 'speedup', 'disabled'], 
                             help='Pause removal mode: "cut" (remove pauses), "speedup" (speed up video segments), "disabled" (no processing)')
+        parser.add_argument('--segment_stretch', type=str, choices=['audio', 'audio_and_video', 'video'],
+                            help='Segment stretch mode: "audio" (audio speed only), "audio_and_video" (hybrid: audio within comfort + video), "video" (video speed only, no audio change)')
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')

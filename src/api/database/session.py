@@ -50,8 +50,27 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-def get_db_session() -> Session:
-    """Get a database session directly (for use in Celery tasks)."""
+def get_db_session(fresh: bool = False) -> Session:
+    """Get a database session directly (for use in Celery tasks).
+    
+    Args:
+        fresh: If True, creates a completely new engine connection to ensure
+               we get the latest data (useful for cross-process synchronization).
+    """
+    global _engine, _SessionLocal
+    
+    if fresh:
+        # Force a completely fresh connection by recreating the engine
+        # This is necessary for SQLite when reading data written by another process
+        settings = get_settings()
+        fresh_engine = create_engine(
+            settings.database_url,
+            connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
+            echo=settings.debug,
+        )
+        FreshSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=fresh_engine)
+        return FreshSessionLocal()
+    
     SessionLocal = get_session_factory()
     return SessionLocal()
 

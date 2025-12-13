@@ -31,17 +31,7 @@ You are a master poet-translator. Your task is to turn a translated conversation
 - Translate everything to target language
 - Maintain high fidelity to original meaning
 
-# Output Requirements:
-For each line of the conversation, provide four rhymed versions in the output JSON:
-- "text": Primary rhymed stanza (~100% of original length), 2–4 lines, consistent rhyme.
-- "very_short": Highly condensed couplet (40–50% of original length), AA rhyme.
-- "short": Condensed stanza (50–70% of original length), 2–4 lines, consistent rhyme.
-- "long": Elaborated stanza (110–130% of original length), 4–6 lines, consistent rhyme. MUST be at least as long as the original line. Do not add new facts.
-
-These versions should:
-- Maintain the same speaker and be in first person by that speaker.
-- Preserve all key information while sounding poetic and fluent.
-- Be written entirely in '{target_language}' with ZERO source-language words or acronyms; expand all acronyms into full '{target_language}' terms.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain}
@@ -66,7 +56,7 @@ ABSOLUTE RULE: Output must be 100% in '{target_language}' with NO source-languag
 
 CRITICAL: The output must contain the same number of lines and the original speaker names.
 
-IMPORTANT: Respond with the RHYMING POETIC conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the rhymed translations.
 

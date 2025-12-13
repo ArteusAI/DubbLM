@@ -141,6 +141,8 @@ class SmartDubbing:
         logger.info(f"Initialized SmartDubbing with {self.device} device")
         logger.debug(f"Using {config.get('tts_system', 'coqui')} TTS system")
         logger.debug(f"Using {config.get('transcription_system', 'whisper')} transcription system")
+        logger.info(f"Language config: source={config.get('source_language')}, target={config.get('target_language')}")
+        logger.info(f"Speakers expected: {config.get('speakers_expected')}")
         
         if config.get('start_time') is not None or config.get('duration') is not None:
             start_str = f"from {config.get('start_time')}s" if config.get('start_time') is not None else "from beginning"
@@ -191,6 +193,7 @@ class SmartDubbing:
                 cache_manager=self.cache_manager,
                 cost_tracker=self.cost_tracker,
                 enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                segment_stretch=self.config.get('segment_stretch', 'audio_and_video'),
             )
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
@@ -309,9 +312,17 @@ class SmartDubbing:
             # Save debug TSV
             self.subtitle_manager.save_debug_tsv(segments_for_output)
             
-            # Save subtitles if requested (only if pause processing is disabled)
+            # Save subtitles if requested (only if no video timing adjustments expected)
             pause_removal_mode = self.config.get('pause_removal', 'disabled')
-            if pause_removal_mode == 'disabled':
+            segment_stretch_for_subtitles = self.config.get('segment_stretch', 'audio_and_video')
+            # Delay subtitle saving if:
+            # 1. pause_removal is enabled (will modify video timing), OR
+            # 2. segment_stretch is not 'audio' (may have per-segment video speed adjustments)
+            has_video_timing_changes = (
+                pause_removal_mode != 'disabled' or 
+                segment_stretch_for_subtitles in ('audio_and_video', 'video')
+            )
+            if not has_video_timing_changes:
                 if save_original_subtitles:
                     self.subtitle_manager.save_subtitles(segments_for_output, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                 
@@ -374,6 +385,27 @@ class SmartDubbing:
 
             # Combine with video (includes pause processing if enabled)
             segments_opt = self.config.get('segments_optimization', {})
+            
+            # For segment_stretch modes audio_and_video and video, pass segments with video speed requirements
+            segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
+            segments_with_video_speed = None
+            if segment_stretch_mode in ('audio_and_video', 'video'):
+                # Filter segments that have video_speed_required set
+                segments_with_video_speed = [
+                    seg for seg in segments_for_output 
+                    if seg.get('video_speed_required') is not None
+                ]
+                if segments_with_video_speed:
+                    logger.info(f"Passing {len(segments_with_video_speed)} segments with video speed requirements to video processor")
+            
+            # pause_removal='speedup' only works with segment_stretch='audio'
+            # For other modes, per-segment video speed adjustment handles timing
+            effective_pause_removal = self.config.get('pause_removal', 'disabled')
+            if effective_pause_removal == 'speedup' and segment_stretch_mode != 'audio':
+                logger.info(f"pause_removal='speedup' disabled because segment_stretch='{segment_stretch_mode}' "
+                           f"(speedup only works with segment_stretch='audio')")
+                effective_pause_removal = 'cut'
+            
             output_video_path, pause_adjustments = self.video_processor.combine_audio_with_video(
                 video_path=self.config.get('input'),
                 translated_audio_path=translated_audio_path,
@@ -389,7 +421,7 @@ class SmartDubbing:
                 target_language=self.config.get('target_language'),
                 normalize_audio=self.config.get('normalize_audio', True),
                 use_two_pass_encoding=self.config.get('use_two_pass_encoding', True),
-                pause_removal=self.config.get('pause_removal', 'disabled'),
+                pause_removal=effective_pause_removal,
                 min_pause_duration=segments_opt.get('min_pause_duration', 3),
                 preserve_pause_duration=segments_opt.get('preserve_pause_duration', 1.5),
                 video_speed_min=segments_opt.get('video_speed_min', 0.75),
@@ -401,31 +433,38 @@ class SmartDubbing:
                 dubbed_volume=self.config.get('dubbed_volume', 1.0),
                 background_volume=self.config.get('background_volume', 0.562341),
                 upscale_factor=self.config.get('upscale_factor', 1.0),
-                upscale_sharpen=self.config.get('upscale_sharpen', True)
+                upscale_sharpen=self.config.get('upscale_sharpen', True),
+                segments_with_video_speed=segments_with_video_speed,
+                video_segment_speed_min=segments_opt.get('video_segment_speed_min', 0.75)
             )
             
             # Store pause adjustments for potential future use
             self.pause_adjustments = pause_adjustments
             
-            # Save subtitles after pause processing if pause removal/speedup is enabled
-            if pause_removal_mode != 'disabled' and (save_original_subtitles or save_translated_subtitles):
+            # Save subtitles after video processing if timing adjustments were expected
+            # (either from pause_removal or per-segment video speed in audio_and_video/video modes)
+            has_video_timing_changes_for_subtitles = (
+                effective_pause_removal != 'disabled' or 
+                segment_stretch_mode in ('audio_and_video', 'video')
+            )
+            if has_video_timing_changes_for_subtitles and (save_original_subtitles or save_translated_subtitles):
                 if pause_adjustments:
-                    logger.info("Adjusting subtitle timestamps based on pause modifications...")
+                    logger.info("Adjusting subtitle timestamps based on video timing modifications...")
                     
                     if save_original_subtitles:
                         adjusted_original_segments = self.adjust_subtitle_timestamps(segments_for_output, pause_adjustments)
                         self.subtitle_manager.save_subtitles(adjusted_original_segments, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
                         adjusted_path = self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language'))
-                        logger.info(f"Saved pause-corrected original subtitles to {adjusted_path}")
+                        logger.info(f"Saved timing-corrected original subtitles to {adjusted_path}")
                     
                     if save_translated_subtitles:
                         adjusted_translated_segments = self.adjust_subtitle_timestamps(segments_for_output, pause_adjustments)
                         self.subtitle_manager.save_subtitles(adjusted_translated_segments, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
                         adjusted_path = self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language'))
-                        logger.info(f"Saved pause-corrected translated subtitles to {adjusted_path}")
+                        logger.info(f"Saved timing-corrected translated subtitles to {adjusted_path}")
                 else:
-                    # No pause adjustments made, but pause removal was enabled - save original timestamps
-                    logger.info("No pause adjustments needed, saving subtitles with original timestamps...")
+                    # No timing adjustments made - save with original timestamps
+                    logger.info("No video timing adjustments needed, saving subtitles with original timestamps...")
                     
                     if save_original_subtitles:
                         self.subtitle_manager.save_subtitles(segments_for_output, "original", self._get_subtitle_path("original", self.config.get('input'), self.config.get('source_language')))
@@ -916,9 +955,20 @@ class SmartDubbing:
         
         # Define comfort ratio constants
         # Allow comfort zone override from config (optionally language-specific)
-        COMFORT_MIN_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_min_adjustment_ratio', 0.85)
-        COMFORT_MAX_ADJUSTMENT_RATIO = self.config.get('segments_optimization', {}).get('comfort_max_adjustment_ratio', 1.15)
+        segments_opt = self.config.get('segments_optimization', {})
+        COMFORT_MIN_ADJUSTMENT_RATIO = segments_opt.get('comfort_min_adjustment_ratio', 0.85)
+        COMFORT_MAX_ADJUSTMENT_RATIO = segments_opt.get('comfort_max_adjustment_ratio', 1.15)
         use_enriched_for_tts = self.config.get('enable_emotion_enrichment', False)
+        
+        # Segment stretch mode: audio | audio_and_video | video
+        segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
+        
+        # Video segment speed limits for segment_stretch modes
+        VIDEO_SEGMENT_SPEED_MIN = segments_opt.get('video_segment_speed_min', 0.75)
+        VIDEO_SEGMENT_SPEED_COMFORTABLE = segments_opt.get('video_segment_speed_comfortable', 1.25)
+        VIDEO_SEGMENT_SPEED_MAX = segments_opt.get('video_segment_speed_max', 1.5)
+        
+        logger.info(f"Segment stretch mode: {segment_stretch_mode}")
         
         # Iteratively estimate and synthesize segments to leverage dynamic duration stats
         segments_metadata: List[Dict[str, Any]] = []
@@ -1023,11 +1073,16 @@ class SmartDubbing:
                 return best_text, best_ratio, best_deviation, best_track_type
 
             alternatives: List[Tuple[str, str]] = []
+            # Skip short variants in video/audio_and_video modes since video can be slowed down
+            skip_short_variants = segment_stretch_mode in ("video", "audio_and_video")
+            
             if ratio_normal < COMFORT_MIN_ADJUSTMENT_RATIO:
-                if segment_dict.get("very_short_translation"):
-                    alternatives.append(("very_short_translation", segment_dict["very_short_translation"]))
-                if segment_dict.get("short_translation"):
-                    alternatives.append(("short_translation", segment_dict["short_translation"]))
+                # Only try short variants in audio-only mode
+                if not skip_short_variants:
+                    if segment_dict.get("very_short_translation"):
+                        alternatives.append(("very_short_translation", segment_dict["very_short_translation"]))
+                    if segment_dict.get("short_translation"):
+                        alternatives.append(("short_translation", segment_dict["short_translation"]))
             elif ratio_normal > COMFORT_MAX_ADJUSTMENT_RATIO:
                 if segment_dict.get("long_translation"):
                     alternatives.append(("long_translation", segment_dict["long_translation"]))
@@ -1304,7 +1359,7 @@ class SmartDubbing:
             with metadata_lock:
                 estimation_stats["total_segments"] += 1
 
-            if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO):
+            if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO) or segment_stretch_mode == 'video':
                 # Estimation was inaccurate - outside comfort zone
                 with metadata_lock:
                     estimation_stats["inaccurate_estimations"] += 1
@@ -1312,18 +1367,78 @@ class SmartDubbing:
                 logger.info(
                     f"[MISS] Segment duration estimation MISS - "
                     f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
-                    f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s. "
-                    f"Resynthesizing..."
+                    f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s."
                 )
-                with tts_lock:
-                    self._resynthesize_segment(
-                        metadata,
-                        tts_instance,
-                        COMFORT_MIN_ADJUSTMENT_RATIO,
-                        COMFORT_MAX_ADJUSTMENT_RATIO,
-                        current_ratio=ratio,
-                        segments=segments,
+                
+                # Handle based on segment_stretch mode
+                if segment_stretch_mode == 'audio':
+                    # Mode: audio - aggressive audio speed changes, allow going beyond comfort zone
+                    logger.info("Mode 'audio': Resynthesizing with aggressive audio adjustments...")
+                    with tts_lock:
+                        self._resynthesize_segment(
+                            metadata,
+                            tts_instance,
+                            COMFORT_MIN_ADJUSTMENT_RATIO,
+                            COMFORT_MAX_ADJUSTMENT_RATIO,
+                            current_ratio=ratio,
+                            segments=segments,
+                        )
+                    
+                elif segment_stretch_mode == 'audio_and_video':
+                    # Mode: audio_and_video - first try audio within comfort, then use video speed
+                    logger.info("Mode 'audio_and_video': Trying audio adjustment within comfort zone...")
+                    
+                    # Try audio adjustment within comfort limits only
+                    with tts_lock:
+                        self._resynthesize_segment(
+                            metadata,
+                            tts_instance,
+                            COMFORT_MIN_ADJUSTMENT_RATIO,
+                            COMFORT_MAX_ADJUSTMENT_RATIO,
+                            current_ratio=ratio,
+                            segments=segments,
+                            limit_to_comfort_zone=True,  # New flag: don't go beyond comfort
+                        )
+                    
+                    # Recalculate ratio after audio adjustment
+                    actual_dur_after = segment_dict.get('synthesized_speech_len', actual_dur)
+                    ratio_after = original_dur / actual_dur_after if actual_dur_after > 0 else 1.0
+                    
+                    # If still outside comfort zone, calculate video speed requirement
+                    if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio_after <= COMFORT_MAX_ADJUSTMENT_RATIO):
+                        video_speed = self._calculate_video_speed_requirement(
+                            ratio_after,
+                            VIDEO_SEGMENT_SPEED_MIN,
+                            VIDEO_SEGMENT_SPEED_COMFORTABLE,
+                            VIDEO_SEGMENT_SPEED_MAX
+                        )
+                        if video_speed is not None:
+                            segment_dict['video_speed_required'] = video_speed
+                            segment_dict['video_sync_start'] = segment_dict['start']
+                            segment_dict['video_sync_end'] = segment_dict['end']
+                            logger.info(
+                                f"Video speed adjustment required: {video_speed:.2f}x "
+                                f"(ratio after audio: {ratio_after:.2f})"
+                            )
+                    
+                elif segment_stretch_mode == 'video':
+                    # Mode: video - no audio speed changes, only video speed adjustment
+                    logger.info("Mode 'video': Using video speed adjustment only (no audio resynthesis)...")
+                    
+                    # Calculate video speed requirement directly from current ratio
+                    video_speed = self._calculate_video_speed_requirement(
+                        ratio,
+                        VIDEO_SEGMENT_SPEED_MIN,
+                        VIDEO_SEGMENT_SPEED_COMFORTABLE,
+                        VIDEO_SEGMENT_SPEED_MAX
                     )
+                    if video_speed is not None:
+                        segment_dict['video_speed_required'] = video_speed
+                        segment_dict['video_sync_start'] = segment_dict['start']
+                        segment_dict['video_sync_end'] = segment_dict['end']
+                        logger.info(
+                            f"Video speed adjustment required: {video_speed:.2f}x (ratio: {ratio:.2f})"
+                        )
             else:
                 # Estimation was accurate - within comfort zone
                 with metadata_lock:
@@ -1562,6 +1677,61 @@ class SmartDubbing:
                 return float('inf')  # Avoid division by zero
             # Synthesized audio is shorter than original → ratio is too large → negative deviation
             return -((ratio - max_ratio_comfort) / max_ratio_comfort)
+    
+    def _calculate_video_speed_requirement(
+        self,
+        ratio: float,
+        video_min: float,
+        video_comfortable: float,
+        video_max: float
+    ) -> Optional[float]:
+        """Calculate video speed needed to sync with dubbed audio.
+        
+        The ratio represents original_duration / synthesized_duration:
+        - ratio < 1: synthesized audio is longer -> need to slow down video (or extend it)
+        - ratio > 1: synthesized audio is shorter -> need to speed up video
+        
+        Args:
+            ratio: original_duration / synthesized_duration
+            video_min: Minimum video speed (slowdown limit, e.g., 0.75)
+            video_comfortable: Comfortable video speed limit (e.g., 1.25)
+            video_max: Maximum video speedup (e.g., 1.5)
+            
+        Returns:
+            Video speed factor, or None if no adjustment needed.
+            - < 1.0: slow down video (use minterpolate for smooth slowdown)
+            - > 1.0: speed up video (use setpts)
+        """
+        # If ratio is approximately 1.0, no video speed change needed
+        if abs(ratio - 1.0) < 0.01:
+            return None
+        
+        if ratio < 1.0:
+            # Synthesized audio is longer than original -> need to slow down video
+            # video_speed = ratio means we slow down video to match audio
+            video_speed = max(ratio, video_min)
+            
+            if video_speed < video_min:
+                # Cannot slow down video enough, limit to video_min
+                logger.warning(
+                    f"Video slowdown limited to {video_min}x (would need {ratio:.2f}x)"
+                )
+                video_speed = video_min
+            
+            return video_speed
+        else:
+            # Synthesized audio is shorter than original -> need to speed up video
+            # video_speed = ratio means we speed up video to match audio
+            video_speed = ratio
+            
+            if video_speed > video_max:
+                # Exceeds max, cap at video_max (speedup always allowed)
+                logger.warning(
+                    f"Video speedup exceeds limit, capping to {video_max}x (would need {ratio:.2f}x)"
+                )
+                video_speed = video_max
+            
+            return video_speed
 
     def _resynthesize_segment(
         self,
@@ -1571,6 +1741,7 @@ class SmartDubbing:
         max_ratio: float,
         current_ratio: Optional[float] = None,
         segments: Optional[List[Dict]] = None,
+        limit_to_comfort_zone: bool = False,
     ) -> None:
         """Attempt to resynthesize a segment using alternative translations,
         focusing on minimizing deviation from the target ratio range.
@@ -1582,6 +1753,7 @@ class SmartDubbing:
             max_ratio: Maximum acceptable ratio original/actual.
             current_ratio: Current ratio to help prioritize alternatives.
             segments: Optional list of all segments for context extraction.
+            limit_to_comfort_zone: If True, only try alternative text variants, skip LLM adjustment.
         """
 
         from src.tts.models import TTSSegmentData
@@ -1602,17 +1774,33 @@ class SmartDubbing:
         if current_ratio is None and segment_dict.get("synthesized_speech_len", 0) > 0:
             current_ratio = original_duration / max(segment_dict["synthesized_speech_len"], 1e-6)
 
+        # Filter candidate keys based on segment_stretch mode
+        segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
+        skip_short_variants = segment_stretch_mode in ("video", "audio_and_video")
+        
         if current_ratio is not None:
             if current_ratio < min_ratio:
-                # synthesized audio longer than original – prioritize shorter variants
-                candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
+                # synthesized audio longer than original – prioritize shorter variants (only in audio mode)
+                if skip_short_variants:
+                    candidate_keys = ["translation", "long_translation"]
+                else:
+                    candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
             elif current_ratio > max_ratio:
                 # synthesized audio shorter than original – prioritize longer variants
-                candidate_keys = ["long_translation", "translation", "short_translation", "very_short_translation"]
+                if skip_short_variants:
+                    candidate_keys = ["long_translation", "translation"]
+                else:
+                    candidate_keys = ["long_translation", "translation", "short_translation", "very_short_translation"]
+            else:
+                if skip_short_variants:
+                    candidate_keys = ["translation", "long_translation"]
+                else:
+                    candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
+        else:
+            if skip_short_variants:
+                candidate_keys = ["translation", "long_translation"]
             else:
                 candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
-        else:
-            candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
 
         # Calculate current deviation to ensure we only accept improvements
         current_deviation = float('inf')
@@ -1695,10 +1883,11 @@ class SmartDubbing:
                     os.remove(temp_output_path)
 
         # If deviation remains large (>15%), try LLM-based text length adjustment
+        # Skip LLM adjustment if limit_to_comfort_zone is True (audio_and_video mode)
         try:
             LLM_DEVIATION_THRESHOLD = 0.15
             # Compute absolute deviation key for comparison
-            if self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
+            if not limit_to_comfort_zone and self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
                 baseline_text = metadata.get("chosen_text") or segment_dict.get("translation", "")
                 if baseline_text:
                     # Aim for center of comfort zone (prefer near 1.0), compute duration factor
@@ -1821,7 +2010,6 @@ class SmartDubbing:
             else:
                 logger.warning(f"No suitable alternative translation could improve duration for segment {metadata['index']+1}.")
 
-
     
     def _adjust_and_combine_audio_grouped(
         self, 
@@ -1849,12 +2037,26 @@ class SmartDubbing:
         
         logger.info("Grouping segments by speaker and optimizing timing...")
 
+        segment_stretch_mode = self.config.get("segment_stretch", "audio_and_video")
+
         # Get parameters from config
         opt_cfg = self.config.get('segments_optimization', {})
         SPLITTING_PAUSE_THRESHOLD_SECONDS = opt_cfg.get('post_translation_merge_gap', 1.5)
         MAX_GROUP_DURATION_SECONDS = opt_cfg.get('max_segment_duration', 60)
-        LIMIT_MIN_ADJUSTMENT_RATIO = 0.5
-        LIMIT_MAX_ADJUSTMENT_RATIO = 1.15
+        
+        if segment_stretch_mode in ('audio_and_video', 'video'):
+            # Hybrid/video modes: use comfort zone for audio, video handles the rest
+            LIMIT_MIN_ADJUSTMENT_RATIO = opt_cfg.get('comfort_min_adjustment_ratio', 0.85)
+            LIMIT_MAX_ADJUSTMENT_RATIO = opt_cfg.get('comfort_max_adjustment_ratio', 1.15)
+        else:
+            # Audio-only mode: aggressive audio stretching
+            LIMIT_MIN_ADJUSTMENT_RATIO = 0.5
+            LIMIT_MAX_ADJUSTMENT_RATIO = 1.15
+        
+        # Video speed limits for segment_stretch modes
+        VIDEO_SEGMENT_SPEED_MIN = opt_cfg.get('video_segment_speed_min', 0.75)
+        VIDEO_SEGMENT_SPEED_COMFORTABLE = opt_cfg.get('video_segment_speed_comfortable', 1.25)
+        VIDEO_SEGMENT_SPEED_MAX = opt_cfg.get('video_segment_speed_max', 1.5)
         
         # Get all unique speakers
         all_speakers = set(segment["speaker"] for segment in segments)
@@ -1986,37 +2188,70 @@ class SmartDubbing:
                 # Calculate required speed adjustment for the entire group
                 actual_duration_ms = len(combined_group_audio)
                 ratio = target_duration_ms / actual_duration_ms if actual_duration_ms > 0 else 1.0
+                original_ratio = ratio  # Keep original ratio for video speed calculation
                 
-                # Clamp ratio to maintain natural speech
-                ratio_clamped = min(max(ratio, LIMIT_MIN_ADJUSTMENT_RATIO), LIMIT_MAX_ADJUSTMENT_RATIO)
-                
-                # Apply speed adjustment to the entire group if needed
+                # Handle based on segment_stretch mode
                 adjusted_group_audio = combined_group_audio
-                if abs(ratio_clamped - 1.0) > 0.01:
-                    try:
-                        # Save the combined group audio to a temporary file
-                        tmp_in = f"artifacts/audio_chunks/group_{speaker}_{group_idx}.wav"
-                        tmp_out = f"artifacts/su_audio_chunks/group_{speaker}_{group_idx}.wav"
-                        os.makedirs(os.path.dirname(tmp_out), exist_ok=True)
-                        combined_group_audio.export(tmp_in, format="wav")
+                video_speed_for_group = None
+                
+                if segment_stretch_mode == 'video':
+                    # Video-only mode: no audio stretching, calculate video speed from original ratio
+                    ratio_clamped = 1.0  # No audio stretching
+                    if abs(ratio - 1.0) > 0.01:
+                        video_speed_for_group = self._calculate_video_speed_requirement(
+                            ratio, VIDEO_SEGMENT_SPEED_MIN, VIDEO_SEGMENT_SPEED_COMFORTABLE, VIDEO_SEGMENT_SPEED_MAX
+                        )
+                        logger.debug(f"Group {speaker}_{group_idx}: video-only mode, video_speed={video_speed_for_group}")
+                else:
+                    # Audio or audio_and_video mode: apply audio time-stretching
+                    ratio_clamped = min(max(ratio, LIMIT_MIN_ADJUSTMENT_RATIO), LIMIT_MAX_ADJUSTMENT_RATIO)
+                    
+                    if abs(ratio_clamped - 1.0) > 0.01:
+                        try:
+                            tmp_in = f"artifacts/audio_chunks/group_{speaker}_{group_idx}.wav"
+                            tmp_out = f"artifacts/su_audio_chunks/group_{speaker}_{group_idx}.wav"
+                            os.makedirs(os.path.dirname(tmp_out), exist_ok=True)
+                            combined_group_audio.export(tmp_in, format="wav")
+                            
+                            if self.config.get('debug_info', False):
+                                for orig_idx, segment in group:
+                                    self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
+                            
+                            tempo = 1.0 / ratio_clamped
+                            success = self.time_stretcher.stretch(tmp_in, tmp_out, tempo)
+                            
+                            if success:
+                                adjusted_group_audio = AudioSegment.from_file(tmp_out)
+                            else:
+                                logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}")
+                        except Exception as exc:
+                            logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
+                    
+                    # For audio_and_video mode: calculate video speed if ratio was outside comfort zone
+                    if segment_stretch_mode == 'audio_and_video':
+                        # Calculate remaining ratio after audio adjustment
+                        audio_adjusted_duration_ms = len(adjusted_group_audio)
+                        remaining_ratio = target_duration_ms / audio_adjusted_duration_ms if audio_adjusted_duration_ms > 0 else 1.0
                         
-                        # Store ratio for debugging
-                        if self.config.get('debug_info', False):
-                            for orig_idx, segment in group:
-                                self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
-                        
-                        # Apply high-quality time-stretching
-                        # This preserves pitch and timbre much better than simple speed change
-                        tempo = 1.0 / ratio_clamped
-                        
-                        success = self.time_stretcher.stretch(tmp_in, tmp_out, tempo)
-                        
-                        if success:
-                            adjusted_group_audio = AudioSegment.from_file(tmp_out)
-                        else:
-                            logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}")
-                    except Exception as exc:
-                        logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
+                        if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
+                            video_speed_for_group = self._calculate_video_speed_requirement(
+                                remaining_ratio, VIDEO_SEGMENT_SPEED_MIN, VIDEO_SEGMENT_SPEED_COMFORTABLE, VIDEO_SEGMENT_SPEED_MAX
+                            )
+                            logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
+                                        f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
+                                        f"video_speed={video_speed_for_group}")
+                
+                # Set video_speed_required on all segments in this group
+                if video_speed_for_group is not None:
+                    logger.info(f"Group {speaker}_{group_idx} requires video speed adjustment: {video_speed_for_group:.2f}x "
+                               f"(segments {group[0][0]+1}-{group[-1][0]+1})")
+                    # Only the first segment in the group gets the video speed marker
+                    # with group boundaries to avoid gaps being processed at 1.0x speed
+                    _, first_segment = group[0]
+                    last_orig__idx, last_segment = group[-1]
+                    first_segment['video_speed_required'] = video_speed_for_group
+                    first_segment['video_sync_start'] = first_segment['start']  # Group start
+                    first_segment['video_sync_end'] = last_segment['end']       # Group end
                 
                 # Enforce allowed overflow beyond the group's original timeframe
                 overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 1.0))
@@ -2108,6 +2343,7 @@ class SmartDubbing:
         real_segment_positions.sort(key=lambda x: x["start"])
         
         return final_audio, real_segment_positions 
+
 
     def _get_subtitle_path(self, subtitle_type: str, input_path: str, language: str) -> str:
         """Generate subtitle path based on input file and language.

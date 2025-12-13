@@ -34,17 +34,7 @@ Your goal is to take the provided technical conversation and make it understanda
 - Create simple, powerful analogies for difficult concepts
 - Focus on the 'why' and 'so what' for managers
 
-# Output Requirements:
-For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
-- "text": The primary, simplified translation, rephrased for a non-technical manager (100% length of the original text).
-- "very_short": A highly condensed version (40-50% length of the original text) of the same speaker's message, focusing only on the core business outcome.
-- "short": A condensed version (50-70% length of the original text) of the same speaker's message, focusing on the core business point.
-- "long": A more detailed version (110-130% length of the original text) of the same speaker's message, elaborating on business implications. This version MUST be at least as long as the original translated line; if needed, expand on the business context to meet this length requirement.
-
-These versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Focus on business impact and simple explanations.
-- Be written entirely in '{target_language}' with ZERO source-language words or acronyms; expand all acronyms into full '{target_language}' terms.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (but explain it for non-experts)
@@ -69,7 +59,7 @@ ABSOLUTE RULE: Output must be 100% in '{target_language}' with NO source-languag
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. The length of the text will likely change.
 
-IMPORTANT: Respond with the SIMPLIFIED and REPHRASED conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys, corresponding to the new requirements. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the simplified translation.
 

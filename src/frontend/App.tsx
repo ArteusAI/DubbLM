@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { UploadView } from './components/UploadView';
 import { ProcessingView } from './components/ProcessingView';
 import { EditorView } from './components/EditorView';
@@ -103,6 +103,9 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       minSegmentDuration: cfg.minSegmentDuration,
       comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
       comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+      segmentStretch: cfg.segmentStretch,
+      videoSegmentSpeedMin: cfg.videoSegmentSpeedMin,
+      videoSegmentSpeedMax: cfg.videoSegmentSpeedMax,
       minPauseDuration: cfg.minPauseDuration,
       preservePauseDuration: cfg.preservePauseDuration,
     },
@@ -112,6 +115,35 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
     sourceSize: p.sourceSize,
     processProgress: 0,
   };
+};
+
+// URL path helpers for browser history
+const buildPath = (step: AppStep, projectId: string | null): string => {
+  if (step === AppStep.PROJECTS || !projectId) return '/';
+  const stepPaths: Record<AppStep, string> = {
+    [AppStep.PROJECTS]: '/',
+    [AppStep.UPLOAD]: 'upload',
+    [AppStep.PROCESSING_TRANSCRIPTION]: 'processing',
+    [AppStep.EDITOR]: 'editor',
+    [AppStep.PROCESSING_DUBBING]: 'dubbing',
+    [AppStep.RESULT]: 'result',
+  };
+  return `/project/${projectId}/${stepPaths[step]}`;
+};
+
+const parsePath = (path: string): { step: AppStep; projectId: string | null } => {
+  const match = path.match(/^\/project\/([^/]+)\/(.+)$/);
+  if (!match) return { step: AppStep.PROJECTS, projectId: null };
+  
+  const [, projectId, stepPath] = match;
+  const pathToStep: Record<string, AppStep> = {
+    'upload': AppStep.UPLOAD,
+    'processing': AppStep.PROCESSING_TRANSCRIPTION,
+    'editor': AppStep.EDITOR,
+    'dubbing': AppStep.PROCESSING_DUBBING,
+    'result': AppStep.RESULT,
+  };
+  return { step: pathToStep[stepPath] || AppStep.UPLOAD, projectId };
 };
 
 const App: React.FC = () => {
@@ -124,6 +156,8 @@ const App: React.FC = () => {
   
   // Navigation State
   const [step, setStep] = useState<AppStep>(AppStep.PROJECTS);
+  const isPopStateNavigation = useRef(false);
+  const isInitialLoad = useRef(true);
   
   // Modals
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -148,6 +182,64 @@ const App: React.FC = () => {
   // Derived State
   const activeProject = projects.find(p => p.id === activeProjectId) || null;
 
+  // --- Browser History Sync ---
+  
+  // Handle browser back/forward
+  useEffect(() => {
+    const handlePopState = async () => {
+      const { step: newStep, projectId } = parsePath(window.location.pathname);
+      isPopStateNavigation.current = true;
+      
+      if (!projectId) {
+        setActiveProjectId(null);
+        setStep(AppStep.PROJECTS);
+        return;
+      }
+      
+      if (projectId !== activeProjectId) {
+        try {
+          const projectData = await api.getProject(projectId);
+          const apiProject = mapProjectFromApi(projectData);
+          setProjects(prev => prev.map(p => p.id === projectId ? { ...apiProject, videoFile: p.videoFile } : p));
+          setActiveProjectId(projectId);
+          setStep(newStep);
+        } catch {
+          setActiveProjectId(null);
+          setStep(AppStep.PROJECTS);
+          window.history.replaceState(null, '', '/');
+        }
+      } else {
+        setStep(newStep);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [activeProjectId]);
+
+  // Sync URL with navigation state
+  useEffect(() => {
+    if (isLoading) return;
+    
+    if (isPopStateNavigation.current) {
+      isPopStateNavigation.current = false;
+      return;
+    }
+    
+    const currentPath = buildPath(step, activeProjectId);
+    if (window.location.pathname !== currentPath) {
+      if (isInitialLoad.current) {
+        // First sync - use replaceState to not add history entry
+        isInitialLoad.current = false;
+        window.history.replaceState({ step, projectId: activeProjectId }, '', currentPath);
+      } else {
+        window.history.pushState({ step, projectId: activeProjectId }, '', currentPath);
+      }
+    } else if (isInitialLoad.current) {
+      isInitialLoad.current = false;
+    }
+  }, [step, activeProjectId, isLoading]);
+
   // --- Initial Data Load ---
   useEffect(() => {
     const loadInitialData = async () => {
@@ -169,6 +261,31 @@ const App: React.FC = () => {
             description: p.description || '',
             promptTemplate: p.promptTemplate,
           })));
+        }
+        
+        // If URL had a project, load it after initial data
+        const { projectId, step: urlStep } = parsePath(window.location.pathname);
+        if (projectId) {
+          const projectExists = projectsData.some(p => p.id === projectId);
+          if (projectExists) {
+            try {
+              const projectData = await api.getProject(projectId);
+              const apiProject = mapProjectFromApi(projectData);
+              setProjects(prev => prev.map(p => p.id === projectId ? apiProject : p));
+              setActiveProjectId(projectId);
+              setStep(urlStep);
+            } catch {
+              // Project not found, go to projects list
+              setActiveProjectId(null);
+              setStep(AppStep.PROJECTS);
+              window.history.replaceState(null, '', '/');
+            }
+          } else {
+            // Project doesn't exist
+            setActiveProjectId(null);
+            setStep(AppStep.PROJECTS);
+            window.history.replaceState(null, '', '/');
+          }
         }
       } catch (err) {
         console.error('Failed to load initial data:', err);
@@ -609,6 +726,9 @@ const App: React.FC = () => {
         minSegmentDuration: cfg.minSegmentDuration,
         comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
         comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+        segmentStretch: cfg.segmentStretch,
+        videoSegmentSpeedMin: cfg.videoSegmentSpeedMin,
+        videoSegmentSpeedMax: cfg.videoSegmentSpeedMax,
         minPauseDuration: cfg.minPauseDuration,
         preservePauseDuration: cfg.preservePauseDuration,
       }).catch(err => {

@@ -605,9 +605,9 @@ export const UploadView: React.FC<UploadViewProps> = ({
                       </div>
                     </div>
 
-                    {/* Segment Optimization Section */}
+                    {/* Segment Settings */}
                     <div className="space-y-2">
-                      <h4 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Segment Optimization</h4>
+                      <h4 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Segments</h4>
                       <div className="grid grid-cols-4 gap-2">
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
@@ -639,20 +639,6 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         </div>
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
-                            Max Dur
-                            <InfoTip text="Maximum segment duration in seconds" />
-                          </label>
-                          <input 
-                            type="number"
-                            step="1"
-                            min="5"
-                            value={config.maxSegmentDuration ?? 60}
-                            onChange={(e) => onConfigChange({ maxSegmentDuration: parseFloat(e.target.value) })}
-                            className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                          />
-                        </div>
-                        <div className="space-y-1">
-                          <label className="text-[10px] text-zinc-500 flex items-center">
                             Min Dur
                             <InfoTip text="Minimum segment duration in seconds" />
                           </label>
@@ -665,49 +651,148 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
                           />
                         </div>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 max-w-[240px]">
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
-                            Min Ratio
-                            <InfoTip text="Comfort min adjustment ratio for TTS speed (0.85 = 15% slower)" />
+                            Max Dur
+                            <InfoTip text="Maximum segment duration in seconds" />
                           </label>
                           <input 
                             type="number"
-                            step="0.05"
-                            min="0.5"
-                            max="1"
-                            value={config.comfortMinAdjustmentRatio ?? 0.85}
-                            onChange={(e) => onConfigChange({ comfortMinAdjustmentRatio: parseFloat(e.target.value) })}
-                            className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                          />
-                        </div>
-                        <div className="space-y-1">
-                          <label className="text-[10px] text-zinc-500 flex items-center">
-                            Max Ratio
-                            <InfoTip text="Comfort max adjustment ratio for TTS speed (1.15 = 15% faster)" />
-                          </label>
-                          <input 
-                            type="number"
-                            step="0.05"
-                            min="1"
-                            max="2"
-                            value={config.comfortMaxAdjustmentRatio ?? 1.15}
-                            onChange={(e) => onConfigChange({ comfortMaxAdjustmentRatio: parseFloat(e.target.value) })}
+                            step="1"
+                            min="5"
+                            value={config.maxSegmentDuration ?? 60}
+                            onChange={(e) => onConfigChange({ maxSegmentDuration: parseFloat(e.target.value) })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
                           />
                         </div>
                       </div>
                     </div>
 
-                    {/* Pause Processing Section */}
+                    {/* Audio/Video Sync */}
+                    <div className="space-y-2">
+                      <h4 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Audio/Video Sync</h4>
+                      <div className="space-y-1 max-w-[200px]">
+                        <label className="text-[10px] text-zinc-500 flex items-center">
+                          Stretch Mode
+                          <InfoTip text="How to sync timing: Audio (TTS speed only), Audio+Video (hybrid), Video (video speed only)" />
+                        </label>
+                        <select 
+                          value={config.segmentStretch || 'audio_and_video'}
+                          onChange={(e) => onConfigChange({ segmentStretch: e.target.value as 'audio' | 'audio_and_video' | 'video' })}
+                          className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                        >
+                          <option value="audio">Audio only</option>
+                          <option value="audio_and_video">Audio + Video</option>
+                          <option value="video">Video only</option>
+                        </select>
+                      </div>
+                      
+                      {/* Audio Comfort Zone */}
+                      <div className="pt-1">
+                        <label className={`text-[10px] font-medium flex items-center gap-1 ${config.segmentStretch === 'video' ? 'text-zinc-600' : 'text-zinc-400'}`}>
+                          🔊 Audio Speed Range
+                          <InfoTip text="TTS playback speed comfort zone (0.85-1.15 means ±15%)" />
+                        </label>
+                        <div className="grid grid-cols-2 gap-2 mt-1">
+                          <div className="space-y-0.5">
+                            <label className={`text-[10px] ${config.segmentStretch === 'video' ? 'text-zinc-600' : 'text-zinc-500'}`}>Slowdown</label>
+                            <input 
+                              type="number"
+                              step="0.05"
+                              min="0.5"
+                              max="1"
+                              disabled={config.segmentStretch === 'video'}
+                              value={config.comfortMinAdjustmentRatio ?? 0.85}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                const videoMin = config.videoSegmentSpeedMin ?? 0.75;
+                                if (val < videoMin) {
+                                  onConfigChange({ comfortMinAdjustmentRatio: val, videoSegmentSpeedMin: val - 0.1 });
+                                } else {
+                                  onConfigChange({ comfortMinAdjustmentRatio: val });
+                                }
+                              }}
+                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'video' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            />
+                          </div>
+                          <div className="space-y-0.5">
+                            <label className={`text-[10px] ${config.segmentStretch === 'video' ? 'text-zinc-600' : 'text-zinc-500'}`}>Speedup</label>
+                            <input 
+                              type="number"
+                              step="0.05"
+                              min="1"
+                              max="2"
+                              disabled={config.segmentStretch === 'video'}
+                              value={config.comfortMaxAdjustmentRatio ?? 1.15}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                const videoMax = config.videoSegmentSpeedMax ?? 1.5;
+                                if (val > videoMax) {
+                                  onConfigChange({ comfortMaxAdjustmentRatio: val, videoSegmentSpeedMax: val + 0.1 });
+                                } else {
+                                  onConfigChange({ comfortMaxAdjustmentRatio: val });
+                                }
+                              }}
+                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'video' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Video Comfort Zone */}
+                      <div className="pt-1">
+                        <label className={`text-[10px] font-medium flex items-center gap-1 ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-400'}`}>
+                          🎬 Video Speed Range
+                          <InfoTip text="Video playback speed limits. Must be wider than audio range. Uses minterpolate for slowdown beyond 0.75x" />
+                        </label>
+                        <div className="grid grid-cols-2 gap-2 mt-1">
+                          <div className="space-y-0.5">
+                            <label className={`text-[10px] ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-500'}`}>Slowdown</label>
+                            <input 
+                              type="number"
+                              step="0.05"
+                              min="0.25"
+                              max={config.comfortMinAdjustmentRatio ?? 0.85}
+                              disabled={config.segmentStretch === 'audio'}
+                              value={config.videoSegmentSpeedMin ?? 0.75}
+                              onChange={(e) => onConfigChange({ videoSegmentSpeedMin: parseFloat(e.target.value) })}
+                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'audio' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            />
+                          </div>
+                          <div className="space-y-0.5">
+                            <label className={`text-[10px] ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-500'}`}>Speedup</label>
+                            <input 
+                              type="number"
+                              step="0.05"
+                              min={config.comfortMaxAdjustmentRatio ?? 1.15}
+                              max="3"
+                              disabled={config.segmentStretch === 'audio'}
+                              value={config.videoSegmentSpeedMax ?? 1.5}
+                              onChange={(e) => onConfigChange({ videoSegmentSpeedMax: parseFloat(e.target.value) })}
+                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'audio' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            />
+                          </div>
+                        </div>
+                        {/* Validation warning */}
+                        {config.segmentStretch !== 'audio' && (
+                          (config.videoSegmentSpeedMin ?? 0.75) >= (config.comfortMinAdjustmentRatio ?? 0.85) ||
+                          (config.videoSegmentSpeedMax ?? 1.5) <= (config.comfortMaxAdjustmentRatio ?? 1.15)
+                        ) && (
+                          <p className="text-[9px] text-amber-500 mt-1">
+                            ⚠️ Video range must be wider than audio range
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Pause Processing */}
                     <div className="space-y-2">
                       <h4 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Pause Processing</h4>
                       <div className="grid grid-cols-3 gap-2">
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Mode
-                            <InfoTip text="How to handle pauses: cut (remove), speedup (speed up video), disabled" />
+                            <InfoTip text="Cut: remove pauses, Speedup: accelerate video (only with Audio stretch mode)" />
                           </label>
                           <select 
                             value={config.pauseRemoval || 'disabled'}
@@ -716,7 +801,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           >
                             <option value="disabled">Disabled</option>
                             <option value="cut">Cut pauses</option>
-                            <option value="speedup">Speed up</option>
+                            <option value="speedup" disabled={config.segmentStretch !== 'audio'}>Speed up {config.segmentStretch !== 'audio' ? '(audio mode only)' : ''}</option>
                           </select>
                         </div>
                         <div className="space-y-1">

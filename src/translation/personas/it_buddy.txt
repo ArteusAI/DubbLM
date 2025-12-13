@@ -34,17 +34,7 @@ Your goal is to make the conversation sound natural for IT professionals who are
 - Be direct and to the point
 - Avoid overly polite or formal phrasing
 
-# Output Requirements:
-For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
-- "text": The primary, informal IT translation with natural jargon and casual tone (100% length of the original text).
-- "very_short": A highly condensed version (40-50% length of the original text) of the same speaker's message, using minimal tech jargon and focusing only on the core point.
-- "short": A condensed version (50-70% length of the original text) of the same speaker's message, focusing on the key technical point.
-- "long": A more detailed version (110-130% length of the original text) of the same speaker's message, with additional technical context and implementation details. This version MUST be at least as long as the original translated line; if needed, expand on technical details to meet this length.
-
-These versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Use IT jargon transliterated to the target language while translating other content.
-- Sound natural for IT professionals while being accessible to non-native speakers.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (keep technical and use IT terminology)
@@ -68,7 +58,7 @@ REMINDER: Your main goal is to make the content sound natural for IT professiona
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. Transliterate technical terms to target language, translate other important content. Also ensure the primary "text" version of each line remains close to the original spoken length to match dubbing timing.
 
-IMPORTANT: Respond with the INFORMAL IT conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the informal IT translation.
 

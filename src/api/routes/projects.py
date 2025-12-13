@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..database.session import get_db
 from ..database.models import Project, Segment, ProjectStatus
@@ -37,7 +38,45 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             speakerCount=config.get("speakerCount"),
             keepBackground=config.get("keepBackground", True),
             pauseRemoval=config.get("pauseRemoval", "disabled"),
+            preset=config.get("preset", "hq"),
             apiKeys=None,  # Never expose API keys
+            autoProcess=config.get("autoProcess"),
+            # LLM settings
+            llmProvider=config.get("llmProvider"),
+            llmModelName=config.get("llmModelName"),
+            llmTemperature=config.get("llmTemperature"),
+            refinementLlmProvider=config.get("refinementLlmProvider"),
+            refinementModelName=config.get("refinementModelName"),
+            refinementTemperature=config.get("refinementTemperature"),
+            translationPromptPrefix=config.get("translationPromptPrefix"),
+            # TTS settings
+            ttsSystem=config.get("ttsSystem"),
+            ttsModel=config.get("ttsModel"),
+            ttsPromptPrefix=config.get("ttsPromptPrefix"),
+            voiceAutoSelection=config.get("voiceAutoSelection"),
+            enableEmotionEnrichment=config.get("enableEmotionEnrichment"),
+            # Audio settings
+            dubbedVolume=config.get("dubbedVolume"),
+            backgroundVolume=config.get("backgroundVolume"),
+            useTwoPassEncoding=config.get("useTwoPassEncoding"),
+            maxWorkers=config.get("maxWorkers"),
+            # Processing settings
+            startTime=config.get("startTime"),
+            duration=config.get("duration"),
+            transcriptionSystem=config.get("transcriptionSystem"),
+            whisperModel=config.get("whisperModel"),
+            # Segment optimization
+            postDiarizationMergeGap=config.get("postDiarizationMergeGap"),
+            postTranslationMergeGap=config.get("postTranslationMergeGap"),
+            maxSegmentDuration=config.get("maxSegmentDuration"),
+            minSegmentDuration=config.get("minSegmentDuration"),
+            comfortMinAdjustmentRatio=config.get("comfortMinAdjustmentRatio"),
+            comfortMaxAdjustmentRatio=config.get("comfortMaxAdjustmentRatio"),
+            minPauseDuration=config.get("minPauseDuration"),
+            preservePauseDuration=config.get("preservePauseDuration"),
+            segmentStretch=config.get("segmentStretch"),
+            videoSegmentSpeedMin=config.get("videoSegmentSpeedMin"),
+            videoSegmentSpeedMax=config.get("videoSegmentSpeedMax"),
         ),
         "sourceFile": project.source_file,
         "sourceFilename": project.source_filename,
@@ -118,15 +157,19 @@ async def update_project_config(
     
     # Update only provided fields
     update_data = config_update.model_dump(exclude_unset=True)
+    
     for key, value in update_data.items():
         if value is not None:
-            # Convert camelCase to snake_case for storage
             current_config[key] = value
     
+    # Explicitly mark config as modified (required for JSON columns in SQLAlchemy)
     project.config = current_config
+    flag_modified(project, "config")
     project.updated_at = datetime.now(timezone.utc)
+    
     db.commit()
     db.refresh(project)
+    
     
     return _project_to_response(project)
 

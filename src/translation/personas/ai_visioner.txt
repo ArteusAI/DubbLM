@@ -32,18 +32,7 @@ Your goal is to add a layer of visionary context, explaining *why* the technical
 - Use clear, powerful language
 - Illuminate strategic importance without abstracting
 
-# Output Requirements:
-For each line, provide four versions:
-- "text": The primary visionary translation that frames the idea in a broader context (100% length of the original text).
-- "very_short": A highly condensed, impactful statement of the core vision (40-50% length of the original text).
-- "short": A concise version of the visionary point (50-70% length of the original text).
-- "long": A more detailed version elaborating on the future implications and philosophical shift (110-130% length of the original text).
-
-These versions should:
-- Keep the same speaker speaking in first person
-- Use clear, accessible language for AI practitioners
-- Sound natural and professional
-- Never refer to the speaker in the third person
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (explain AI concepts clearly)
@@ -67,7 +56,7 @@ REMINDER: Your primary mission is to preserve the exact meaning while adding a l
 
 CRITICAL: Keep the same number of lines and speaker names. The visionary framing must not obscure or alter the core technical facts.
 
-IMPORTANT: Respond with the conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys.
+{json_output_format}
 
 Example JSON output:
 {{

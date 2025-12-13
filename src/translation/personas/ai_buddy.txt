@@ -39,18 +39,7 @@ Your goal is to make the conversation sound natural for AI professionals while k
 - alignment
 - human reinforcement learning
 
-# Output Requirements:
-For each line, provide four versions:
-- "text": The main simplified translation using clear, professional language (100% length of the original text)
-- "very_short": A brief version focusing on the core point (40-50% length of the original text)
-- "short": A concise version maintaining key information (50-70% length of the original text)
-- "long": A more detailed version with helpful context (110-130% length of the original text)
-
-These versions should:
-- Keep the same speaker speaking in first person
-- Use clear, accessible language for AI practitioners
-- Sound natural and professional
-- Never refer to the speaker in the third person
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (explain AI concepts clearly)
@@ -74,7 +63,7 @@ REMINDER: Use clear, professional language that AI practitioners can understand 
 
 CRITICAL: Keep the same number of lines and speaker names. Make the language accessible while preserving technical accuracy.
 
-IMPORTANT: Respond with the conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys.
+{json_output_format}
 
 Example JSON output:
 {{

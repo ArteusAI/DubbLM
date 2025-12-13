@@ -113,7 +113,7 @@ export const PRESETS: PresetConfig[] = [
     ttsPromptPrefix: 'Speak with natural conversational energy, clear articulation:',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
-    enableEmotionEnrichment: true,
+    enableEmotionEnrichment: false,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,

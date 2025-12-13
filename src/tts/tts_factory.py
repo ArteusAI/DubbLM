@@ -1,7 +1,10 @@
 import os
+import logging
 from typing import Dict, Any, Union, Callable, Optional, Type
 
 from .tts_interface import TTSInterface
+
+logger = logging.getLogger(__name__)
 from .f5_tts_wrapper import F5TTSWrapper
 from .openai_tts_wrapper import OpenAITTSWrapper
 from .gemini_tts_wrapper import GeminiTTSWrapper
@@ -168,7 +171,7 @@ class TTSFactory:
         except Exception as e:
             # Ensure we catch and re-raise with context
             import traceback
-            print(f"Error details during TTS client creation for provider '{config.provider}':\n{traceback.format_exc()}")
+            logger.error(f"Error details during TTS client creation for provider '{config.provider}':\n{traceback.format_exc()}")
             raise RuntimeError(
                 f"Failed to create or initialize TTS client for provider '{config.provider}': {str(e)}"
             ) from e

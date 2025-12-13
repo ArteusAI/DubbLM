@@ -2,6 +2,7 @@
 
 import os
 import sys
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal
@@ -16,6 +17,8 @@ from ..database.session import get_db_session
 from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, JobType
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
+
+logger = logging.getLogger(__name__)
 
 
 PresetType = Literal["fast", "hq", "ultra"]
@@ -173,8 +176,9 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         pm = ProjectManager(project_id)
         pm.ensure_directories()
         
-        # Get project config from database
-        db = get_db_session()
+        # Get project config from database with fresh connection
+        # (SQLite requires fresh connection to see changes from other processes)
+        db = get_db_session(fresh=True)
         try:
             project = db.query(Project).filter(Project.id == project_id).first()
             if not project:
@@ -183,6 +187,9 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             config_data = project.config or {}
             source_file = pm.get_source_video_path()
             
+            # Debug: log config loaded from database
+            logger.warning(f"[WORKER TRANSCRIBE] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
+            
             if not source_file or not source_file.exists():
                 raise ValueError("No source video uploaded")
         finally:
@@ -190,28 +197,44 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         
         update_job_progress(job_id, 2, "initialization", "Starting transcription pipeline")
         
-        # Change to project artifacts directory for the pipeline
+        # Change to project base directory for the pipeline
+        # (SmartDubbing uses paths like "artifacts/audio", so we need to be in the project root)
         original_cwd = os.getcwd()
-        os.chdir(str(pm.artifacts_dir))
+        os.chdir(str(pm.base_dir))
         
         try:
             # Import and configure SmartDubbing
             from src.dubbing.core.config import DubbingConfig
             from src.dubbing.core.smart_dubbing import SmartDubbing
+            from src.dubbing.core.log_config import setup_logging
+            
+            # Setup logging to project's debug directory
+            setup_logging(output_dir=str(pm.debug_dir))
             
             # Get preset configuration
             preset = config_data.get("preset", "hq")
             preset_config = get_preset_config(preset)
             
             # Build configuration with preset values (config_data overrides preset)
+            # Log the values we're extracting from config_data
+            source_lang = config_data.get("sourceLang", "en")
+            target_lang = config_data.get("targetLang", "ru")
+            speaker_count = config_data.get("speakerCount")
+            logger.warning(f"[WORKER] Building DubbingConfig: source_language={source_lang}, target_language={target_lang}, speakers_expected={speaker_count}")
+            logger.warning(f"[DEBUG TRANSCRIBE] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
+            logger.warning(f"[DEBUG TRANSCRIBE] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
+            logger.warning(f"[DEBUG TRANSCRIBE] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
+            logger.warning(f"[DEBUG TRANSCRIBE] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
+            logger.warning(f"[DEBUG TRANSCRIBE] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
                 "input": str(source_file),
-                "source_language": config_data.get("sourceLang", "en"),
-                "target_language": config_data.get("targetLang", "ru"),
+                "source_language": source_lang,
+                "target_language": target_lang,
                 "keep_background": config_data.get("keepBackground", True),
                 "pause_removal": config_data.get("pauseRemoval", "disabled"),
-                "speakers_expected": config_data.get("speakerCount"),
+                "speakers_expected": speaker_count,
                 "exit_before_synthesis": True,  # Stop after translation
                 "no_cache": False,
                 # TTS settings (config_data overrides preset)
@@ -263,7 +286,15 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            if config_data.get("videoSegmentSpeedMin") is not None:
+                segments_opt["video_segment_speed_min"] = config_data["videoSegmentSpeedMin"]
+            if config_data.get("videoSegmentSpeedMax") is not None:
+                segments_opt["video_segment_speed_max"] = config_data["videoSegmentSpeedMax"]
             dubbing_config.config["segments_optimization"] = segments_opt
+            
+            # Apply segment_stretch mode
+            if config_data.get("segmentStretch"):
+                dubbing_config.config["segment_stretch"] = config_data["segmentStretch"]
             
             # Apply API keys from settings and project config
             _apply_api_keys(config_data.get("apiKeys"))
@@ -373,8 +404,9 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         pm = ProjectManager(project_id)
         pm.ensure_directories()
         
-        # Get project and segments from database
-        db = get_db_session()
+        # Get project and segments from database with fresh connection
+        # (SQLite requires fresh connection to see changes from other processes)
+        db = get_db_session(fresh=True)
         try:
             project = db.query(Project).filter(Project.id == project_id).first()
             if not project:
@@ -390,6 +422,9 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             config_data = project.config or {}
             source_file = pm.get_source_video_path()
             
+            # Debug: log config loaded from database
+            logger.warning(f"[WORKER DUB] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
+            
             if not source_file or not source_file.exists():
                 raise ValueError("No source video uploaded")
             
@@ -401,13 +436,18 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         # Dubbing starts at 35% (continuing from transcription phase)
         update_job_progress(job_id, 37, "initialization", "Starting dubbing pipeline")
         
-        # Change to project artifacts directory
+        # Change to project base directory
+        # (SmartDubbing uses paths like "artifacts/audio", so we need to be in the project root)
         original_cwd = os.getcwd()
-        os.chdir(str(pm.artifacts_dir))
+        os.chdir(str(pm.base_dir))
         
         try:
             from src.dubbing.core.config import DubbingConfig
             from src.dubbing.core.smart_dubbing import SmartDubbing
+            from src.dubbing.core.log_config import setup_logging
+            
+            # Setup logging to project's debug directory
+            setup_logging(output_dir=str(pm.debug_dir))
             
             # Get preset configuration
             preset = config_data.get("preset", "hq")
@@ -421,8 +461,13 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Build configuration with preset values (config_data overrides preset)
             pause_removal_value = config_data.get("pauseRemoval", "disabled")
-            print(f"[DEBUG] pause_removal from config_data: {pause_removal_value}")
-            print(f"[DEBUG] config_data keys: {list(config_data.keys())}")
+            logger.warning(f"[DEBUG DUB] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
+            logger.warning(f"[DEBUG DUB] pause_removal from config_data: {pause_removal_value}")
+            logger.warning(f"[DEBUG DUB] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
+            logger.warning(f"[DEBUG DUB] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
+            logger.warning(f"[DEBUG DUB] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
+            logger.warning(f"[DEBUG DUB] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            logger.warning(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
@@ -450,6 +495,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "translator_type": "llm",
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
                 "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
+                "llm_temperature": config_data.get("llmTemperature") if config_data.get("llmTemperature") is not None else preset_config["llm_temperature"],
+                "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
+                "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
+                "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
+                "refinement_persona": config_data.get("personaId", "normal"),
             })
             
             # Apply segment optimization settings if provided
@@ -470,7 +520,15 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            if config_data.get("videoSegmentSpeedMin") is not None:
+                segments_opt["video_segment_speed_min"] = config_data["videoSegmentSpeedMin"]
+            if config_data.get("videoSegmentSpeedMax") is not None:
+                segments_opt["video_segment_speed_max"] = config_data["videoSegmentSpeedMax"]
             dubbing_config.config["segments_optimization"] = segments_opt
+            
+            # Apply segment_stretch mode
+            if config_data.get("segmentStretch"):
+                dubbing_config.config["segment_stretch"] = config_data["segmentStretch"]
             
             # Apply API keys from settings and project config
             _apply_api_keys(config_data.get("apiKeys"))
@@ -525,7 +583,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                     # Progress from 74% to 84% during background audio extraction
                     progress = 74 + int((current / total) * 10) if total > 0 else 74
                     update_job_progress(job_id, progress, "background_audio", f"Processing background audio: {current}/{total}")
-                
+                                
                 background_audio_path = dubber.audio_processor.process_background_audio(
                     audio_file, progress_callback=background_progress
                 )
@@ -537,8 +595,26 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 progress = 84 + int((current / total) * 15) if total > 0 else 84
                 update_job_progress(job_id, progress, "video_combine", message or f"Processing video: {current}/{total}s")
             
+            def video_combine_log(message: str):
+                add_job_log(job_id, message)
+            
             # Combine with video
             segments_opt = dubbing_config.config.get("segments_optimization", {})
+            
+            # For segment_stretch modes audio_and_video and video, pass segments with video speed requirements
+            segment_stretch_mode = dubbing_config.get("segment_stretch", "audio_and_video")
+            segments_with_video_speed = None
+            if segment_stretch_mode in ("audio_and_video", "video"):
+                segments_with_video_speed = [
+                    seg for seg in segments_data 
+                    if seg.get("video_speed_required") is not None
+                ]
+            
+            # Determine effective pause removal (speedup only works with segment_stretch=audio)
+            effective_pause_removal = dubbing_config.get("pause_removal", "disabled")
+            if effective_pause_removal == "speedup" and segment_stretch_mode != "audio":
+                effective_pause_removal = "cut"
+            
             output_video_path, _ = dubber.video_processor.combine_audio_with_video(
                 video_path=str(source_file),
                 translated_audio_path=translated_audio_path,
@@ -546,13 +622,16 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 output_file=str(pm.get_result_video_path(config_data.get("targetLang", "ru"))),
                 source_language=config_data.get("sourceLang", "en"),
                 target_language=config_data.get("targetLang", "ru"),
-                pause_removal=dubbing_config.get("pause_removal", "disabled"),
+                pause_removal=effective_pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
                 video_speed_min=segments_opt.get("video_speed_min", 0.75),
                 video_speed_max=segments_opt.get("video_speed_max", 1.5),
                 segment_positions=dubber.real_segment_positions,
                 progress_callback=video_combine_progress,
+                log_callback=video_combine_log,
+                segments_with_video_speed=segments_with_video_speed,
+                video_segment_speed_min=segments_opt.get("video_segment_speed_min", 0.75),
             )
             
             # Save subtitles to results directory

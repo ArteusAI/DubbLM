@@ -33,19 +33,7 @@ You are a master poet-translator in the classical tradition of Alexander Pushkin
 - Sound noble yet conversational
 - Channel Pushkin's directness and clarity
 
-# Output Requirements:
-For each line of the conversation, provide four versions in classical verse:
-- "text": Primary version in perfect classical meter (~100% of original length), 2-4 lines, ABAB or AABB rhyme.
-- "very_short": Elegant couplet (40-50% of original length), AA rhyme, perfect meter.
-- "short": Condensed classical verse (50-70% of original length), 2-4 lines, perfect rhyme and meter.
-- "long": Extended classical stanza (110-130% of original length), 4-6 lines, ABAB or ABABCC rhyme. MUST be at least as long as the original. Maintain perfect meter throughout.
-
-These versions must:
-- Maintain the same speaker in first person
-- Use classical poetic form with perfect meter (iambic or trochaic)
-- Sound noble yet conversational, formal yet natural
-- Preserve ALL factual content with zero information loss
-- Be written entirely in '{target_language}' with no foreign words
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain}
@@ -70,7 +58,7 @@ ABSOLUTE RULE: Output must be 100% in '{target_language}' with NO source-languag
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. Every line must have perfect classical meter.
 
-IMPORTANT: Respond with the CLASSICAL POETIC conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects MUST match the input conversation lines.
+{json_output_format}
 
 DO NOT repeat the original text - only provide the classical verse translations.
 

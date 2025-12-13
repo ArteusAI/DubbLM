@@ -145,15 +145,24 @@ export interface AppConfig {
   startTime?: number;
   duration?: number;
   
-  // Segment optimization extras
+  // Segment merging
   postDiarizationMergeGap?: number;
   postTranslationMergeGap?: number;
+  
+  // Segment duration limits
   maxSegmentDuration?: number;
   minSegmentDuration?: number;
+  
+  // Audio/Video sync settings
+  segmentStretch?: 'audio' | 'audio_and_video' | 'video';
+  // Audio comfort zone (TTS speed adjustment)
   comfortMinAdjustmentRatio?: number;
   comfortMaxAdjustmentRatio?: number;
+  // Video comfort zone (must be wider than audio)
+  videoSegmentSpeedMin?: number;
+  videoSegmentSpeedMax?: number;
   
-  // Pause removal extras
+  // Pause processing
   minPauseDuration?: number;
   preservePauseDuration?: number;
 }

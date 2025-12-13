@@ -36,18 +36,7 @@ Your goal is to take rapid, jumping thoughts with tangents and unclear connectio
 - Allow slower speaking pace through reduced word count
 - Preserve all essential facts and technical details
 
-# Output Requirements:
-For each line of the conversation, you will provide four versions in the output JSON:
-- "text": The primary restructured version with 60-80% of original word count, designed for slow, clear delivery (shorter than original to allow slower speaking).
-- "very_short": A highly condensed version (30-40% of original length) with only the absolute core message.
-- "short": A condensed version (40-60% of original length) with essential ideas only.
-- "long": A version matching the original length (100% of original length) that maintains clarity while including more context.
-
-These versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Use short, simple sentences with clear meaning.
-- Have significantly fewer words to enable slower, clearer speech delivery.
-- Be much more concise and structured than the original.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain}
@@ -71,7 +60,7 @@ REMINDER: Your main goal is to transform fast, fragmented ADHD-style speech into
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. The primary "text" version should have 60-80% of the original word count to allow for slower speaking. Focus on brevity and clarity.
 
-IMPORTANT: Respond with the CLARIFIED conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the clarified translation.
 

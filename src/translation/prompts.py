@@ -1,6 +1,9 @@
 import os
+import logging
 from pathlib import Path
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,7 +54,7 @@ def _load_all_personas() -> dict[str, str]:
             persona = _load_persona_from_file(file_path)
             prompts[persona.id] = persona.prompt
         except Exception as e:
-            print(f"Warning: Failed to load persona from {file_path}: {e}")
+            logger.warning(f"Failed to load persona from {file_path}: {e}")
     
     return prompts
 
@@ -69,7 +72,7 @@ def get_available_personas() -> list[PersonaInfo]:
             persona = _load_persona_from_file(file_path)
             personas.append(persona)
         except Exception as e:
-            print(f"Warning: Failed to load persona from {file_path}: {e}")
+            logger.warning(f"Failed to load persona from {file_path}: {e}")
     
     return personas
 
@@ -255,4 +258,89 @@ JSON Requirements:
 - Field name is "text" NOT "translation"
 - Number of objects must match input lines
 - Speaker IDs must match exactly
+"""
+
+
+# Instructions inserted into refinement persona prompts.
+# These strings are *not* formatted with .format() (they are injected as-is into the persona template),
+# so they can safely include JSON braces and examples.
+
+ALTERNATIVE_VERSIONS_FULL = """
+# Alternative versions (required)
+For every line, produce 3 additional variants that preserve ALL facts and speaker intent:
+- very_short: noticeably shorter than "text" (tight, but still complete and natural)
+- short: slightly shorter than "text"
+- long: slightly longer than "text" (adds natural connective phrasing, but NO new facts)
+
+Constraints:
+- "text" stays closest to the original line's spoken length.
+- All variants must keep the same meaning and details; do not add or remove any concrete information.
+- Keep speaker IDs unchanged.
+"""
+
+ALTERNATIVE_VERSIONS_LONG_ONLY = """
+# Alternative versions (required)
+For every line, produce a "long" variant that is slightly longer than "text" while preserving ALL facts.
+
+Constraints:
+- "text" stays closest to the original line's spoken length.
+- "long" may add natural connective phrasing, but MUST NOT add new facts or omit details.
+- Keep speaker IDs unchanged.
+"""
+
+JSON_OUTPUT_FORMAT_FULL = r"""
+Return ONLY valid JSON (no markdown, no commentary, no code fences).
+
+Schema (all keys required):
+{
+  "translations": [
+    {
+      "speaker": "SPEAKER_ID",
+      "text": "refined line",
+      "very_short": "very short variant",
+      "short": "short variant",
+      "long": "long variant"
+    }
+  ]
+}
+
+Rules:
+- The number of items in "translations" MUST equal the number of input lines.
+- "speaker" MUST exactly match the corresponding input speaker for that line.
+- All fields MUST be strings (use "" if absolutely necessary; do not omit keys).
+
+Few-shot examples (structure only):
+Example 1 output:
+{"translations":[{"speaker":"SPEAKER_A","text":"A.","very_short":"A.","short":"A.","long":"Well, A."}]}
+
+Example 2 output:
+{"translations":[{"speaker":"SPEAKER_A","text":"We ship tomorrow.","very_short":"Ship tomorrow.","short":"We ship tomorrow.","long":"Alright, we ship tomorrow."},{"speaker":"SPEAKER_B","text":"Got it.","very_short":"OK.","short":"Got it.","long":"Yep, got it."}]}
+"""
+
+JSON_OUTPUT_FORMAT_LONG_ONLY = r"""
+Return ONLY valid JSON (no markdown, no commentary, no code fences).
+
+Schema (all keys required):
+{
+  "translations": [
+    {
+      "speaker": "SPEAKER_ID",
+      "text": "refined line",
+      "long": "long variant"
+    }
+  ]
+}
+
+Rules:
+- The number of items in "translations" MUST equal the number of input lines.
+- "speaker" MUST exactly match the corresponding input speaker for that line.
+- "long" should be slightly longer than "text" while preserving ALL facts (no new claims).
+- All fields MUST be strings (use "" if absolutely necessary; do not omit keys).
+
+Few-shot examples (structure only):
+Example 1 output:
+{"translations":[{"speaker":"SPEAKER_A","text":"Got it.","long":"Yes, got it."}]}
+
+Example 2 output:
+{"translations":[{"speaker":"SPEAKER_A","text":"We start at nine.","long":"Alright, we start at nine."},{"speaker":"SPEAKER_B","text":"Perfect.","long":"Perfect, that works."}]}
 """

@@ -32,16 +32,7 @@ Your goal is to take a potentially dense or technical conversation and transform
 - Answer the "Why should I care?" question
 - Preserve scientific accuracy while being accessible
 
-# Output Requirements:
-For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
-- "text": The primary, accessible translation, rephrased for a general audience (100% length of the original text).
-- "very_short": A highly condensed version (40-50% length of the original text) of the same speaker's message, focusing only on the most exciting core discovery.
-- "short": A condensed version (50-70% length of the original text) of the same speaker's message, highlighting the key "wow fact".
-- "long": A more detailed version (110-130% length of the original text) of the same speaker's message, elaborating on the underlying principle and real-world implications. This version MUST be at least as long as the original translated line; if needed, expand on the real-world implications to meet this length.
-
-These versions should:
-- Maintain the same speaker and be spoken in first person by that speaker.
-- Focus on clarity, engagement, and the real-world importance of the topic.
+{alternative_versions_section}
 
 # Context:
 - Domain: {domain} (but explain it for a layperson)
@@ -65,7 +56,7 @@ REMINDER: Your main goal is to spark curiosity and make complex topics understan
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. The length of the text will likely change.
 
-IMPORTANT: Respond with the ACCESSIBLE and REPHRASED conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys, corresponding to the new requirements. The number of objects in the array MUST match the number of lines in the input conversation.
+{json_output_format}
 
 DO NOT repeat or include the original text in your response - only provide the rephrased translation.
 

@@ -47,6 +47,9 @@ class ProjectConfig(BaseModel):
     comfortMaxAdjustmentRatio: Optional[float] = None
     minPauseDuration: Optional[float] = None
     preservePauseDuration: Optional[float] = None
+    segmentStretch: Optional[Literal["audio", "audio_and_video", "video"]] = None
+    videoSegmentSpeedMin: Optional[float] = None
+    videoSegmentSpeedMax: Optional[float] = None
 
 
 class ProjectConfigUpdate(BaseModel):
@@ -89,6 +92,9 @@ class ProjectConfigUpdate(BaseModel):
     comfortMaxAdjustmentRatio: Optional[float] = None
     minPauseDuration: Optional[float] = None
     preservePauseDuration: Optional[float] = None
+    segmentStretch: Optional[Literal["audio", "audio_and_video", "video"]] = None
+    videoSegmentSpeedMin: Optional[float] = None
+    videoSegmentSpeedMax: Optional[float] = None
 
 
 class ProjectCreate(BaseModel):
