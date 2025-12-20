@@ -59,6 +59,7 @@ PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "tts_fallback_model": "gemini-2.5-pro-preview-tts",
         "tts_prompt_prefix": "Speak with natural conversational energy, clear articulation:",
         "pause_removal": "cut",
+        "video_minterpolate_threshold": 1.0,  # Enable smooth slowdown for all slowdowns
     },
 }
 
@@ -117,7 +118,8 @@ def update_job_status(job_id: str, status: JobStatus, error_message: Optional[st
         if job:
             job.status = status
             if status == JobStatus.PROCESSING:
-                job.started_at = datetime.now(timezone.utc)
+                if job.started_at is None:
+                    job.started_at = datetime.now(timezone.utc)
             elif status in (JobStatus.COMPLETED, JobStatus.FAILED):
                 job.completed_at = datetime.now(timezone.utc)
             if error_message:
@@ -185,6 +187,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 raise ValueError(f"Project {project_id} not found")
             
             config_data = project.config or {}
+            auto_process_enabled = bool(config_data.get("autoProcess"))
             source_file = pm.get_source_video_path()
             
             # Debug: log config loaded from database
@@ -264,6 +267,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 # Processing settings
                 "max_workers": config_data.get("maxWorkers", 4),
+                # Video processing settings
+                "video_minterpolate_threshold": config_data.get("videoMinterpolateThreshold") or preset_config.get("video_minterpolate_threshold"),
                 "start_time": config_data.get("startTime"),
                 "duration": config_data.get("duration"),
             })
@@ -350,6 +355,15 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Save segments to database
             _save_segments_to_db(project_id, translated_segments)
+
+            # If requested, continue straight into final dubbing in the same job.
+            # This keeps the SSE stream alive and avoids a "pause" between stages.
+            if auto_process_enabled:
+                update_job_progress(job_id, 36, "handoff", "Transcription complete, starting dubbing")
+                result = dub_project(project_id, job_id)
+                if isinstance(result, dict):
+                    result.setdefault("segments_count", len(translated_segments))
+                return result
             
             update_job_progress(job_id, 100, "complete", f"Transcription complete: {len(translated_segments)} segments")
             
@@ -359,27 +373,6 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         # Update statuses
         update_job_status(job_id, JobStatus.COMPLETED)
         update_project_status(project_id, ProjectStatus.TRANSCRIBED)
-        
-        # Check if auto-process is enabled - automatically start dubbing
-        db = get_db_session()
-        try:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project and project.config and project.config.get("autoProcess"):
-                # Create a new job for dubbing
-                from ..database.models import JobType
-                dub_job = Job(
-                    project_id=project_id,
-                    type=JobType.DUBBING,
-                    status=JobStatus.PENDING,
-                )
-                db.add(dub_job)
-                db.commit()
-                dub_job_id = str(dub_job.id)
-                
-                # Start dubbing task
-                dub_project.delay(project_id, dub_job_id)
-        finally:
-            db.close()
         
         return {"status": "success", "segments_count": len(translated_segments)}
         
@@ -491,6 +484,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
+                # Video processing settings
+                "video_minterpolate_threshold": config_data.get("videoMinterpolateThreshold") or preset_config.get("video_minterpolate_threshold"),
                 # Translation settings (for any re-translation)
                 "translator_type": "llm",
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
@@ -566,7 +561,13 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Progress callback for grouping and overlay (70% to 74%)
             def grouping_progress(current: int, total: int, message: str = ""):
                 progress = 70 + int((current / total) * 4) if total > 0 else 70
-                update_job_progress(job_id, progress, "audio_grouping", message or "Adjusting segment timing...")
+                # Use the same "Label: current/total" format as background audio so the frontend renders a progress bar.
+                update_job_progress(
+                    job_id,
+                    progress,
+                    "audio_grouping",
+                    f"Adjusting segment timing: {current}/{total}" if total > 0 else "Adjusting segment timing",
+                )
             
             # Synthesize speech
             translated_audio_path = dubber.synthesize_speech(
@@ -884,4 +885,3 @@ def _segment_to_dubbing_format(segment: Segment) -> dict:
         "tts_prompt": segment.tts_prompt,
         "is_muted": segment.is_muted,
     }
-

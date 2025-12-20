@@ -10,6 +10,7 @@ from typing import Optional, List, Callable
 from pydub import AudioSegment
 from audio_separator.separator import Separator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from celery.exceptions import SoftTimeLimitExceeded
 
 from ..core.cache_manager import CacheManager
 from ..debug.performance_tracker import PerformanceTracker
@@ -119,20 +120,20 @@ class AudioProcessor:
             self.total_duration = None
     
     def process_background_audio(
-        self, 
-        audio_file: str, 
+        self,
+        audio_file: str,
         voice_denoising: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None
     ) -> Optional[str]:
         """Process and extract background audio if needed.
-        
+
         Args:
             audio_file: Path to the audio file
             voice_denoising: Whether to perform voice denoising
             progress_callback: Optional callback(current, total, message) for progress updates
             log_callback: Optional callback(message) for logging to external systems
-            
+
         Returns:
             Path to the background audio file or None
         """
@@ -142,19 +143,19 @@ class AudioProcessor:
                 log_callback(message)
         # Start timing
         self.performance_tracker.start_timing("background_audio")
-        
+
         if not voice_denoising:
             # No processing needed
             self.performance_tracker.end_timing("background_audio")
             return None
-        
+
         # Generate cache key
         cache_key = self.cache_manager.generate_cache_key(
             audio_file, "", "", ""  # Empty values for non-transcription cache
         )
-        
+
         step_name = "background_audio"
-        
+
         # Check if results are cached (check for WAV file directly)
         output_path = "artifacts/audio/background.wav"
         if self.cache_manager.load_file_from_cache(step_name, cache_key, f"{cache_key}.wav", output_path):
@@ -163,30 +164,44 @@ class AudioProcessor:
                 progress_callback(1, 1, "Loaded from cache")
             self.performance_tracker.end_timing("background_audio")
             return output_path
-        
-        log("Extracting background audio...")
-        
-        # Initialize audio separator
-        separator = Separator()
-        separator.load_model(model_filename='2_HP-UVR.pth')
-        
-        # Separate vocals and background with progress tracking
-        with tqdm_progress_callback(progress_callback, "Separating audio"):
-            output_file_paths = separator.separate(audio_file)[0]
-        
-        log("Audio separation complete")
-        
-        # Move the background audio to our audio directory
-        background_audio_path = "artifacts/audio/background.wav"
-        shutil.move(output_file_paths, background_audio_path)
-        
-        # Save to cache
-        self.cache_manager.save_file_to_cache(step_name, cache_key, background_audio_path, f"{cache_key}.wav")
-        
-        # End timing
-        self.performance_tracker.end_timing("background_audio")
-        
-        return background_audio_path
+
+        try:
+            log("Extracting background audio...")
+
+            # Initialize audio separator
+            separator = Separator()
+            separator.load_model(model_filename='2_HP-UVR.pth')
+
+            # Separate vocals and background with progress tracking
+            with tqdm_progress_callback(progress_callback, "Separating audio"):
+                output_file_paths = separator.separate(audio_file)[0]
+
+            log("Audio separation complete")
+
+            # Move the background audio to our audio directory
+            background_audio_path = "artifacts/audio/background.wav"
+            shutil.move(output_file_paths, background_audio_path)
+
+            # Save to cache
+            self.cache_manager.save_file_to_cache(step_name, cache_key, background_audio_path, f"{cache_key}.wav")
+
+            # End timing
+            self.performance_tracker.end_timing("background_audio")
+
+            return background_audio_path
+
+        except SoftTimeLimitExceeded:
+            # If background audio processing takes too long, skip it and continue
+            log("Background audio separation timed out - continuing without background audio")
+            logger.warning("Background audio separation exceeded time limit - skipping background audio")
+            self.performance_tracker.end_timing("background_audio")
+            return None
+        except Exception as e:
+            # If background audio processing fails for any reason, log and continue without it
+            log(f"Background audio separation failed: {str(e)} - continuing without background audio")
+            logger.warning(f"Background audio separation failed: {e} - skipping background audio")
+            self.performance_tracker.end_timing("background_audio")
+            return None
     
     def normalize_audio(self, audio_path: str, mode: str = "gentle") -> str:
         """Apply audio normalization with configurable gentleness.

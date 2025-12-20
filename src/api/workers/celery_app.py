@@ -24,19 +24,16 @@ def create_celery_app() -> Celery:
         result_serializer="json",
         timezone="UTC",
         enable_utc=True,
-        
+
         # Task execution settings
         task_track_started=True,
-        task_time_limit=3600 * 4,  # 4 hour hard limit
-        task_soft_time_limit=3600 * 3,  # 3 hour soft limit
-        
+
         # Result settings
         result_expires=86400,  # 24 hours
-        
+
         # Worker settings
         worker_prefetch_multiplier=1,  # One task at a time for resource-heavy tasks
-        worker_concurrency=2,  # Number of worker processes
-        
+
         # Task routes for different queues
         task_routes={
             "src.api.workers.tasks.transcribe_project": {"queue": "heavy"},
@@ -44,7 +41,7 @@ def create_celery_app() -> Celery:
             "src.api.workers.tasks.generate_preview": {"queue": "light"},
             "src.api.workers.tasks.rephrase_segment": {"queue": "light"},
         },
-        
+
         # Default queue
         task_default_queue="default",
     )

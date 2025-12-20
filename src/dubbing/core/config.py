@@ -106,6 +106,8 @@ class DubbingConfig:
                 'video_segment_speed_min': 0.75,  # Min video speed (slowdown limit with minterpolate)
                 'video_segment_speed_comfortable': 1.25,  # Comfortable speedup limit
                 'video_segment_speed_max': 1.5,  # Max video speedup
+                # Video quality settings
+                'video_minterpolate_threshold': 0.75,  # Speed threshold for smooth slowdown (< threshold uses minterpolate)
                 # Audio comfort zone for segment_stretch
                 'comfort_min_adjustment_ratio': 0.85,  # Audio slowdown comfort limit
                 'comfort_max_adjustment_ratio': 1.15,  # Audio speedup comfort limit

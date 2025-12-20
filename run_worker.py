@@ -14,7 +14,7 @@ if __name__ == "__main__":
     worker_args = [
         "worker",
         "--loglevel=INFO",
-        "--concurrency=2",
+        "--autoscale=8,1",  # Autoscale from 1 to 8 processes
         "-Q", "default,heavy,light",  # Process all queues
     ]
     

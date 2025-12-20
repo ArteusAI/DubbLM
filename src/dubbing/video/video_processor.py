@@ -5,7 +5,7 @@ import subprocess
 import json
 import tempfile
 import shutil
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 
 from ..debug.performance_tracker import PerformanceTracker
 from ..audio.audio_processor import AudioProcessor
@@ -16,14 +16,19 @@ logger = get_logger(__name__)
 
 class VideoProcessor:
     """Handles video processing for the Smart Dubbing system."""
-    
-    def __init__(self, performance_tracker: PerformanceTracker):
+
+    def __init__(self, performance_tracker: PerformanceTracker, config: Optional[Dict[str, Any]] = None):
         """Initialize the video processor.
-        
+
         Args:
             performance_tracker: Performance tracker instance
+            config: Optional configuration dict (DubbingConfig.config)
         """
         self.performance_tracker = performance_tracker
+        self.config = config or {}
+
+        # Extract video processing settings
+        self.video_minterpolate_threshold = self.config.get('video_minterpolate_threshold', 0.75)
     
     def _get_video_info(self, video_path: str) -> Dict[str, any]:
         """Get detailed video information including codec, bitrate, and other parameters.
@@ -1006,7 +1011,7 @@ class VideoProcessor:
                     video_path,
                     video_speed_segments,
                     temp_speed_video,
-                    video_min_speed=video_segment_speed_min,
+                    video_min_speed=self.video_minterpolate_threshold,
                     use_minterpolate_for_slowdown=True,
                     progress_callback=progress_callback,
                     log_callback=log_callback
@@ -1606,21 +1611,28 @@ class VideoProcessor:
         # Create temporary video with cuts (without audio)
         temp_video_path = "artifacts/temp_video_with_cuts.mp4"
         
-        # Create cuts command for video only
-        cuts_cmd = ["ffmpeg", "-y"]
-        
-        # Add multiple video inputs for each cut
-        for start, end in cuts_to_keep:
-            cuts_cmd.extend(["-ss", str(start), "-t", str(end - start), "-i", video_path])
-        
-        # Build concat filter for video cuts
-        video_streams = []
-        for i in range(len(cuts_to_keep)):
-            video_streams.append(f"[{i}:v:0]")
-        
-        cuts_filter = f"{''.join(video_streams)}concat=n={len(cuts_to_keep)}:v=1:a=0[outv]"
-        
-        cuts_cmd.extend(["-filter_complex", cuts_filter])
+        # Create cuts command for video only.
+        #
+        # IMPORTANT: Use filter trim+setpts on a single input instead of `-ss` before `-i` per segment.
+        # Fast input seeking snaps to keyframes/packet boundaries and can introduce small per-cut drift
+        # that accumulates over many cuts (visible desync near the end).
+        cuts_cmd = ["ffmpeg", "-y", "-i", video_path]
+
+        filter_parts: List[str] = []
+        video_labels: List[str] = []
+        for i, (start, end) in enumerate(cuts_to_keep):
+            start_s = f"{float(start):.6f}"
+            end_s = f"{float(end):.6f}"
+            filter_parts.append(
+                f"[0:v]trim=start={start_s}:end={end_s},setpts=PTS-STARTPTS[v{i}]"
+            )
+            video_labels.append(f"[v{i}]")
+
+        filter_parts.append(
+            f"{''.join(video_labels)}concat=n={len(cuts_to_keep)}:v=1:a=0[outv]"
+        )
+
+        cuts_cmd.extend(["-filter_complex", ";".join(filter_parts)])
         cuts_cmd.extend(["-map", "[outv]"])
         cuts_cmd.extend(["-c:v", "libx264", "-crf", "23", "-preset", "medium"])
         cuts_cmd.extend(["-an"])  # No audio
@@ -1763,25 +1775,33 @@ class VideoProcessor:
             
             logger.debug(f"Source audio: {sample_rate}Hz, {channels} channels")
             
-            # Build FFmpeg command to cut audio
-            cmd = ["ffmpeg", "-y"]
-            
-            # Add inputs for each cut segment
-            for start, end in cuts_to_keep:
-                cmd.extend(["-ss", str(start), "-t", str(end - start), "-i", audio_path])
-            
-            # Build concat filter for audio
-            if len(cuts_to_keep) > 1:
-                audio_streams = []
-                for i in range(len(cuts_to_keep)):
-                    audio_streams.append(f"[{i}:a:0]")
-                
-                concat_filter = f"{''.join(audio_streams)}concat=n={len(cuts_to_keep)}:v=0:a=1[outa]"
-                cmd.extend(["-filter_complex", concat_filter])
-                cmd.extend(["-map", "[outa]"])
+            # Build FFmpeg command to cut audio.
+            #
+            # IMPORTANT: Use atrim+asetpts on a single input instead of `-ss` before `-i` per segment.
+            # Fast seeking on audio can snap to packet boundaries; over many cuts this causes audible drift
+            # and desync with the cut video.
+            cmd = ["ffmpeg", "-y", "-i", audio_path]
+
+            filter_parts: List[str] = []
+            audio_labels: List[str] = []
+            for i, (start, end) in enumerate(cuts_to_keep):
+                start_s = f"{float(start):.6f}"
+                end_s = f"{float(end):.6f}"
+                filter_parts.append(
+                    f"[0:a]atrim=start={start_s}:end={end_s},asetpts=PTS-STARTPTS[a{i}]"
+                )
+                audio_labels.append(f"[a{i}]")
+
+            if len(audio_labels) > 1:
+                filter_parts.append(
+                    f"{''.join(audio_labels)}concat=n={len(audio_labels)}:v=0:a=1[outa]"
+                )
+                map_label = "[outa]"
             else:
-                # Single segment, no need for concat
-                cmd.extend(["-map", "0:a:0"])
+                map_label = audio_labels[0]
+
+            cmd.extend(["-filter_complex", ";".join(filter_parts)])
+            cmd.extend(["-map", map_label])
             
             # Audio encoding settings - use PCM WAV for better compatibility
             cmd.extend(["-c:a", "pcm_s16le", "-ar", str(sample_rate), "-ac", str(channels)])
@@ -2385,9 +2405,10 @@ class VideoProcessor:
         if not speed_segments:
             log("No segments require video speed adjustment")
             return video_path, []
-        
+
         log(f"Applying video speed adjustment to {len(speed_segments)} segments...")
-        
+        log(f"Minterpolate threshold: {video_min_speed}x (speeds below this use smooth frame interpolation)")
+
         # Get video info
         video_info = self._get_video_info(video_path)
         video_duration = self._get_video_duration(video_path)

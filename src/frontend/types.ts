@@ -40,6 +40,7 @@ export interface PresetConfig {
   useTwoPassEncoding?: boolean;
   maxWorkers?: number;
   pauseRemoval?: 'cut' | 'speedup' | 'disabled';
+  videoMinterpolateThreshold?: number;
 }
 
 export type ProjectStatus = 

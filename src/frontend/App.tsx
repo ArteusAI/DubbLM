@@ -355,15 +355,7 @@ const App: React.FC = () => {
 
           // Navigate based on status
           if (status === 'transcribed') {
-            // If autoProcess enabled, backend will auto-start dubbing
-            // Show processing view while waiting for dubbing to start
-            if (updatedProject.config?.autoProcess) {
-              setProcessingLogs([]);
-              setProcessingProgress(0);
-              setStep(AppStep.PROCESSING_DUBBING);
-            } else {
-              setStep(AppStep.EDITOR);
-            }
+            setStep(AppStep.EDITOR);
           } else if (status === 'dubbed') {
             // Clear autoProcess flag when complete
             await api.updateProjectConfig(activeProjectId, { autoProcess: false });
@@ -758,15 +750,49 @@ const App: React.FC = () => {
       setProcessingStep('Preparing...');
       setStep(AppStep.PROCESSING_TRANSCRIPTION);
 
-      // Save config
+      // Save full config (and auto-process end-to-end).
+      const cfg = activeProject.config;
       await api.updateProjectConfig(activeProject.id, {
-        sourceLang: activeProject.config.sourceLang,
-        targetLang: activeProject.config.targetLang,
-        personaId: activeProject.config.personaId,
-        speakerCount: activeProject.config.speakerCount,
-        keepBackground: activeProject.config.keepBackground,
-        pauseRemoval: activeProject.config.pauseRemoval,
-        preset: activeProject.config.preset,
+        sourceLang: cfg.sourceLang,
+        targetLang: cfg.targetLang,
+        personaId: cfg.personaId,
+        speakerCount: cfg.speakerCount,
+        keepBackground: cfg.keepBackground,
+        pauseRemoval: cfg.pauseRemoval,
+        preset: cfg.preset,
+        // Extra settings
+        startTime: cfg.startTime,
+        duration: cfg.duration,
+        transcriptionSystem: cfg.transcriptionSystem,
+        whisperModel: cfg.whisperModel,
+        llmProvider: cfg.llmProvider,
+        llmModelName: cfg.llmModelName,
+        llmTemperature: cfg.llmTemperature,
+        refinementLlmProvider: cfg.refinementLlmProvider,
+        refinementModelName: cfg.refinementModelName,
+        refinementTemperature: cfg.refinementTemperature,
+        translationPromptPrefix: cfg.translationPromptPrefix,
+        ttsSystem: cfg.ttsSystem,
+        ttsModel: cfg.ttsModel,
+        ttsPromptPrefix: cfg.ttsPromptPrefix,
+        voiceAutoSelection: cfg.voiceAutoSelection,
+        enableEmotionEnrichment: cfg.enableEmotionEnrichment,
+        dubbedVolume: cfg.dubbedVolume,
+        backgroundVolume: cfg.backgroundVolume,
+        useTwoPassEncoding: cfg.useTwoPassEncoding,
+        maxWorkers: cfg.maxWorkers,
+        postDiarizationMergeGap: cfg.postDiarizationMergeGap,
+        postTranslationMergeGap: cfg.postTranslationMergeGap,
+        maxSegmentDuration: cfg.maxSegmentDuration,
+        minSegmentDuration: cfg.minSegmentDuration,
+        comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
+        comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+        segmentStretch: cfg.segmentStretch,
+        videoSegmentSpeedMin: cfg.videoSegmentSpeedMin,
+        videoSegmentSpeedMax: cfg.videoSegmentSpeedMax,
+        minPauseDuration: cfg.minPauseDuration,
+        preservePauseDuration: cfg.preservePauseDuration,
+        autoProcess: true,
       });
 
       // Start transcription
@@ -791,7 +817,7 @@ const App: React.FC = () => {
       const project = mapProjectFromApi(projectData);
       
       setProjects(prev => prev.map(p => p.id === activeProjectId ? project : p));
-      setStep(AppStep.EDITOR);
+      setStep(project.status === 'dubbed' ? AppStep.RESULT : AppStep.EDITOR);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load transcription results');
     }
@@ -1202,7 +1228,7 @@ const App: React.FC = () => {
         {step === AppStep.PROCESSING_TRANSCRIPTION && activeProject && (
           <ProcessingView 
             title="Processing Video"
-            description="Extracting audio, transcribing speech, identifying speakers, and generating translations."
+            description="Transcribing, translating, synthesizing voices, and rendering the final dubbed video."
             projectId={activeProject.id}
             onComplete={handleTranscriptionComplete}
             logs={processingLogs}

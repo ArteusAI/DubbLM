@@ -388,20 +388,29 @@ class SmartDubbing:
             
             # For segment_stretch modes audio_and_video and video, pass segments with video speed requirements
             segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
-            segments_with_video_speed = None
+
+            # Filter segments that have video_speed_required set
+            segments_with_video_speed = []
             if segment_stretch_mode in ('audio_and_video', 'video'):
-                # Filter segments that have video_speed_required set
                 segments_with_video_speed = [
-                    seg for seg in segments_for_output 
+                    seg for seg in segments_for_output
                     if seg.get('video_speed_required') is not None
                 ]
                 if segments_with_video_speed:
                     logger.info(f"Passing {len(segments_with_video_speed)} segments with video speed requirements to video processor")
-            
+
             # pause_removal='speedup' only works with segment_stretch='audio'
             # For other modes, per-segment video speed adjustment handles timing
             effective_pause_removal = self.config.get('pause_removal', 'disabled')
-            if effective_pause_removal == 'speedup' and segment_stretch_mode != 'audio':
+
+            # CRITICAL: If using per-segment video speed adjustments, disable pause removal
+            # because pause removal would conflict with video speed timing
+            if len(segments_with_video_speed) > 0:
+                if effective_pause_removal != 'disabled':
+                    logger.info(f"pause_removal='{effective_pause_removal}' disabled because per-segment video speed adjustments are active "
+                               f"({len(segments_with_video_speed)} segments with video speed)")
+                effective_pause_removal = 'disabled'
+            elif effective_pause_removal == 'speedup' and segment_stretch_mode != 'audio':
                 logger.info(f"pause_removal='speedup' disabled because segment_stretch='{segment_stretch_mode}' "
                            f"(speedup only works with segment_stretch='audio')")
                 effective_pause_removal = 'cut'
@@ -2227,20 +2236,35 @@ class SmartDubbing:
                         except Exception as exc:
                             logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
                     
-                    # For audio_and_video mode: calculate video speed if ratio was outside comfort zone
-                    if segment_stretch_mode == 'audio_and_video':
-                        # Calculate remaining ratio after audio adjustment
-                        audio_adjusted_duration_ms = len(adjusted_group_audio)
-                        remaining_ratio = target_duration_ms / audio_adjusted_duration_ms if audio_adjusted_duration_ms > 0 else 1.0
-                        
-                        if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
-                            video_speed_for_group = self._calculate_video_speed_requirement(
-                                remaining_ratio, VIDEO_SEGMENT_SPEED_MIN, VIDEO_SEGMENT_SPEED_COMFORTABLE, VIDEO_SEGMENT_SPEED_MAX
-                            )
-                            logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
-                                        f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
-                                        f"video_speed={video_speed_for_group}")
-                
+                # Enforce allowed overflow beyond the group's original timeframe
+                # CRITICAL: Do this BEFORE video speed calculation so video speed is based on final audio length
+                overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 1.0))
+                overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
+
+                original_group_span_ms = target_duration_ms
+                adjusted_len_ms = len(adjusted_group_audio)
+                if adjusted_len_ms > original_group_span_ms:
+                    overflow_ms = adjusted_len_ms - original_group_span_ms
+                    allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
+                    if adjusted_len_ms > allowed_len_ms:
+                        adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
+
+                # Calculate final audio length after overflow trimming
+                final_group_duration_ms = len(adjusted_group_audio)
+
+                # For audio_and_video mode: calculate video speed using FINAL audio length (after trimming)
+                if segment_stretch_mode == 'audio_and_video':
+                    # Calculate remaining ratio using final audio duration
+                    remaining_ratio = target_duration_ms / final_group_duration_ms if final_group_duration_ms > 0 else 1.0
+
+                    if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
+                        video_speed_for_group = self._calculate_video_speed_requirement(
+                            remaining_ratio, VIDEO_SEGMENT_SPEED_MIN, VIDEO_SEGMENT_SPEED_COMFORTABLE, VIDEO_SEGMENT_SPEED_MAX
+                        )
+                        logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
+                                    f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
+                                    f"final_duration={final_group_duration_ms}ms, video_speed={video_speed_for_group}")
+
                 # Set video_speed_required on all segments in this group
                 if video_speed_for_group is not None:
                     logger.info(f"Group {speaker}_{group_idx} requires video speed adjustment: {video_speed_for_group:.2f}x "
@@ -2252,21 +2276,6 @@ class SmartDubbing:
                     first_segment['video_speed_required'] = video_speed_for_group
                     first_segment['video_sync_start'] = first_segment['start']  # Group start
                     first_segment['video_sync_end'] = last_segment['end']       # Group end
-                
-                # Enforce allowed overflow beyond the group's original timeframe
-                overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 1.0))
-                overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
-
-                original_group_span_ms = target_duration_ms
-                adjusted_len_ms = len(adjusted_group_audio)
-                if adjusted_len_ms > original_group_span_ms:
-                    overflow_ms = adjusted_len_ms - original_group_span_ms
-                    allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
-                    if adjusted_len_ms > allowed_len_ms:
-                        adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
-                
-                # Calculate real segment positions after speed adjustment
-                final_group_duration_ms = len(adjusted_group_audio)
                 position_ms = int(group_start_time_ms)
                 
                 for seg_pos in group_segment_positions:

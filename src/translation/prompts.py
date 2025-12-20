@@ -273,7 +273,8 @@ For every line, produce 3 additional variants that preserve ALL facts and speake
 - long: slightly longer than "text" (adds natural connective phrasing, but NO new facts)
 
 Constraints:
-- "text" stays closest to the original line's spoken length.
+- "text" is the refined, naturally rephrased version optimized for understanding and native fluency in the target language.
+- You may rephrase text across consecutive blocks in the translations list if it makes the dialogue flow more naturally or improves comprehension in the target language.
 - All variants must keep the same meaning and details; do not add or remove any concrete information.
 - Keep speaker IDs unchanged.
 """
@@ -283,7 +284,8 @@ ALTERNATIVE_VERSIONS_LONG_ONLY = """
 For every line, produce a "long" variant that is slightly longer than "text" while preserving ALL facts.
 
 Constraints:
-- "text" stays closest to the original line's spoken length.
+- "text" is the refined, naturally rephrased version optimized for understanding and native fluency in the target language.
+- You may rephrase text across consecutive blocks in the translations list if it makes the dialogue flow more naturally or improves comprehension in the target language.
 - "long" may add natural connective phrasing, but MUST NOT add new facts or omit details.
 - Keep speaker IDs unchanged.
 """

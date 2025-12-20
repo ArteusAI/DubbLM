@@ -143,5 +143,6 @@ export const PRESETS: PresetConfig[] = [
     useTwoPassEncoding: true,
     maxWorkers: 4,
     pauseRemoval: 'cut',
+    videoMinterpolateThreshold: 1.0,
   },
 ];
