@@ -608,10 +608,12 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             segment_stretch_mode = dubbing_config.get("segment_stretch", "audio_and_video")
             segments_with_video_speed = None
             if segment_stretch_mode in ("audio_and_video", "video"):
-                segments_with_video_speed = [
-                    seg for seg in segments_data 
-                    if seg.get("video_speed_required") is not None
-                ]
+                segments_with_video_speed = getattr(dubber, "video_speed_segments", None)
+                if segments_with_video_speed is None:
+                    segments_with_video_speed = [
+                        seg for seg in segments_data 
+                        if seg.get("video_speed_required") is not None
+                    ]
             
             # Determine effective pause removal (speedup only works with segment_stretch=audio)
             effective_pause_removal = dubbing_config.get("pause_removal", "disabled")

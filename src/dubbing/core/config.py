@@ -111,6 +111,9 @@ class DubbingConfig:
                 # Audio comfort zone for segment_stretch
                 'comfort_min_adjustment_ratio': 0.85,  # Audio slowdown comfort limit
                 'comfort_max_adjustment_ratio': 1.15,  # Audio speedup comfort limit
+                # Conservative audio comfort zone for audio_and_video/video overlay modes
+                'overlay_comfort_min_adjustment_ratio': 0.9,
+                'overlay_comfort_max_adjustment_ratio': 1.1,
                 # TTS grouping
                 'group_overflow_tolerance': 1.0,
             }

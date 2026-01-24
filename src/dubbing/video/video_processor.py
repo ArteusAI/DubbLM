@@ -1005,6 +1005,15 @@ class VideoProcessor:
             # Create temporary video with per-segment speed adjustments
             temp_speed_video = "artifacts/temp_per_segment_speed_video.mp4"
             temp_files_to_cleanup.append(temp_speed_video)
+            target_audio_duration = 0.0
+            try:
+                target_audio_duration = self._get_video_duration(normalized_translated_audio_path)
+                if background_audio_path:
+                    bg_duration = self._get_video_duration(background_audio_path)
+                    if bg_duration > target_audio_duration:
+                        target_audio_duration = bg_duration
+            except Exception as exc:
+                logger.warning(f"Unable to determine target audio duration: {exc}")
             
             try:
                 _, speed_adjustments = self._apply_per_segment_video_speed(
@@ -1013,6 +1022,7 @@ class VideoProcessor:
                     temp_speed_video,
                     video_min_speed=self.video_minterpolate_threshold,
                     use_minterpolate_for_slowdown=True,
+                    target_duration=target_audio_duration if target_audio_duration > 0 else None,
                     progress_callback=progress_callback,
                     log_callback=log_callback
                 )
@@ -2372,6 +2382,7 @@ class VideoProcessor:
         output_path: str,
         video_min_speed: float = 0.75,
         use_minterpolate_for_slowdown: bool = True,
+        target_duration: Optional[float] = None,
         progress_callback: Optional[callable] = None,
         log_callback: Optional[callable] = None
     ) -> Tuple[str, List[Dict[str, float]]]:
@@ -2516,26 +2527,41 @@ class VideoProcessor:
         filter_parts.append(
             f"{concat_audio}concat=n={n_segments}:v=0:a=1[outa]"
         )
-        
+
+        # Calculate expected output duration for progress tracking
+        total_output_duration = sum(
+            (seg["end"] - seg["start"]) / seg["speed_factor"]
+            for seg in full_speed_segments
+        )
+
+        video_out_label = "[outv]"
+        audio_out_label = "[outa]"
+        if target_duration and target_duration > total_output_duration + 0.05:
+            pad_duration = target_duration - total_output_duration
+            filter_parts.append(
+                f"{video_out_label}tpad=stop_mode=clone:stop_duration={pad_duration}[outv_pad]"
+            )
+            filter_parts.append(
+                f"{audio_out_label}apad=pad_dur={pad_duration}[outa_pad]"
+            )
+            video_out_label = "[outv_pad]"
+            audio_out_label = "[outa_pad]"
+            total_output_duration = target_duration
+            log(f"Padding speed-adjusted video by {pad_duration:.2f}s to match audio duration")
+
         filter_complex = ";".join(filter_parts)
         
         # Build FFmpeg command
         cmd = [
             "ffmpeg", "-y", "-i", video_path,
             "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "[outa]",
+            "-map", video_out_label, "-map", audio_out_label,
             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
             "-c:a", "aac", "-b:a", "192k",
             output_path
         ]
         
         logger.debug(f"Creating per-segment speed video: {' '.join(cmd)}")
-        
-        # Calculate expected output duration for progress tracking
-        total_output_duration = sum(
-            (seg["end"] - seg["start"]) / seg["speed_factor"]
-            for seg in full_speed_segments
-        )
         
         try:
             self._run_ffmpeg_with_progress(

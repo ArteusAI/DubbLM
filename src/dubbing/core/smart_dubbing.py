@@ -125,6 +125,8 @@ class SmartDubbing:
         
         # Initialize real segment positions for pause removal
         self.real_segment_positions = []
+        # Track per-group video speed adjustments for sync in overlay modes
+        self.video_speed_segments = None
         
         # Initialize pause adjustments for subtitle timing
         self.pause_adjustments = []
@@ -173,6 +175,17 @@ class SmartDubbing:
             removed = len(segments) - len(filtered)
             logger.debug(f"Speaker filter applied: muted={sorted(self.muted_speakers)} removed={removed} kept={len(filtered)}")
         return filtered
+
+    def _get_audio_comfort_range(self, segment_stretch_mode: str) -> Tuple[float, float]:
+        """Return the effective audio comfort range for the given stretch mode."""
+        opt_cfg = self.config.get('segments_optimization', {})
+        base_min = opt_cfg.get('comfort_min_adjustment_ratio', 0.85)
+        base_max = opt_cfg.get('comfort_max_adjustment_ratio', 1.15)
+        if segment_stretch_mode in ("audio_and_video", "video"):
+            conservative_min = opt_cfg.get('overlay_comfort_min_adjustment_ratio', 0.9)
+            conservative_max = opt_cfg.get('overlay_comfort_max_adjustment_ratio', 1.1)
+            return max(base_min, conservative_min), min(base_max, conservative_max)
+        return base_min, base_max
     
     def _initialize_translator(self) -> None:
         """Initialize translator based on configuration."""
@@ -392,10 +405,13 @@ class SmartDubbing:
             # Filter segments that have video_speed_required set
             segments_with_video_speed = []
             if segment_stretch_mode in ('audio_and_video', 'video'):
-                segments_with_video_speed = [
-                    seg for seg in segments_for_output
-                    if seg.get('video_speed_required') is not None
-                ]
+                if self.video_speed_segments is not None:
+                    segments_with_video_speed = self.video_speed_segments
+                else:
+                    segments_with_video_speed = [
+                        seg for seg in segments_for_output
+                        if seg.get('video_speed_required') is not None
+                    ]
                 if segments_with_video_speed:
                     logger.info(f"Passing {len(segments_with_video_speed)} segments with video speed requirements to video processor")
 
@@ -965,12 +981,12 @@ class SmartDubbing:
         # Define comfort ratio constants
         # Allow comfort zone override from config (optionally language-specific)
         segments_opt = self.config.get('segments_optimization', {})
-        COMFORT_MIN_ADJUSTMENT_RATIO = segments_opt.get('comfort_min_adjustment_ratio', 0.85)
-        COMFORT_MAX_ADJUSTMENT_RATIO = segments_opt.get('comfort_max_adjustment_ratio', 1.15)
-        use_enriched_for_tts = self.config.get('enable_emotion_enrichment', False)
-        
         # Segment stretch mode: audio | audio_and_video | video
         segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
+        COMFORT_MIN_ADJUSTMENT_RATIO, COMFORT_MAX_ADJUSTMENT_RATIO = self._get_audio_comfort_range(
+            segment_stretch_mode
+        )
+        use_enriched_for_tts = self.config.get('enable_emotion_enrichment', False)
         
         # Video segment speed limits for segment_stretch modes
         VIDEO_SEGMENT_SPEED_MIN = segments_opt.get('video_segment_speed_min', 0.75)
@@ -1413,31 +1429,16 @@ class SmartDubbing:
                     actual_dur_after = segment_dict.get('synthesized_speech_len', actual_dur)
                     ratio_after = original_dur / actual_dur_after if actual_dur_after > 0 else 1.0
                     
-                    # If still outside comfort zone, calculate video speed requirement
+                    # If still outside comfort zone, defer to group-level video adjustment
                     if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio_after <= COMFORT_MAX_ADJUSTMENT_RATIO):
-                        video_speed = max(min(ratio_after, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        if video_speed is not None:
-                            segment_dict['video_speed_required'] = video_speed
-                            segment_dict['video_sync_start'] = segment_dict['start']
-                            segment_dict['video_sync_end'] = segment_dict['end']
-                            logger.info(
-                                f"Video speed adjustment required: {video_speed:.2f}x "
-                                f"(ratio after audio: {ratio_after:.2f})"
-                            )
+                        logger.info(
+                            f"Segment remains outside comfort zone after audio adjustment "
+                            f"(ratio after audio: {ratio_after:.2f}); deferring to group-level video sync"
+                        )
                     
                 elif segment_stretch_mode == 'video':
                     # Mode: video - no audio speed changes, only video speed adjustment
-                    logger.info("Mode 'video': Using video speed adjustment only (no audio resynthesis)...")
-                    
-                    # Calculate video speed requirement directly from current ratio
-                    video_speed = max(min(ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                    if abs(video_speed - 1.0) > 0.01:
-                        segment_dict['video_speed_required'] = video_speed
-                        segment_dict['video_sync_start'] = segment_dict['start']
-                        segment_dict['video_sync_end'] = segment_dict['end']
-                        logger.info(
-                            f"Video speed adjustment required: {video_speed:.2f}x (ratio: {ratio:.2f})"
-                        )
+                    logger.info("Mode 'video': Deferring video speed adjustment to group-level overlay...")
             else:
                 # Estimation was accurate - within comfort zone
                 with metadata_lock:
@@ -1982,14 +1983,16 @@ class SmartDubbing:
         logger.info("Grouping segments by speaker and optimizing timing...")
 
         segment_stretch_mode = self.config.get("segment_stretch", "audio_and_video")
+        self.video_speed_segments = []
 
         # Get parameters from config
         opt_cfg = self.config.get('segments_optimization', {})
         SPLITTING_PAUSE_THRESHOLD_SECONDS = opt_cfg.get('post_translation_merge_gap', 1.5)
         MAX_GROUP_DURATION_SECONDS = opt_cfg.get('max_segment_duration', 60)
         
-        LIMIT_MIN_ADJUSTMENT_RATIO = opt_cfg.get('comfort_min_adjustment_ratio', 0.85)
-        LIMIT_MAX_ADJUSTMENT_RATIO = opt_cfg.get('comfort_max_adjustment_ratio', 1.15)
+        LIMIT_MIN_ADJUSTMENT_RATIO, LIMIT_MAX_ADJUSTMENT_RATIO = self._get_audio_comfort_range(
+            segment_stretch_mode
+        )
         
         # Video speed limits for segment_stretch modes
         VIDEO_SEGMENT_SPEED_MIN = opt_cfg.get('video_segment_speed_min', 0.75)
@@ -2014,8 +2017,11 @@ class SmartDubbing:
         
         # Track progress through groups
         processed_groups = 0
-        
-        # Process each speaker's segments separately
+
+        group_entries = []
+        speaker_group_counts: Dict[str, int] = {}
+
+        # Build groups per speaker first
         for speaker in sorted(all_speakers):
             # Get segments for this speaker with their original indices
             speaker_segments = [(idx, segment) for idx, segment in enumerate(segments) if segment["speaker"] == speaker]
@@ -2051,188 +2057,228 @@ class SmartDubbing:
                 speaker_groups.append(current_group)
             
             logger.debug(f"Divided speaker {speaker} into {len(speaker_groups)} continuous groups")
+            speaker_group_counts[speaker] = len(speaker_groups)
             
             # Store groups information for debug (extract just segments without indices)
             if self.config.get('debug_info', False):
                 speaker_groups_info[speaker] = [[seg for _, seg in group] for group in speaker_groups]
                 self.debug_data["speaker_groups"] = speaker_groups_info
             
-            # Process each group for this speaker
             for group_idx, group in enumerate(speaker_groups):
                 group_start_time_ms = group[0][1]["start"] * 1000
                 group_end_time_ms = group[-1][1]["end"] * 1000
-                target_duration_ms = int(group_end_time_ms - group_start_time_ms)
+                group_entries.append({
+                    "speaker": speaker,
+                    "group_idx": group_idx,
+                    "group": group,
+                    "start_ms": group_start_time_ms,
+                    "end_ms": group_end_time_ms,
+                    "speaker_group_count": speaker_group_counts[speaker],
+                })
+
+        # Process groups in chronological order to apply cumulative video offsets
+        group_entries.sort(key=lambda entry: (entry["start_ms"], entry["end_ms"], entry["speaker"]))
+        cumulative_offset_ms = 0.0
+
+        for entry in group_entries:
+            speaker = entry["speaker"]
+            group_idx = entry["group_idx"]
+            group = entry["group"]
+            group_start_time_ms = entry["start_ms"]
+            group_end_time_ms = entry["end_ms"]
+            target_duration_ms = int(group_end_time_ms - group_start_time_ms)
+
+            # Combine all synthesized audio in this group
+            combined_group_audio = AudioSegment.empty()
+            group_segment_positions = []  # Track individual segment positions within the group
+            
+            for i, (orig_idx, segment) in enumerate(group):
+                # Add pause between segments if not the first segment
+                segment_start_in_group_ms = len(combined_group_audio)
                 
-                # Combine all synthesized audio in this group
-                combined_group_audio = AudioSegment.empty()
-                group_segment_positions = []  # Track individual segment positions within the group
+                if i > 0:
+                    _, prev_segment = group[i-1]
+                    prev_segment_end = prev_segment["end"]
+                    current_segment_start = segment["start"]
+                    pause_duration_ms = int((current_segment_start - prev_segment_end) * 1000)
+                    if pause_duration_ms > 0:
+                        combined_group_audio += AudioSegment.silent(duration=pause_duration_ms)
+                        segment_start_in_group_ms = len(combined_group_audio)
                 
-                for i, (orig_idx, segment) in enumerate(group):
-                    # Add pause between segments if not the first segment
-                    segment_start_in_group_ms = len(combined_group_audio)
-                    
-                    if i > 0:
-                        _, prev_segment = group[i-1]
-                        prev_segment_end = prev_segment["end"]
-                        current_segment_start = segment["start"]
-                        pause_duration_ms = int((current_segment_start - prev_segment_end) * 1000)
-                        if pause_duration_ms > 0:
-                            combined_group_audio += AudioSegment.silent(duration=pause_duration_ms)
-                            segment_start_in_group_ms = len(combined_group_audio)
-                    
-                    # Load segment audio
-                    segment_file = segment.get('synthesized_speech_file') or f"artifacts/audio_chunks/{orig_idx}.wav"
-                    if os.path.exists(segment_file):
-                        segment_audio = AudioSegment.from_file(segment_file)
-                    else:
-                        # Fallback: create silence with original duration
-                        duration_ms = int((segment["end"] - segment["start"]) * 1000)
-                        segment_audio = AudioSegment.silent(duration=duration_ms)
-                    
-                    combined_group_audio += segment_audio
-                    segment_end_in_group_ms = len(combined_group_audio)
-                    
-                    # Store the segment position within the group (before speed adjustment)
-                    group_segment_positions.append({
-                        "segment": segment,
-                        "start_in_group_ms": segment_start_in_group_ms,
-                        "end_in_group_ms": segment_end_in_group_ms,
-                        "original_index": orig_idx
-                    })
-                
-                # Calculate required speed adjustment for the entire group
-                actual_duration_ms = len(combined_group_audio)
-                ratio = target_duration_ms / actual_duration_ms if actual_duration_ms > 0 else 1.0
-                original_ratio = ratio  # Keep original ratio for video speed calculation
-                
-                # Handle based on segment_stretch mode
-                adjusted_group_audio = combined_group_audio
-                video_speed_for_group = None
-                
-                if segment_stretch_mode == 'video':
-                    # Video-only mode: no audio stretching, calculate video speed from original ratio
-                    ratio_clamped = 1.0  # No audio stretching
-                    if abs(ratio - 1.0) > 0.01:
-                        video_speed_for_group = max(min(ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        logger.debug(f"Group {speaker}_{group_idx}: video-only mode, video_speed={video_speed_for_group}")
-                elif segment_stretch_mode == 'audio':
-                    # Audio-only mode: stretch to exact fit without clamping
-                    # Resynthesis already picked the best variant closest to comfort zone
-                    ratio_clamped = ratio
-                    logger.debug(f"Group {speaker}_{group_idx}: audio-only mode, ratio={ratio:.2f} (no clamping)")
+                # Load segment audio
+                segment_file = segment.get('synthesized_speech_file') or f"artifacts/audio_chunks/{orig_idx}.wav"
+                if os.path.exists(segment_file):
+                    segment_audio = AudioSegment.from_file(segment_file)
                 else:
-                    # audio_and_video mode: clamp audio stretching, remaining handled by video speed
-                    ratio_clamped = min(max(ratio, LIMIT_MIN_ADJUSTMENT_RATIO), LIMIT_MAX_ADJUSTMENT_RATIO)
+                    # Fallback: create silence with original duration
+                    duration_ms = int((segment["end"] - segment["start"]) * 1000)
+                    segment_audio = AudioSegment.silent(duration=duration_ms)
+                
+                combined_group_audio += segment_audio
+                segment_end_in_group_ms = len(combined_group_audio)
+                
+                # Store the segment position within the group (before speed adjustment)
+                group_segment_positions.append({
+                    "segment": segment,
+                    "start_in_group_ms": segment_start_in_group_ms,
+                    "end_in_group_ms": segment_end_in_group_ms,
+                    "original_index": orig_idx
+                })
+            
+            # Calculate required speed adjustment for the entire group
+            actual_duration_ms = len(combined_group_audio)
+            ratio = target_duration_ms / actual_duration_ms if actual_duration_ms > 0 else 1.0
+            original_ratio = ratio  # Keep original ratio for video speed calculation
+            
+            # Handle based on segment_stretch mode
+            adjusted_group_audio = combined_group_audio
+            video_speed_for_group = None
+            
+            if segment_stretch_mode == 'video':
+                # Video-only mode: no audio stretching, calculate video speed from original ratio
+                ratio_clamped = 1.0  # No audio stretching
+                if abs(ratio - 1.0) > 0.01:
+                    video_speed_for_group = max(min(ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
+                    logger.debug(f"Group {speaker}_{group_idx}: video-only mode, video_speed={video_speed_for_group}")
+            elif segment_stretch_mode == 'audio':
+                # Audio-only mode: stretch to exact fit without clamping
+                # Resynthesis already picked the best variant closest to comfort zone
+                ratio_clamped = ratio
+                logger.debug(f"Group {speaker}_{group_idx}: audio-only mode, ratio={ratio:.2f} (no clamping)")
+            else:
+                # audio_and_video mode: clamp audio stretching, remaining handled by video speed
+                ratio_clamped = min(max(ratio, LIMIT_MIN_ADJUSTMENT_RATIO), LIMIT_MAX_ADJUSTMENT_RATIO)
+                
+            if segment_stretch_mode in ('audio', 'audio_and_video') and abs(ratio_clamped - 1.0) > 0.01:
+                try:
+                    tmp_in = f"artifacts/audio_chunks/group_{speaker}_{group_idx}.wav"
+                    tmp_out = f"artifacts/su_audio_chunks/group_{speaker}_{group_idx}.wav"
+                    os.makedirs(os.path.dirname(tmp_out), exist_ok=True)
+                    combined_group_audio.export(tmp_in, format="wav")
                     
-                if segment_stretch_mode in ('audio', 'audio_and_video') and abs(ratio_clamped - 1.0) > 0.01:
-                    try:
-                        tmp_in = f"artifacts/audio_chunks/group_{speaker}_{group_idx}.wav"
-                        tmp_out = f"artifacts/su_audio_chunks/group_{speaker}_{group_idx}.wav"
-                        os.makedirs(os.path.dirname(tmp_out), exist_ok=True)
-                        combined_group_audio.export(tmp_in, format="wav")
-                        
-                        if self.config.get('debug_info', False):
-                            for orig_idx, segment in group:
-                                self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
-                        
-                        tempo = 1.0 / ratio_clamped
-                        success = self.time_stretcher.stretch(tmp_in, tmp_out, tempo)
-                        
-                        if success:
-                            adjusted_group_audio = AudioSegment.from_file(tmp_out)
-                        else:
-                            logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}")
-                    except Exception as exc:
-                        logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
-                
-                # Enforce allowed overflow beyond the group's original timeframe
-                # Skip for audio-only mode since we stretch to exact fit
-                if segment_stretch_mode != 'audio':
-                    overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 0.5))
-                    overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
-
-                    original_group_span_ms = target_duration_ms
-                    adjusted_len_ms = len(adjusted_group_audio)
-                    if adjusted_len_ms > original_group_span_ms:
-                        overflow_ms = adjusted_len_ms - original_group_span_ms
-                        allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
-                        if adjusted_len_ms > allowed_len_ms:
-                            adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
-
-                # Calculate final audio length after overflow trimming
-                final_group_duration_ms = len(adjusted_group_audio)
-
-                # For audio_and_video mode: calculate video speed using FINAL audio length (after trimming)
-                if segment_stretch_mode == 'audio_and_video':
-                    # Calculate remaining ratio using final audio duration
-                    remaining_ratio = target_duration_ms / final_group_duration_ms if final_group_duration_ms > 0 else 1.0
-
-                    if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
-                        video_speed_for_group = max(min(remaining_ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
-                                    f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
-                                    f"final_duration={final_group_duration_ms}ms, video_speed={video_speed_for_group}")
-
-                # Set video_speed_required on all segments in this group
-                if video_speed_for_group is not None:
-                    logger.info(f"Group {speaker}_{group_idx} requires video speed adjustment: {video_speed_for_group:.2f}x "
-                               f"(segments {group[0][0]+1}-{group[-1][0]+1})")
-                    # Only the first segment in the group gets the video speed marker
-                    # with group boundaries to avoid gaps being processed at 1.0x speed
-                    _, first_segment = group[0]
-                    last_orig__idx, last_segment = group[-1]
-                    first_segment['video_speed_required'] = video_speed_for_group
-                    first_segment['video_sync_start'] = first_segment['start']  # Group start
-                    first_segment['video_sync_end'] = last_segment['end']       # Group end
+                    if self.config.get('debug_info', False):
+                        for orig_idx, segment in group:
+                            self.debug_data.setdefault("speed_ratios", {})[orig_idx] = ratio_clamped
                     
-                position_ms = int(group_start_time_ms)
-                
-                for seg_pos in group_segment_positions:
-                    # Apply speed ratio to get actual positions in final audio
-                    real_start_ms = position_ms + (seg_pos["start_in_group_ms"] * ratio_clamped)
-                    real_end_ms = position_ms + (seg_pos["end_in_group_ms"] * ratio_clamped)
-                    # Clamp to the trimmed group end if overflow was restricted
-                    group_final_end_ms = position_ms + final_group_duration_ms
-                    if real_end_ms > group_final_end_ms:
-                        real_end_ms = group_final_end_ms
-                    if real_start_ms > group_final_end_ms:
-                        real_start_ms = group_final_end_ms
+                    tempo = 1.0 / ratio_clamped
+                    success = self.time_stretcher.stretch(tmp_in, tmp_out, tempo)
                     
-                    real_segment_positions.append({
-                        "start": real_start_ms / 1000.0,
-                        "end": real_end_ms / 1000.0,
-                        "speaker": seg_pos["segment"]["speaker"],
-                        "text": seg_pos["segment"]["text"],
-                        "translation": seg_pos["segment"]["translation"],
-                        "original_index": seg_pos["original_index"],
-                        "original_start": seg_pos["segment"]["start"],
-                        "original_end": seg_pos["segment"]["end"]
-                    })
+                    if success:
+                        adjusted_group_audio = AudioSegment.from_file(tmp_out)
+                    else:
+                        logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}")
+                except Exception as exc:
+                    logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
+            
+            # Enforce allowed overflow beyond the group's original timeframe
+            # Skip for audio-only mode since we stretch to exact fit
+            if segment_stretch_mode != 'audio':
+                overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 0.5))
+                overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
+
+                original_group_span_ms = target_duration_ms
+                adjusted_len_ms = len(adjusted_group_audio)
+                if adjusted_len_ms > original_group_span_ms:
+                    overflow_ms = adjusted_len_ms - original_group_span_ms
+                    allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
+                    if adjusted_len_ms > allowed_len_ms:
+                        adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
+
+            # Calculate final audio length after overflow trimming
+            final_group_duration_ms = len(adjusted_group_audio)
+
+            # For audio_and_video mode: calculate video speed using FINAL audio length (after trimming)
+            if segment_stretch_mode == 'audio_and_video':
+                # Calculate remaining ratio using final audio duration
+                remaining_ratio = target_duration_ms / final_group_duration_ms if final_group_duration_ms > 0 else 1.0
+
+                if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
+                    video_speed_for_group = max(min(remaining_ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
+                    logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
+                                f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
+                                f"final_duration={final_group_duration_ms}ms, video_speed={video_speed_for_group}")
+
+            # Clear any existing per-segment speed markers in overlay modes
+            if segment_stretch_mode in ('audio_and_video', 'video'):
+                for _, seg in group:
+                    seg.pop('video_speed_required', None)
+                    seg.pop('video_sync_start', None)
+                    seg.pop('video_sync_end', None)
+
+            # Set video_speed_required on all segments in this group
+            if video_speed_for_group is not None:
+                logger.info(f"Group {speaker}_{group_idx} requires video speed adjustment: {video_speed_for_group:.2f}x "
+                           f"(segments {group[0][0]+1}-{group[-1][0]+1})")
+                # Only the first segment in the group gets the video speed marker
+                # with group boundaries to avoid gaps being processed at 1.0x speed
+                _, first_segment = group[0]
+                last_orig__idx, last_segment = group[-1]
+                first_segment['video_speed_required'] = video_speed_for_group
+                first_segment['video_sync_start'] = first_segment['start']  # Group start
+                first_segment['video_sync_end'] = last_segment['end']       # Group end
+                self.video_speed_segments.append({
+                    "video_speed_required": video_speed_for_group,
+                    "video_sync_start": first_segment['start'],
+                    "video_sync_end": last_segment['end'],
+                    "start": first_segment['start'],
+                    "end": last_segment['end'],
+                })
                 
-                # Place the adjusted group at the correct position in the speaker's track
-                speaker_track = speaker_tracks[speaker]
+            if segment_stretch_mode in ('audio_and_video', 'video'):
+                position_ms = max(0, int(round(group_start_time_ms - cumulative_offset_ms)))
+            else:
+                position_ms = int(round(group_start_time_ms))
+            
+            for seg_pos in group_segment_positions:
+                # Apply speed ratio to get actual positions in final audio
+                real_start_ms = position_ms + (seg_pos["start_in_group_ms"] * ratio_clamped)
+                real_end_ms = position_ms + (seg_pos["end_in_group_ms"] * ratio_clamped)
+                # Clamp to the trimmed group end if overflow was restricted
+                group_final_end_ms = position_ms + final_group_duration_ms
+                if real_end_ms > group_final_end_ms:
+                    real_end_ms = group_final_end_ms
+                if real_start_ms > group_final_end_ms:
+                    real_start_ms = group_final_end_ms
                 
-                # Extend track if needed
-                if position_ms + len(adjusted_group_audio) > len(speaker_track):
-                    extension = position_ms + len(adjusted_group_audio) - len(speaker_track)
-                    speaker_track += AudioSegment.silent(duration=extension)
-                
-                # Overlay the adjusted group audio at the correct position
-                speaker_tracks[speaker] = speaker_track.overlay(
-                    adjusted_group_audio,
-                    position=position_ms
-                )
-                
-                from src.utils.time_utils import format_seconds_to_srt
-                duration_ms = len(adjusted_group_audio)
-                duration_minutes = duration_ms / (1000 * 60)
-                logger.debug(f"Processed group {group_idx+1}/{len(speaker_groups)} for speaker {speaker}: "
-                      f"{len(group)} segments, Speed ratio: {ratio_clamped:.2f}, "
-                      f"Time: {format_seconds_to_srt(group_start_time_ms / 1000)}-{format_seconds_to_srt((group_start_time_ms + duration_ms) / 1000)}, "
-                      f"Duration: {duration_minutes:.2f} minutes")
-                
-                # Update progress (report only at 25%, 50%, 75% milestones)
-                processed_groups += 1
+                real_segment_positions.append({
+                    "start": real_start_ms / 1000.0,
+                    "end": real_end_ms / 1000.0,
+                    "speaker": seg_pos["segment"]["speaker"],
+                    "text": seg_pos["segment"]["text"],
+                    "translation": seg_pos["segment"]["translation"],
+                    "original_index": seg_pos["original_index"],
+                    "original_start": seg_pos["segment"]["start"],
+                    "original_end": seg_pos["segment"]["end"]
+                })
+            
+            # Place the adjusted group at the correct position in the speaker's track
+            speaker_track = speaker_tracks[speaker]
+            
+            # Extend track if needed
+            if position_ms + len(adjusted_group_audio) > len(speaker_track):
+                extension = position_ms + len(adjusted_group_audio) - len(speaker_track)
+                speaker_track += AudioSegment.silent(duration=extension)
+            
+            # Overlay the adjusted group audio at the correct position
+            speaker_tracks[speaker] = speaker_track.overlay(
+                adjusted_group_audio,
+                position=position_ms
+            )
+            
+            from src.utils.time_utils import format_seconds_to_srt
+            duration_ms = len(adjusted_group_audio)
+            duration_minutes = duration_ms / (1000 * 60)
+            logger.debug(f"Processed group {group_idx+1}/{entry['speaker_group_count']} for speaker {speaker}: "
+                  f"{len(group)} segments, Speed ratio: {ratio_clamped:.2f}, "
+                  f"Time: {format_seconds_to_srt(group_start_time_ms / 1000)}-{format_seconds_to_srt((group_start_time_ms + duration_ms) / 1000)}, "
+                  f"Duration: {duration_minutes:.2f} minutes")
+            
+            if segment_stretch_mode in ('audio_and_video', 'video') and video_speed_for_group is not None:
+                time_change_ms = target_duration_ms - (target_duration_ms / video_speed_for_group)
+                cumulative_offset_ms += time_change_ms
+            
+            # Update progress (report only at 25%, 50%, 75% milestones)
+            processed_groups += 1
 
         progress_callback(processed_groups, processed_groups, "Segments grouped")
 
