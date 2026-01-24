@@ -38,6 +38,8 @@ const INITIAL_CONFIG: AppConfig = {
   useTwoPassEncoding: DEFAULT_PRESET.useTwoPassEncoding,
   maxWorkers: DEFAULT_PRESET.maxWorkers,
   pauseRemoval: DEFAULT_PRESET.pauseRemoval,
+  translationPromptPrefix: '',
+  speakerTtsPrompts: {},
 };
 
 const mapSegmentFromApi = (seg: SegmentResponse): Segment => ({
@@ -87,6 +89,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       refinementModelName: cfg.refinementModelName || preset.refinementModelName,
       refinementTemperature: cfg.refinementTemperature ?? preset.refinementTemperature,
       translationPromptPrefix: cfg.translationPromptPrefix,
+      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
       ttsSystem: cfg.ttsSystem || preset.ttsSystem,
       ttsModel: cfg.ttsModel || preset.ttsModel,
       ttsPromptPrefix: cfg.ttsPromptPrefix ?? preset.ttsPromptPrefix,
@@ -245,14 +248,19 @@ const App: React.FC = () => {
     const loadInitialData = async () => {
       try {
         setIsLoading(true);
-        const [projectsData, voicesData, personasData] = await Promise.all([
+        const [projectsData, voicesData, personasData, settingsData] = await Promise.all([
           api.listProjects(),
           api.getVoices(),
           api.getPersonas(),
+          api.getSettings(),
         ]);
         
         setProjects(projectsData.map(p => mapProjectFromApi(p as ProjectResponse)));
         setVoices(voicesData);
+        
+        if (settingsData && settingsData.defaults) {
+          setGlobalConfig(prev => ({ ...prev, ...(settingsData.defaults as Partial<AppConfig>) }));
+        }
         
         if (personasData.length > 0) {
           setPersonas(personasData.map((p: PersonaResponse) => ({
@@ -465,9 +473,10 @@ const App: React.FC = () => {
           pauseRemoval: cfg.pauseRemoval,
           preset: cfg.preset,
           llmProvider: cfg.llmProvider,
-          llmModelName: cfg.llmModelName,
-          llmTemperature: cfg.llmTemperature,
-          refinementLlmProvider: cfg.refinementLlmProvider,
+      llmModelName: cfg.llmModelName,
+      llmTemperature: cfg.llmTemperature,
+      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+      refinementLlmProvider: cfg.refinementLlmProvider,
           refinementModelName: cfg.refinementModelName,
           refinementTemperature: cfg.refinementTemperature,
           ttsSystem: cfg.ttsSystem,
@@ -697,9 +706,10 @@ const App: React.FC = () => {
         transcriptionSystem: cfg.transcriptionSystem,
         whisperModel: cfg.whisperModel,
         llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        refinementLlmProvider: cfg.refinementLlmProvider,
+      llmModelName: cfg.llmModelName,
+      llmTemperature: cfg.llmTemperature,
+      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+      refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
         translationPromptPrefix: cfg.translationPromptPrefix,
@@ -730,7 +740,14 @@ const App: React.FC = () => {
   }, [activeProjectId]);
 
   const updateGlobalConfig = (updates: Partial<AppConfig>) => {
-    setGlobalConfig(prev => ({ ...prev, ...updates }));
+    setGlobalConfig(prev => {
+      const newConfig = { ...prev, ...updates };
+      // Save to backend
+      api.updateSettings({ defaults: newConfig }).catch(err => {
+        console.error('Failed to save global settings:', err);
+      });
+      return newConfig;
+    });
   };
 
   // --- Step Handlers ---
@@ -766,9 +783,10 @@ const App: React.FC = () => {
         transcriptionSystem: cfg.transcriptionSystem,
         whisperModel: cfg.whisperModel,
         llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        refinementLlmProvider: cfg.refinementLlmProvider,
+      llmModelName: cfg.llmModelName,
+      llmTemperature: cfg.llmTemperature,
+      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+      refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
         translationPromptPrefix: cfg.translationPromptPrefix,
@@ -855,9 +873,10 @@ const App: React.FC = () => {
         maxWorkers: cfg.maxWorkers,
         // LLM settings (in case they matter for dubbing)
         llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        refinementLlmProvider: cfg.refinementLlmProvider,
+      llmModelName: cfg.llmModelName,
+      llmTemperature: cfg.llmTemperature,
+      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+      refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
       });
@@ -1244,7 +1263,9 @@ const App: React.FC = () => {
             videoFile={activeProject.videoFile}
             voices={voices}
             onUpdateSegments={handleUpdateSegments}
+            onUpdateConfig={handleSettingsUpdate}
             onContinue={startDubbing}
+            activeProject={activeProject}
           />
         )}
 

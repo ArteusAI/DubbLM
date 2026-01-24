@@ -26,6 +26,7 @@ class ProjectConfig(BaseModel):
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
+    speakerTtsPrompts: Optional[Dict[str, str]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None
@@ -71,6 +72,7 @@ class ProjectConfigUpdate(BaseModel):
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
+    speakerTtsPrompts: Optional[Dict[str, str]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None

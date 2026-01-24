@@ -429,6 +429,7 @@ export interface ProjectConfig {
   llmProvider?: string;
   llmModelName?: string;
   llmTemperature?: number;
+  speakerTtsPrompts?: Record<string, string>;
   refinementLlmProvider?: string;
   refinementModelName?: string;
   refinementTemperature?: number;

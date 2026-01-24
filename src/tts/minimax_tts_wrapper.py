@@ -619,6 +619,11 @@ class MinimaxTTSWrapper(TTSInterface):
             # Determine voice
             voice_id = segment.voice or self.voice_mapping.get(segment.speaker, self.default_voice)
 
+            # Debug log: TTS synthesis details
+            logger.debug(f"  TTS Synthesis for [{segment.speaker}]:")
+            logger.debug(f"    Voice: {voice_id}")
+            logger.debug(f"    Model: {self.model}")
+
             # Prepare request
             url = f"{self.BASE_URL}/t2a_v2"
             headers = {

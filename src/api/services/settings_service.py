@@ -29,6 +29,7 @@ DEFAULT_SETTINGS = {
         "targetLang": "ru",
         "personaId": "normal",
         "keepBackground": True,
+        "translationPromptPrefix": "",
     },
 }
 

@@ -1,6 +1,6 @@
 
-import React, { useState, useMemo } from 'react';
-import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain } from 'lucide-react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain, Plus, Trash2, Users } from 'lucide-react';
 import { AppConfig, Persona, PresetId, LlmProvider } from '../types';
 import { LANGUAGES, PRESETS, LLM_PROVIDERS, TTS_PROVIDERS, TRANSCRIPTION_PROVIDERS, WHISPER_MODELS } from '../constants';
 import api from '../api';
@@ -64,6 +64,39 @@ export const UploadView: React.FC<UploadViewProps> = ({
 }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showExtra, setShowExtra] = useState(false);
+  const [newSpeakerName, setNewSpeakerName] = useState('');
+  const [newSpeakerPrompt, setNewSpeakerPrompt] = useState('');
+  
+  // Use ref to track latest speakerTtsPrompts to avoid race conditions with async state updates
+  const speakerPromptsRef = useRef<Record<string, string>>(config.speakerTtsPrompts || {});
+  
+  useEffect(() => {
+    speakerPromptsRef.current = config.speakerTtsPrompts || {};
+  }, [config.speakerTtsPrompts]);
+
+  const handleAddSpeakerPrompt = () => {
+    if (!newSpeakerName.trim()) return;
+    const currentPrompts = { ...speakerPromptsRef.current };
+    currentPrompts[newSpeakerName.trim()] = newSpeakerPrompt.trim();
+    speakerPromptsRef.current = currentPrompts;
+    onConfigChange({ speakerTtsPrompts: currentPrompts });
+    setNewSpeakerName('');
+    setNewSpeakerPrompt('');
+  };
+
+  const handleRemoveSpeakerPrompt = (speakerName: string) => {
+    const currentPrompts = { ...speakerPromptsRef.current };
+    delete currentPrompts[speakerName];
+    speakerPromptsRef.current = currentPrompts;
+    onConfigChange({ speakerTtsPrompts: currentPrompts });
+  };
+
+  const handleUpdateSpeakerPrompt = (speakerName: string, prompt: string) => {
+    const currentPrompts = { ...speakerPromptsRef.current };
+    currentPrompts[speakerName] = prompt;
+    speakerPromptsRef.current = currentPrompts;
+    onConfigChange({ speakerTtsPrompts: currentPrompts });
+  };
 
   const currentPreset = useMemo(() => 
     PRESETS.find(p => p.id === (config.preset || 'hq')) || PRESETS[1],
@@ -536,6 +569,70 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           disabled={(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini'}
                           className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini' ? 'opacity-40 cursor-not-allowed' : ''}`}
                           placeholder={(config.ttsSystem || currentPreset.ttsSystem) === 'gemini' ? "Speak with natural conversational energy..." : "Only available for Gemini"}/>
+                      </div>
+
+                      {/* Per-Speaker TTS Prompts */}
+                      <div className={`space-y-2 pt-2 border-t border-zinc-800/30 ${(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini' ? 'opacity-40 pointer-events-none' : ''}`}>
+                        <label className="text-[10px] text-zinc-500 flex items-center gap-1">
+                          <Users className="w-3 h-3" />
+                          Per-Speaker TTS Prompts
+                          <InfoTip text="Set individual TTS style prompts for specific speakers. Speaker names will be matched after transcription." />
+                        </label>
+                        
+                        {/* Existing speaker prompts */}
+                        {Object.entries(config.speakerTtsPrompts || {}).length > 0 && (
+                          <div className="space-y-1.5">
+                            {Object.entries(config.speakerTtsPrompts || {}).map(([speaker, prompt]) => (
+                              <div key={speaker} className="flex items-center gap-2 bg-zinc-950/50 rounded p-1.5">
+                                <span className="text-[10px] font-medium text-zinc-400 min-w-[60px] shrink-0">{speaker}</span>
+                                <input
+                                  type="text"
+                                  value={prompt}
+                                  onChange={(e) => handleUpdateSpeakerPrompt(speaker, e.target.value)}
+                                  className="flex-1 bg-zinc-900 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                  placeholder="TTS style for this speaker..."
+                                />
+                                <button
+                                  onClick={() => handleRemoveSpeakerPrompt(speaker)}
+                                  className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                                  title="Remove"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Add new speaker prompt */}
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newSpeakerName}
+                            onChange={(e) => setNewSpeakerName(e.target.value)}
+                            className="w-[80px] bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            placeholder="Speaker"
+                          />
+                          <input
+                            type="text"
+                            value={newSpeakerPrompt}
+                            onChange={(e) => setNewSpeakerPrompt(e.target.value)}
+                            onKeyDown={(e) => e.key === 'Enter' && handleAddSpeakerPrompt()}
+                            className="flex-1 bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            placeholder="TTS prompt for this speaker..."
+                          />
+                          <button
+                            onClick={handleAddSpeakerPrompt}
+                            disabled={!newSpeakerName.trim()}
+                            className="p-1 text-zinc-500 hover:text-brand-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            title="Add speaker prompt"
+                          >
+                            <Plus className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <p className="text-[9px] text-zinc-600">
+                          Speaker names (e.g., "SPEAKER_00", "SPEAKER_01") will be matched after transcription
+                        </p>
                       </div>
                     </div>
 

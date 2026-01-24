@@ -245,6 +245,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
                 "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
                 "tts_prompt_prefix": config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
@@ -476,6 +477,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
                 "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
                 "tts_prompt_prefix": tts_prompt_prefix,
+                "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
@@ -739,9 +741,19 @@ def generate_preview(
             
             # Create TTS instance
             tts_system = segment.provider or config_data.get("ttsSystem", "gemini")
+            
+            # Build TTS prompt prefix
+            target_lang = config_data.get("targetLang", "ru")
+            tts_prompt_prefix = config_data.get("ttsPromptPrefix")
+            if tts_prompt_prefix and "{lang}" in tts_prompt_prefix:
+                tts_prompt_prefix = tts_prompt_prefix.replace("{lang}", target_lang)
+                
             tts = TTSFactory.create_tts(
                 tts_system=tts_system,
                 device="cpu",
+                voice_prompt=config_data.get("speakerTtsPrompts", {}),
+                prompt_prefix=tts_prompt_prefix,
+                model=config_data.get("ttsModel"),
             )
             
             # Create segment data

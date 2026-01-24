@@ -4,7 +4,7 @@ import {
   Play, Pause, Wand2, Volume2, VolumeX, 
   ChevronRight, RefreshCw, ArrowRight, Loader2, Speaker, Sparkles, X, Clock, Pencil, Check
 } from 'lucide-react';
-import { Segment } from '../types';
+import { Segment, AppConfig } from '../types';
 import { VoiceResponse } from '../api';
 import api from '../api';
 
@@ -14,7 +14,9 @@ interface EditorViewProps {
   videoFile: File | null;
   voices: VoiceResponse[];
   onUpdateSegments: (segments: Segment[]) => void;
+  onUpdateConfig?: (cfg: Partial<AppConfig>) => void;
   onContinue: () => void;
+  activeProject?: any; // Add this to access config
 }
 
 export const EditorView: React.FC<EditorViewProps> = ({ 
@@ -23,7 +25,9 @@ export const EditorView: React.FC<EditorViewProps> = ({
   videoFile, 
   voices,
   onUpdateSegments, 
-  onContinue 
+  onUpdateConfig,
+  onContinue,
+  activeProject
 }) => {
   const [reTranslatePrompt, setReTranslatePrompt] = useState<string>('');
   const [showPromptInputId, setShowPromptInputId] = useState<string | null>(null);
@@ -47,6 +51,13 @@ export const EditorView: React.FC<EditorViewProps> = ({
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  
+  // Use ref to track latest speakerTtsPrompts to avoid race conditions with async state updates
+  const speakerPromptsRef = useRef<Record<string, string>>(activeProject?.config.speakerTtsPrompts || {});
+  
+  useEffect(() => {
+    speakerPromptsRef.current = activeProject?.config.speakerTtsPrompts || {};
+  }, [activeProject?.config.speakerTtsPrompts]);
 
   // Get unique speakers for the reassignment dropdown
   const uniqueSpeakers: { name: string; color: string }[] = Array.from(
@@ -293,6 +304,20 @@ export const EditorView: React.FC<EditorViewProps> = ({
     setShowSpeakerDropdownId(null);
   };
 
+  const handleSpeakerPromptChange = (speakerName: string, prompt: string) => {
+    const currentPrompts = { ...speakerPromptsRef.current };
+    if (prompt) {
+      currentPrompts[speakerName] = prompt;
+    } else {
+      delete currentPrompts[speakerName];
+    }
+    speakerPromptsRef.current = currentPrompts;
+    
+    if (onUpdateConfig) {
+      onUpdateConfig({ speakerTtsPrompts: currentPrompts });
+    }
+  };
+
   const handleSegmentClick = (segment: Segment) => {
     setSelectedSegmentId(segment.id);
     if (videoRef.current) {
@@ -497,20 +522,32 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
                                     {/* Reassign Dropdown */}
                                     {showSpeakerDropdownId === segment.id && (
-                                        <div className="absolute top-full left-0 mt-1 z-50 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl py-1 min-w-[160px] animate-in fade-in zoom-in-95 duration-150">
-                                            <div className="px-2 py-1 text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Switch Speaker</div>
-                                            {uniqueSpeakers.map((spk) => (
-                                                <button
-                                                    key={spk.name}
-                                        
-                                        
-                                                    onClick={(e) => { e.stopPropagation(); handleSegmentReassign(segment.id, spk.name); }}
-                                                    className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors flex items-center gap-2 ${spk.name === segment.speaker ? 'bg-brand-500/10 text-brand-400' : 'text-zinc-300'}`}
-                                                >
-                                                    <span className={`w-2 h-2 rounded-full ${spk.color.split(' ')[0].replace('/20', '')}`}></span>
-                                                    {spk.name}
-                                                </button>
-                                            ))}
+                                        <div className="absolute top-full left-0 mt-1 z-50 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl py-1 min-w-[200px] animate-in fade-in zoom-in-95 duration-150">
+                                            <div className="px-3 py-2 border-b border-zinc-800">
+                                                <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2">Speaker Style</div>
+                                                <input 
+                                                    type="text"
+                                                    placeholder="Global style for this speaker..."
+                                                    value={activeProject?.config.speakerTtsPrompts?.[segment.speaker] || ''}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                    onChange={(e) => handleSpeakerPromptChange(segment.speaker, e.target.value)}
+                                                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs text-white focus:outline-none focus:ring-1 focus:ring-brand-500"
+                                                />
+                                                <p className="text-[9px] text-zinc-500 mt-1">Applies to all segments of {segment.speaker}</p>
+                                            </div>
+                                            <div className="px-3 py-1.5 text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Switch Speaker</div>
+                                            <div className="max-h-48 overflow-y-auto">
+                                                {uniqueSpeakers.map((spk) => (
+                                                    <button
+                                                        key={spk.name}
+                                                        onClick={(e) => { e.stopPropagation(); handleSegmentReassign(segment.id, spk.name); }}
+                                                        className={`w-full text-left px-3 py-1.5 text-xs hover:bg-zinc-800 transition-colors flex items-center gap-2 ${spk.name === segment.speaker ? 'bg-brand-500/10 text-brand-400' : 'text-zinc-300'}`}
+                                                    >
+                                                        <span className={`w-2 h-2 rounded-full ${spk.color.split(' ')[0].replace('/20', '')}`}></span>
+                                                        {spk.name}
+                                                    </button>
+                                                ))}
+                                            </div>
                                         </div>
                                     )}
                                 </>

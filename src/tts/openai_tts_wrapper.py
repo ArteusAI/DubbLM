@@ -355,6 +355,11 @@ class OpenAITTSWrapper(TTSInterface):
         voice_name = segment_data.voice or self.voice_mapping.get(speaker_id, self.default_voice)
         voice_name = self._validate_voice_name(voice_name)  # Ensure it's a valid OpenAI voice
         
+        # Debug log: TTS synthesis details
+        logger.debug(f"  TTS Synthesis for [{speaker_id}]:")
+        logger.debug(f"    Voice: {voice_name}")
+        logger.debug(f"    Model: {self.model}")
+        
         final_text = text_to_synthesize
 
         # OpenAI API character limit is 4096 for tts-1 models.

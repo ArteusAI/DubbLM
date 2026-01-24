@@ -45,6 +45,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             llmProvider=config.get("llmProvider"),
             llmModelName=config.get("llmModelName"),
             llmTemperature=config.get("llmTemperature"),
+            speakerTtsPrompts=config.get("speakerTtsPrompts"),
             refinementLlmProvider=config.get("refinementLlmProvider"),
             refinementModelName=config.get("refinementModelName"),
             refinementTemperature=config.get("refinementTemperature"),

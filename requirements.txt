@@ -17,7 +17,7 @@ astunparse==1.6.3
 attrs==25.3.0
 audio-separator==0.30.2
 audioread==3.0.1
-av==14.3.0
+av==13.1.0
 babel==2.17.0
 banks==2.1.2
 beartype==0.18.5

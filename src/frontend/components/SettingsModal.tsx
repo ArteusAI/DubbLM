@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { X, Plus, Trash2, Save, Globe, Pencil, RotateCcw, CheckCircle, Loader2 } from 'lucide-react';
+import { X, Plus, Trash2, Save, Globe, Pencil, RotateCcw, CheckCircle, Loader2, Sparkles } from 'lucide-react';
 import { AppConfig, Persona } from '../types';
 import { LANGUAGES } from '../constants';
 import api from '../api';
@@ -198,6 +198,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ))}
                   </select>
                 </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-300 flex items-center gap-2">
+                  <Pencil className="w-4 h-4" />
+                  Additional Translation Prompt
+                </label>
+                <p className="text-xs text-zinc-500 mb-2">Add custom instructions for the LLM translator (e.g., "Use polite form", "Keep it technical").</p>
+                <textarea
+                  value={config.translationPromptPrefix || ''}
+                  onChange={(e) => onUpdateConfig({ translationPromptPrefix: e.target.value })}
+                  placeholder="Enter custom translation instructions..."
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50 h-24 resize-none"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-zinc-300 flex items-center gap-2">
+                  <Sparkles className="w-4 h-4" />
+                  Global TTS Prompt Prefix
+                </label>
+                <p className="text-xs text-zinc-500 mb-2">Default instructions for all speakers (e.g., "Speak with natural energy").</p>
+                <textarea
+                  value={config.ttsPromptPrefix || ''}
+                  onChange={(e) => onUpdateConfig({ ttsPromptPrefix: e.target.value })}
+                  placeholder="Enter default TTS style instructions..."
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50 h-24 resize-none"
+                />
               </div>
             </div>
           )}

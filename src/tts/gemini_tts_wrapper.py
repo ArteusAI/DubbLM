@@ -668,11 +668,19 @@ class GeminiTTSWrapper(TTSInterface):
     def _get_style_prompt_for_speaker(self, speaker_id: str, 
                                     segment_hint: Optional[TTSSegmentData] = None) -> str:
         """Determine the style prompt for a speaker."""
-        style_prompt = self.voice_prompt_mapping.get(speaker_id, "")
+        speaker_prompt = self.voice_prompt_mapping.get(speaker_id, "").strip()
+        segment_prompt = segment_hint.style_prompt.strip() if segment_hint and segment_hint.style_prompt else ""
+        
+        combined_parts = []
+        if speaker_prompt:
+            combined_parts.append(speaker_prompt)
+        if segment_prompt:
+            combined_parts.append(segment_prompt)
+            
+        style_prompt = " ".join(combined_parts)
         
         if not style_prompt and segment_hint:
-            style_prompt = segment_hint.style_prompt
-            if not style_prompt and segment_hint.emotion and segment_hint.emotion != "Neutral":
+            if segment_hint.emotion and segment_hint.emotion != "Neutral":
                 # Get voice name for more natural prompts
                 voice_name = self._get_voice_for_speaker(speaker_id, segment_hint)
                 voice_name = self._validate_voice_name(voice_name)
@@ -1063,6 +1071,14 @@ class GeminiTTSWrapper(TTSInterface):
                     prompt_parts.append(style_hint)
                 if prompt_parts:
                     final_text = f"{' '.join(prompt_parts)}\n\n{text_to_synthesize}"
+
+                # Debug log: TTS synthesis details
+                logger.debug(f"  TTS Synthesis for [{speaker_id}]:")
+                logger.debug(f"    Voice: {voice_name}")
+                logger.debug(f"    Prompt prefix: {self.config.prompt_prefix or '(none)'}")
+                logger.debug(f"    Speaker style hint: {style_hint or '(none)'}")
+                if prompt_parts:
+                    logger.debug(f"    Full prompt: {' '.join(prompt_parts)}")
 
                 text_chunks = greedy_sent_split(final_text, MAX_CHAR_LIMIT_PER_REQUEST)
                 segment_audio_files = []

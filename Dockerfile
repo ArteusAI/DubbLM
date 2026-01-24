@@ -10,6 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    pkg-config \
+    python3-dev \
     libsndfile1 \
     libportaudio2 \
     git \

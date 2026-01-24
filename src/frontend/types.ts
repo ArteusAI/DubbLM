@@ -117,6 +117,7 @@ export interface AppConfig {
   llmProvider?: LlmProvider;
   llmModelName?: string;
   llmTemperature?: number;
+  speakerTtsPrompts?: Record<string, string>;
   
   // Refinement model settings (Extra)
   refinementLlmProvider?: LlmProvider;
