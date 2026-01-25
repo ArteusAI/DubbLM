@@ -417,7 +417,7 @@ export interface ProjectConfig {
   personaId?: string;
   speakerCount?: number;
   keepBackground?: boolean;
-  pauseRemoval?: 'cut' | 'speedup' | 'disabled';
+  pauseRemoval?: 'cut' | 'disabled';
   preset?: string;
   apiKeys?: Record<string, string>;
   autoProcess?: boolean;  // Auto-continue to dubbing after transcription

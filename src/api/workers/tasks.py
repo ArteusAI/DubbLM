@@ -45,7 +45,7 @@ PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "tts_model": "gemini-2.5-flash-preview-tts",
         "tts_fallback_model": "gemini-2.5-flash-preview-tts",
         "tts_prompt_prefix": "Speak with natural conversational energy, clear articulation:",
-        "pause_removal": "speedup",
+        "pause_removal": "cut",
     },
     "ultra": {
         "llm_provider": "gemini",
@@ -613,9 +613,9 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                     if seg.get("video_speed_required") is not None
                 ]
             
-            # Determine effective pause removal (speedup only works with segment_stretch=audio)
+            # Determine effective pause removal
             effective_pause_removal = dubbing_config.get("pause_removal", "disabled")
-            if effective_pause_removal == "speedup" and segment_stretch_mode != "audio":
+            if effective_pause_removal == "speedup":
                 effective_pause_removal = "cut"
             
             output_video_path, _ = dubber.video_processor.combine_audio_with_video(
@@ -628,9 +628,6 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 pause_removal=effective_pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
-                video_speed_min=segments_opt.get("video_speed_min", 0.75),
-                video_speed_max=segments_opt.get("video_speed_max", 1.5),
-                segment_positions=dubber.real_segment_positions,
                 progress_callback=video_combine_progress,
                 log_callback=video_combine_log,
                 segments_with_video_speed=segments_with_video_speed,

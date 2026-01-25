@@ -889,16 +889,15 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Mode
-                            <InfoTip text="Cut: remove pauses, Speedup: accelerate video (only with Audio stretch mode)" />
+                            <InfoTip text="Cut: remove pauses" />
                           </label>
                           <select 
                             value={config.pauseRemoval || 'disabled'}
-                            onChange={(e) => onConfigChange({ pauseRemoval: e.target.value as 'cut' | 'speedup' | 'disabled' })}
+                            onChange={(e) => onConfigChange({ pauseRemoval: e.target.value as 'cut' | 'disabled' })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
                           >
                             <option value="disabled">Disabled</option>
                             <option value="cut">Cut pauses</option>
-                            <option value="speedup" disabled={config.segmentStretch !== 'audio'}>Speed up {config.segmentStretch !== 'audio' ? '(audio mode only)' : ''}</option>
                           </select>
                         </div>
                         <div className="space-y-1">

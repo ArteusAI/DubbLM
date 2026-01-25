@@ -68,7 +68,7 @@ class DubbingConfig:
             'keep_original_audio_ranges': None,
             'tts_system_mapping': None,
             'tts_prompt_prefix': None,
-            'pause_removal': 'disabled',  # 'cut', 'speedup', or 'disabled'
+            'pause_removal': 'disabled',  # 'cut' or 'disabled'
             'use_two_pass_encoding': True,
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
@@ -98,10 +98,6 @@ class DubbingConfig:
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,
-                # Video speed limits for 'speedup' pause_removal mode
-                'video_speed_min': 0.75,
-                'video_speed_comfortable': 1.25,  # First phase: comfortable speedup
-                'video_speed_max': 1.5,  # Second phase: extended speedup for remainder
                 # Per-segment video speed limits for segment_stretch modes
                 'video_segment_speed_min': 0.75,  # Min video speed (slowdown limit with minterpolate)
                 'video_segment_speed_comfortable': 1.25,  # Comfortable speedup limit
@@ -319,8 +315,8 @@ class DubbingConfig:
                             help='Estimate pipeline cost using configured pricing and exit without running dubbing.')
         parser.add_argument('--tts_system_mapping', type=str, help='JSON string mapping speakers to TTS systems')
         parser.add_argument('--tts_prompt_prefix', type=str, help='Global prompt prefix for TTS generation instructions (mainly for Gemini TTS)')
-        parser.add_argument('--pause_removal', type=str, choices=['cut', 'speedup', 'disabled'], 
-                            help='Pause removal mode: "cut" (remove pauses), "speedup" (speed up video segments), "disabled" (no processing)')
+        parser.add_argument('--pause_removal', type=str, choices=['cut', 'disabled'], 
+                            help='Pause removal mode: "cut" (remove pauses), "disabled" (no processing)')
         parser.add_argument('--segment_stretch', type=str, choices=['audio', 'audio_and_video', 'video'],
                             help='Segment stretch mode: "audio" (audio speed only), "audio_and_video" (hybrid: audio within comfort + video), "video" (video speed only, no audio change)')
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')

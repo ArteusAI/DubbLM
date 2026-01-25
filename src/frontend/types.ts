@@ -39,7 +39,7 @@ export interface PresetConfig {
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;
   maxWorkers?: number;
-  pauseRemoval?: 'cut' | 'speedup' | 'disabled';
+  pauseRemoval?: 'cut' | 'disabled';
   videoMinterpolateThreshold?: number;
 }
 
@@ -104,7 +104,7 @@ export interface AppConfig {
   personaId: string;
   speakerCount?: number;
   keepBackground: boolean;
-  pauseRemoval: 'cut' | 'speedup' | 'disabled';
+  pauseRemoval: 'cut' | 'disabled';
   preset?: PresetId;
   apiKeys: {
     openai?: string;

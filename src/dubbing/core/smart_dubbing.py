@@ -410,10 +410,6 @@ class SmartDubbing:
                     logger.info(f"pause_removal='{effective_pause_removal}' disabled because per-segment video speed adjustments are active "
                                f"({len(segments_with_video_speed)} segments with video speed)")
                 effective_pause_removal = 'disabled'
-            elif effective_pause_removal == 'speedup' and segment_stretch_mode != 'audio':
-                logger.info(f"pause_removal='speedup' disabled because segment_stretch='{segment_stretch_mode}' "
-                           f"(speedup only works with segment_stretch='audio')")
-                effective_pause_removal = 'cut'
             
             output_video_path, pause_adjustments = self.video_processor.combine_audio_with_video(
                 video_path=self.config.get('input'),
@@ -433,10 +429,6 @@ class SmartDubbing:
                 pause_removal=effective_pause_removal,
                 min_pause_duration=segments_opt.get('min_pause_duration', 3),
                 preserve_pause_duration=segments_opt.get('preserve_pause_duration', 1.5),
-                video_speed_min=segments_opt.get('video_speed_min', 0.75),
-                video_speed_comfortable=segments_opt.get('video_speed_comfortable', 1.25),
-                video_speed_max=segments_opt.get('video_speed_max', 1.5),
-                segment_positions=self.real_segment_positions,
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
                 ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
                 dubbed_volume=self.config.get('dubbed_volume', 1.0),

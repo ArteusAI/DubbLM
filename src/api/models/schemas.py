@@ -14,7 +14,7 @@ class ProjectConfig(BaseModel):
     personaId: Optional[str] = None
     speakerCount: Optional[int] = None
     keepBackground: bool = True
-    pauseRemoval: Literal["cut", "speedup", "disabled"] = "disabled"
+    pauseRemoval: Literal["cut", "disabled"] = "disabled"
     preset: Optional[Literal["fast", "hq", "ultra"]] = "hq"
     apiKeys: Optional[Dict[str, str]] = None
     autoProcess: Optional[bool] = None  # Auto-continue to dubbing after transcription
@@ -60,7 +60,7 @@ class ProjectConfigUpdate(BaseModel):
     personaId: Optional[str] = None
     speakerCount: Optional[int] = None
     keepBackground: Optional[bool] = None
-    pauseRemoval: Optional[Literal["cut", "speedup", "disabled"]] = None
+    pauseRemoval: Optional[Literal["cut", "disabled"]] = None
     preset: Optional[Literal["fast", "hq", "ultra"]] = None
     apiKeys: Optional[Dict[str, str]] = None
     autoProcess: Optional[bool] = None  # Auto-continue to dubbing after transcription

@@ -118,7 +118,7 @@ export const PRESETS: PresetConfig[] = [
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,
     maxWorkers: 4,
-    pauseRemoval: 'speedup',
+    pauseRemoval: 'cut',
   },
   {
     id: 'ultra',
