@@ -76,8 +76,6 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             minPauseDuration=config.get("minPauseDuration"),
             preservePauseDuration=config.get("preservePauseDuration"),
             segmentStretch=config.get("segmentStretch"),
-            videoSegmentSpeedMin=config.get("videoSegmentSpeedMin"),
-            videoSegmentSpeedMax=config.get("videoSegmentSpeedMax"),
         ),
         "sourceFile": project.source_file,
         "sourceFilename": project.source_filename,

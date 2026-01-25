@@ -160,9 +160,6 @@ export interface AppConfig {
   // Audio comfort zone (TTS speed adjustment)
   comfortMinAdjustmentRatio?: number;
   comfortMaxAdjustmentRatio?: number;
-  // Video comfort zone (must be wider than audio)
-  videoSegmentSpeedMin?: number;
-  videoSegmentSpeedMax?: number;
   
   // Pause processing
   minPauseDuration?: number;

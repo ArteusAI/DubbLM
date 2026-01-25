@@ -800,15 +800,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                               max="1"
                               disabled={config.segmentStretch === 'video'}
                               value={config.comfortMinAdjustmentRatio ?? 0.85}
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value);
-                                const videoMin = config.videoSegmentSpeedMin ?? 0.75;
-                                if (val < videoMin) {
-                                  onConfigChange({ comfortMinAdjustmentRatio: val, videoSegmentSpeedMin: val - 0.1 });
-                                } else {
-                                  onConfigChange({ comfortMinAdjustmentRatio: val });
-                                }
-                              }}
+                              onChange={(e) => onConfigChange({ comfortMinAdjustmentRatio: parseFloat(e.target.value) })}
                               className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'video' ? 'opacity-40 cursor-not-allowed' : ''}`}
                             />
                           </div>
@@ -821,64 +813,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                               max="2"
                               disabled={config.segmentStretch === 'video'}
                               value={config.comfortMaxAdjustmentRatio ?? 1.15}
-                              onChange={(e) => {
-                                const val = parseFloat(e.target.value);
-                                const videoMax = config.videoSegmentSpeedMax ?? 1.5;
-                                if (val > videoMax) {
-                                  onConfigChange({ comfortMaxAdjustmentRatio: val, videoSegmentSpeedMax: val + 0.1 });
-                                } else {
-                                  onConfigChange({ comfortMaxAdjustmentRatio: val });
-                                }
-                              }}
+                              onChange={(e) => onConfigChange({ comfortMaxAdjustmentRatio: parseFloat(e.target.value) })}
                               className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'video' ? 'opacity-40 cursor-not-allowed' : ''}`}
                             />
                           </div>
                         </div>
-                      </div>
-
-                      {/* Video Comfort Zone */}
-                      <div className="pt-1">
-                        <label className={`text-[10px] font-medium flex items-center gap-1 ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-400'}`}>
-                          🎬 Video Speed Range
-                          <InfoTip text="Video playback speed limits. Must be wider than audio range. Uses minterpolate for slowdown beyond 0.75x" />
-                        </label>
-                        <div className="grid grid-cols-2 gap-2 mt-1">
-                          <div className="space-y-0.5">
-                            <label className={`text-[10px] ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-500'}`}>Slowdown</label>
-                            <input 
-                              type="number"
-                              step="0.05"
-                              min="0.25"
-                              max={config.comfortMinAdjustmentRatio ?? 0.85}
-                              disabled={config.segmentStretch === 'audio'}
-                              value={config.videoSegmentSpeedMin ?? 0.75}
-                              onChange={(e) => onConfigChange({ videoSegmentSpeedMin: parseFloat(e.target.value) })}
-                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'audio' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                            />
-                          </div>
-                          <div className="space-y-0.5">
-                            <label className={`text-[10px] ${config.segmentStretch === 'audio' ? 'text-zinc-600' : 'text-zinc-500'}`}>Speedup</label>
-                            <input 
-                              type="number"
-                              step="0.05"
-                              min={config.comfortMaxAdjustmentRatio ?? 1.15}
-                              max="3"
-                              disabled={config.segmentStretch === 'audio'}
-                              value={config.videoSegmentSpeedMax ?? 1.5}
-                              onChange={(e) => onConfigChange({ videoSegmentSpeedMax: parseFloat(e.target.value) })}
-                              className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${config.segmentStretch === 'audio' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                            />
-                          </div>
-                        </div>
-                        {/* Validation warning */}
-                        {config.segmentStretch !== 'audio' && (
-                          (config.videoSegmentSpeedMin ?? 0.75) >= (config.comfortMinAdjustmentRatio ?? 0.85) ||
-                          (config.videoSegmentSpeedMax ?? 1.5) <= (config.comfortMaxAdjustmentRatio ?? 1.15)
-                        ) && (
-                          <p className="text-[9px] text-amber-500 mt-1">
-                            ⚠️ Video range must be wider than audio range
-                          </p>
-                        )}
                       </div>
                     </div>
 

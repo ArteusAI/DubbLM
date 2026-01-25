@@ -191,7 +191,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             source_file = pm.get_source_video_path()
             
             # Debug: log config loaded from database
-            logger.warning(f"[WORKER TRANSCRIBE] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
+            logger.info(f"[WORKER TRANSCRIBE] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
             
             if not source_file or not source_file.exists():
                 raise ValueError("No source video uploaded")
@@ -212,7 +212,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             from src.dubbing.core.log_config import setup_logging
             
             # Setup logging to project's debug directory
-            setup_logging(output_dir=str(pm.debug_dir))
+            setup_logging(output_dir=str(pm.debug_dir), include_console=False)
             
             # Get preset configuration
             preset = config_data.get("preset", "hq")
@@ -223,12 +223,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             source_lang = config_data.get("sourceLang", "en")
             target_lang = config_data.get("targetLang", "ru")
             speaker_count = config_data.get("speakerCount")
-            logger.warning(f"[WORKER] Building DubbingConfig: source_language={source_lang}, target_language={target_lang}, speakers_expected={speaker_count}")
-            logger.warning(f"[DEBUG TRANSCRIBE] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
-            logger.warning(f"[DEBUG TRANSCRIBE] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
-            logger.warning(f"[DEBUG TRANSCRIBE] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
-            logger.warning(f"[DEBUG TRANSCRIBE] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
-            logger.warning(f"[DEBUG TRANSCRIBE] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            logger.info(f"[WORKER] Building DubbingConfig: source_language={source_lang}, target_language={target_lang}, speakers_expected={speaker_count}")
+            logger.info(f"[DEBUG TRANSCRIBE] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
+            logger.info(f"[DEBUG TRANSCRIBE] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
+            logger.info(f"[DEBUG TRANSCRIBE] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
+            logger.info(f"[DEBUG TRANSCRIBE] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
+            logger.info(f"[DEBUG TRANSCRIBE] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
@@ -292,10 +292,6 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
-            if config_data.get("videoSegmentSpeedMin") is not None:
-                segments_opt["video_segment_speed_min"] = config_data["videoSegmentSpeedMin"]
-            if config_data.get("videoSegmentSpeedMax") is not None:
-                segments_opt["video_segment_speed_max"] = config_data["videoSegmentSpeedMax"]
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -417,7 +413,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             source_file = pm.get_source_video_path()
             
             # Debug: log config loaded from database
-            logger.warning(f"[WORKER DUB] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
+            logger.info(f"[WORKER DUB] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
             
             if not source_file or not source_file.exists():
                 raise ValueError("No source video uploaded")
@@ -441,7 +437,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             from src.dubbing.core.log_config import setup_logging
             
             # Setup logging to project's debug directory
-            setup_logging(output_dir=str(pm.debug_dir))
+            setup_logging(output_dir=str(pm.debug_dir), include_console=False)
             
             # Get preset configuration
             preset = config_data.get("preset", "hq")
@@ -455,13 +451,13 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Build configuration with preset values (config_data overrides preset)
             pause_removal_value = config_data.get("pauseRemoval", "disabled")
-            logger.warning(f"[DEBUG DUB] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
-            logger.warning(f"[DEBUG DUB] pause_removal from config_data: {pause_removal_value}")
-            logger.warning(f"[DEBUG DUB] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
-            logger.warning(f"[DEBUG DUB] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
-            logger.warning(f"[DEBUG DUB] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
-            logger.warning(f"[DEBUG DUB] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
-            logger.warning(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
+            logger.info(f"[DEBUG DUB] preset from config_data: {config_data.get('preset')!r} -> using preset_config for: {preset!r}")
+            logger.info(f"[DEBUG DUB] pause_removal from config_data: {pause_removal_value}")
+            logger.info(f"[DEBUG DUB] llmModelName from config_data: {config_data.get('llmModelName')!r} -> final: {config_data.get('llmModelName') or preset_config['llm_model_name']!r}")
+            logger.info(f"[DEBUG DUB] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
+            logger.info(f"[DEBUG DUB] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
+            logger.info(f"[DEBUG DUB] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            logger.info(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
@@ -517,10 +513,6 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
-            if config_data.get("videoSegmentSpeedMin") is not None:
-                segments_opt["video_segment_speed_min"] = config_data["videoSegmentSpeedMin"]
-            if config_data.get("videoSegmentSpeedMax") is not None:
-                segments_opt["video_segment_speed_max"] = config_data["videoSegmentSpeedMax"]
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -619,7 +611,6 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
                 progress_callback=video_combine_progress,
                 log_callback=video_combine_log,
-                video_segment_speed_min=segments_opt.get("video_segment_speed_min", 0.75),
             )
             
             # Save subtitles to results directory

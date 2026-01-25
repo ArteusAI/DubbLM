@@ -98,10 +98,6 @@ class DubbingConfig:
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,
-                # Per-segment video speed limits for segment_stretch modes
-                'video_segment_speed_min': 0.75,  # Min video speed (slowdown limit with minterpolate)
-                'video_segment_speed_comfortable': 1.25,  # Comfortable speedup limit
-                'video_segment_speed_max': 1.5,  # Max video speedup
                 # Video quality settings
                 'video_minterpolate_threshold': 0.75,  # Speed threshold for smooth slowdown (< threshold uses minterpolate)
                 # Audio comfort zone for segment_stretch

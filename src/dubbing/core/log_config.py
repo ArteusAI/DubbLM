@@ -15,7 +15,7 @@ def get_current_log_file() -> Optional[str]:
     return _current_log_file
 
 
-def setup_logging(level=logging.INFO, output_dir: Optional[str] = None):
+def setup_logging(level=logging.INFO, output_dir: Optional[str] = None, include_console: bool = True):
     """
     Set up logging for the application.
     
@@ -23,6 +23,8 @@ def setup_logging(level=logging.INFO, output_dir: Optional[str] = None):
         level: The logging level to use for console output (e.g., logging.INFO, logging.DEBUG)
         output_dir: Optional directory to save log file. If None, uses 'logs/' directory.
                    If provided, saves to that directory (e.g., project's artifacts/debug/).
+        include_console: Whether to include a console handler. Set to False when running 
+                        in environments like Celery that already handle stdout/stderr.
     """
     global _current_log_file
     
@@ -57,12 +59,13 @@ def setup_logging(level=logging.INFO, output_dir: Optional[str] = None):
     logging.getLogger("speechbrain.utils.checkpoints").setLevel(logging.WARNING)
 
     # Console Handler (prints INFO and above to stdout)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    # Use a simpler format for the console
-    console_formatter = logging.Formatter("%(asctime)s - %(message)s", datefmt='%H:%M:%S')
-    console_handler.setFormatter(console_formatter)
-    root_logger.addHandler(console_handler)
+    if include_console:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(level)
+        # Use a simpler format for the console
+        console_formatter = logging.Formatter("%(asctime)s - %(message)s", datefmt='%H:%M:%S')
+        console_handler.setFormatter(console_formatter)
+        root_logger.addHandler(console_handler)
 
     # File Handler (prints DEBUG and above to a file)
     file_handler = logging.FileHandler(log_filename, 'a', 'utf-8')
