@@ -388,28 +388,7 @@ class SmartDubbing:
             
             # For segment_stretch modes audio_and_video and video, pass segments with video speed requirements
             segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
-
-            # Filter segments that have video_speed_required set
-            segments_with_video_speed = []
-            if segment_stretch_mode in ('audio_and_video', 'video'):
-                segments_with_video_speed = [
-                    seg for seg in segments_for_output
-                    if seg.get('video_speed_required') is not None
-                ]
-                if segments_with_video_speed:
-                    logger.info(f"Passing {len(segments_with_video_speed)} segments with video speed requirements to video processor")
-
-            # pause_removal='speedup' only works with segment_stretch='audio'
-            # For other modes, per-segment video speed adjustment handles timing
-            effective_pause_removal = self.config.get('pause_removal', 'disabled')
-
-            # CRITICAL: If using per-segment video speed adjustments, disable pause removal
-            # because pause removal would conflict with video speed timing
-            if len(segments_with_video_speed) > 0:
-                if effective_pause_removal != 'disabled':
-                    logger.info(f"pause_removal='{effective_pause_removal}' disabled because per-segment video speed adjustments are active "
-                               f"({len(segments_with_video_speed)} segments with video speed)")
-                effective_pause_removal = 'disabled'
+            pause_removal = self.config.get('pause_removal', 'disabled')
             
             output_video_path, pause_adjustments = self.video_processor.combine_audio_with_video(
                 video_path=self.config.get('input'),
@@ -426,7 +405,7 @@ class SmartDubbing:
                 target_language=self.config.get('target_language'),
                 normalize_audio=self.config.get('normalize_audio', True),
                 use_two_pass_encoding=self.config.get('use_two_pass_encoding', True),
-                pause_removal=effective_pause_removal,
+                pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get('min_pause_duration', 3),
                 preserve_pause_duration=segments_opt.get('preserve_pause_duration', 1.5),
                 keyframe_buffer=self.config.get('keyframe_buffer', 0.2),
@@ -435,7 +414,6 @@ class SmartDubbing:
                 background_volume=self.config.get('background_volume', 0.562341),
                 upscale_factor=self.config.get('upscale_factor', 1.0),
                 upscale_sharpen=self.config.get('upscale_sharpen', True),
-                segments_with_video_speed=segments_with_video_speed,
                 video_segment_speed_min=segments_opt.get('video_segment_speed_min', 0.75)
             )
             
@@ -1371,65 +1349,17 @@ class SmartDubbing:
                     f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s."
                 )
                 
-                # Handle based on segment_stretch mode
-                if segment_stretch_mode == 'audio':
-                    # Mode: audio - aggressive audio speed changes, allow going beyond comfort zone
-                    logger.info("Mode 'audio': Resynthesizing with aggressive audio adjustments...")
-                    with tts_lock:
-                        self._resynthesize_segment(
-                            metadata,
-                            tts_instance,
-                            COMFORT_MIN_ADJUSTMENT_RATIO,
-                            COMFORT_MAX_ADJUSTMENT_RATIO,
-                            current_ratio=ratio,
-                            segments=segments,
-                        )
-                    
-                elif segment_stretch_mode == 'audio_and_video':
-                    # Mode: audio_and_video - first try audio within comfort, then use video speed
-                    logger.info("Mode 'audio_and_video': Trying audio adjustment within comfort zone...")
-                    
-                    # Try audio adjustment within comfort limits only
-                    with tts_lock:
-                        self._resynthesize_segment(
-                            metadata,
-                            tts_instance,
-                            COMFORT_MIN_ADJUSTMENT_RATIO,
-                            COMFORT_MAX_ADJUSTMENT_RATIO,
-                            current_ratio=ratio,
-                            segments=segments,
-                            limit_to_comfort_zone=True,  # New flag: don't go beyond comfort
-                        )
-                    
-                    # Recalculate ratio after audio adjustment
-                    actual_dur_after = segment_dict.get('synthesized_speech_len', actual_dur)
-                    ratio_after = original_dur / actual_dur_after if actual_dur_after > 0 else 1.0
-                    
-                    # If still outside comfort zone, calculate video speed requirement
-                    if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio_after <= COMFORT_MAX_ADJUSTMENT_RATIO):
-                        video_speed = max(min(ratio_after, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        if video_speed is not None:
-                            segment_dict['video_speed_required'] = video_speed
-                            segment_dict['video_sync_start'] = segment_dict['start']
-                            segment_dict['video_sync_end'] = segment_dict['end']
-                            logger.info(
-                                f"Video speed adjustment required: {video_speed:.2f}x "
-                                f"(ratio after audio: {ratio_after:.2f})"
-                            )
-                    
-                elif segment_stretch_mode == 'video':
-                    # Mode: video - no audio speed changes, only video speed adjustment
-                    logger.info("Mode 'video': Using video speed adjustment only (no audio resynthesis)...")
-                    
-                    # Calculate video speed requirement directly from current ratio
-                    video_speed = max(min(ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                    if abs(video_speed - 1.0) > 0.01:
-                        segment_dict['video_speed_required'] = video_speed
-                        segment_dict['video_sync_start'] = segment_dict['start']
-                        segment_dict['video_sync_end'] = segment_dict['end']
-                        logger.info(
-                            f"Video speed adjustment required: {video_speed:.2f}x (ratio: {ratio:.2f})"
-                        )
+                # Mode: audio - aggressive audio speed changes, allow going beyond comfort zone
+                logger.info("Mode 'audio': Resynthesizing with aggressive audio adjustments...")
+                with tts_lock:
+                    self._resynthesize_segment(
+                        metadata,
+                        tts_instance,
+                        COMFORT_MIN_ADJUSTMENT_RATIO,
+                        COMFORT_MAX_ADJUSTMENT_RATIO,
+                        current_ratio=ratio,
+                        segments=segments,
+                    )                    
             else:
                 # Estimation was accurate - within comfort zone
                 with metadata_lock:
@@ -1676,8 +1606,7 @@ class SmartDubbing:
         min_ratio: float,
         max_ratio: float,
         current_ratio: Optional[float] = None,
-        segments: Optional[List[Dict]] = None,
-        limit_to_comfort_zone: bool = False,
+        segments: Optional[List[Dict]] = None
     ) -> None:
         """Attempt to resynthesize a segment using alternative translations,
         focusing on minimizing deviation from the target ratio range.
@@ -1689,7 +1618,6 @@ class SmartDubbing:
             max_ratio: Maximum acceptable ratio original/actual.
             current_ratio: Current ratio to help prioritize alternatives.
             segments: Optional list of all segments for context extraction.
-            limit_to_comfort_zone: If True, only try alternative text variants, skip LLM adjustment.
         """
 
         from src.tts.models import TTSSegmentData
@@ -1709,34 +1637,16 @@ class SmartDubbing:
         # Decide search direction based on how the current ratio deviates
         if current_ratio is None and segment_dict.get("synthesized_speech_len", 0) > 0:
             current_ratio = original_duration / max(segment_dict["synthesized_speech_len"], 1e-6)
-
-        # Filter candidate keys based on segment_stretch mode
-        segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
-        skip_short_variants = segment_stretch_mode in ("video", "audio_and_video")
         
         if current_ratio is not None:
             if current_ratio < min_ratio:
-                # synthesized audio longer than original – prioritize shorter variants (only in audio mode)
-                if skip_short_variants:
-                    candidate_keys = ["translation", "long_translation"]
-                else:
-                    candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
-            elif current_ratio > max_ratio:
-                # synthesized audio shorter than original – prioritize longer variants
-                if skip_short_variants:
-                    candidate_keys = ["long_translation", "translation"]
-                else:
-                    candidate_keys = ["long_translation", "translation", "short_translation", "very_short_translation"]
-            else:
-                if skip_short_variants:
-                    candidate_keys = ["translation", "long_translation"]
-                else:
-                    candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
-        else:
-            if skip_short_variants:
-                candidate_keys = ["translation", "long_translation"]
-            else:
                 candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
+            elif current_ratio > max_ratio:
+                candidate_keys = ["long_translation", "translation", "short_translation", "very_short_translation"]
+            else:                
+                candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
+        else:
+            candidate_keys = ["very_short_translation", "short_translation", "translation", "long_translation"]
 
         # Calculate current deviation to ensure we only accept improvements
         current_deviation = float('inf')
@@ -1819,11 +1729,10 @@ class SmartDubbing:
                     os.remove(temp_output_path)
 
         # If deviation remains large (>15%), try LLM-based text length adjustment
-        # Skip LLM adjustment if limit_to_comfort_zone is True (audio_and_video streching mode)
         try:
             LLM_DEVIATION_THRESHOLD = 0.15
             # Compute absolute deviation key for comparison
-            if not limit_to_comfort_zone and self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
+            if self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
                 baseline_text = metadata.get("chosen_text") or segment_dict.get("translation", "")
                 if baseline_text:
                     # Aim for center of comfort zone (prefer near 1.0), compute duration factor
@@ -2099,22 +2008,14 @@ class SmartDubbing:
                 
                 # Handle based on segment_stretch mode
                 adjusted_group_audio = combined_group_audio
-                video_speed_for_group = None
                 
-                if segment_stretch_mode == 'video':
-                    # Video-only mode: no audio stretching, calculate video speed from original ratio
-                    ratio_clamped = 1.0  # No audio stretching
-                    if abs(ratio - 1.0) > 0.01:
-                        video_speed_for_group = max(min(ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        logger.debug(f"Group {speaker}_{group_idx}: video-only mode, video_speed={video_speed_for_group}")
-                elif segment_stretch_mode == 'audio':
+                if segment_stretch_mode == 'audio':
                     # Audio-only mode: stretch to exact fit without clamping
                     # Resynthesis already picked the best variant closest to comfort zone
                     ratio_clamped = ratio
                     logger.debug(f"Group {speaker}_{group_idx}: audio-only mode, ratio={ratio:.2f} (no clamping)")
                 else:
-                    # audio_and_video mode: clamp audio stretching, remaining handled by video speed
-                    ratio_clamped = min(max(ratio, LIMIT_MIN_ADJUSTMENT_RATIO), LIMIT_MAX_ADJUSTMENT_RATIO)
+                    raise ValueError(f"{segment_stretch_mode} not implemented yes")
                     
                 if segment_stretch_mode in ('audio', 'audio_and_video') and abs(ratio_clamped - 1.0) > 0.01:
                     try:
@@ -2137,45 +2038,8 @@ class SmartDubbing:
                     except Exception as exc:
                         logger.warning(f"Warning: Speed adjustment failed for group {speaker}_{group_idx}: {exc}")
                 
-                # Enforce allowed overflow beyond the group's original timeframe
-                # Skip for audio-only mode since we stretch to exact fit
-                if segment_stretch_mode != 'audio':
-                    overflow_tolerance = float(opt_cfg.get('group_overflow_tolerance', 0.5))
-                    overflow_tolerance = max(0.0, min(1.0, overflow_tolerance))
-
-                    original_group_span_ms = target_duration_ms
-                    adjusted_len_ms = len(adjusted_group_audio)
-                    if adjusted_len_ms > original_group_span_ms:
-                        overflow_ms = adjusted_len_ms - original_group_span_ms
-                        allowed_len_ms = original_group_span_ms + int(overflow_ms * overflow_tolerance)
-                        if adjusted_len_ms > allowed_len_ms:
-                            adjusted_group_audio = adjusted_group_audio[:allowed_len_ms]
-
                 # Calculate final audio length after overflow trimming
                 final_group_duration_ms = len(adjusted_group_audio)
-
-                # For audio_and_video mode: calculate video speed using FINAL audio length (after trimming)
-                if segment_stretch_mode == 'audio_and_video':
-                    # Calculate remaining ratio using final audio duration
-                    remaining_ratio = target_duration_ms / final_group_duration_ms if final_group_duration_ms > 0 else 1.0
-
-                    if abs(remaining_ratio - 1.0) > 0.02:  # Small tolerance
-                        video_speed_for_group = max(min(remaining_ratio, VIDEO_SEGMENT_SPEED_MAX), VIDEO_SEGMENT_SPEED_MIN)
-                        logger.debug(f"Group {speaker}_{group_idx}: audio_and_video mode, "
-                                    f"original_ratio={original_ratio:.2f}, remaining_ratio={remaining_ratio:.2f}, "
-                                    f"final_duration={final_group_duration_ms}ms, video_speed={video_speed_for_group}")
-
-                # Set video_speed_required on all segments in this group
-                if video_speed_for_group is not None:
-                    logger.info(f"Group {speaker}_{group_idx} requires video speed adjustment: {video_speed_for_group:.2f}x "
-                               f"(segments {group[0][0]+1}-{group[-1][0]+1})")
-                    # Only the first segment in the group gets the video speed marker
-                    # with group boundaries to avoid gaps being processed at 1.0x speed
-                    _, first_segment = group[0]
-                    last_orig__idx, last_segment = group[-1]
-                    first_segment['video_speed_required'] = video_speed_for_group
-                    first_segment['video_sync_start'] = first_segment['start']  # Group start
-                    first_segment['video_sync_end'] = last_segment['end']       # Group end
                     
                 position_ms = int(group_start_time_ms)
                 

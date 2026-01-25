@@ -604,19 +604,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Combine with video
             segments_opt = dubbing_config.config.get("segments_optimization", {})
             
-            # For segment_stretch modes audio_and_video and video, pass segments with video speed requirements
-            segment_stretch_mode = dubbing_config.get("segment_stretch", "audio_and_video")
-            segments_with_video_speed = None
-            if segment_stretch_mode in ("audio_and_video", "video"):
-                segments_with_video_speed = [
-                    seg for seg in segments_data 
-                    if seg.get("video_speed_required") is not None
-                ]
-            
             # Determine effective pause removal
-            effective_pause_removal = dubbing_config.get("pause_removal", "disabled")
-            if effective_pause_removal == "speedup":
-                effective_pause_removal = "cut"
+            pause_removal = dubbing_config.get("pause_removal", "disabled")
             
             output_video_path, _ = dubber.video_processor.combine_audio_with_video(
                 video_path=str(source_file),
@@ -625,12 +614,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 output_file=str(pm.get_result_video_path(config_data.get("targetLang", "ru"))),
                 source_language=config_data.get("sourceLang", "en"),
                 target_language=config_data.get("targetLang", "ru"),
-                pause_removal=effective_pause_removal,
+                pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
                 progress_callback=video_combine_progress,
                 log_callback=video_combine_log,
-                segments_with_video_speed=segments_with_video_speed,
                 video_segment_speed_min=segments_opt.get("video_segment_speed_min", 0.75),
             )
             
