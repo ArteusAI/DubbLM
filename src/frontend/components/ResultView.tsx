@@ -20,7 +20,8 @@ const formatTime = (seconds: number): string => {
 export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) => {
   const [stats, setStats] = useState<ProjectStatsResponse | null>(null);
   
-  const videoUrl = api.getDownloadVideoUrl(projectId);
+  const streamVideoUrl = api.getStreamVideoUrl(projectId);
+  const downloadVideoUrl = api.getDownloadVideoUrl(projectId);
   const sourceSrtUrl = api.getDownloadSubtitlesUrl(projectId, 'srt', 'source');
   const targetSrtUrl = api.getDownloadSubtitlesUrl(projectId, 'srt', 'target');
 
@@ -32,7 +33,7 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
 
   const handleDownloadVideo = () => {
     const link = document.createElement('a');
-    link.href = videoUrl;
+    link.href = downloadVideoUrl;
     link.download = 'dubbed_video.mp4';
     document.body.appendChild(link);
     link.click();
@@ -78,8 +79,10 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
 
       <div className="w-full max-w-3xl bg-black rounded-xl overflow-hidden aspect-video border border-zinc-800 shadow-2xl relative group">
         <video 
-          src={videoUrl}
+          src={streamVideoUrl}
           controls
+          preload="metadata"
+          playsInline
           className="w-full h-full"
         />
       </div>

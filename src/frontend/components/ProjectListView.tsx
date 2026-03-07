@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2 } from 'lucide-react';
+import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2, RotateCcw } from 'lucide-react';
 import { Project, ProjectStatus, PresetId } from '../types';
 import { PRESETS, LANGUAGES } from '../constants';
 import { api } from '../api';
@@ -31,6 +31,7 @@ interface ProjectListViewProps {
   onBatchUpload: (files: File[]) => void;
   onAutoProcess: (ids: string[]) => void;
   onStopProcess: (ids: string[]) => void;
+  onResetAndRestart: (id: string) => void;
   onOpenSettings: () => void;
   onChangePreset: (projectId: string, preset: PresetId) => void;
   onChangeLanguages: (projectId: string, sourceLang: string, targetLang: string) => void;
@@ -75,6 +76,7 @@ interface ProjectCardProps {
   onDelete: () => void;
   onAutoProcess: () => void;
   onStopProcess: () => void;
+  onResetAndRestart: () => void;
   onChangePreset: (preset: PresetId) => void;
   onChangeLanguages: (source: string, target: string) => void;
   onProgressUpdate: (progress: number, stage: string) => void;
@@ -89,6 +91,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
   onDelete,
   onAutoProcess,
   onStopProcess,
+  onResetAndRestart,
   onChangePreset,
   onChangeLanguages,
   onProgressUpdate,
@@ -314,6 +317,16 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               </button>
             )}
 
+            {!uploading && !processing && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onResetAndRestart(); }}
+                className="p-2 text-zinc-500 hover:text-cyan-300 hover:bg-cyan-500/10 rounded-lg transition-colors backdrop-blur-sm"
+                title="Reset Cache and Restart"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+            )}
+
             <button
               onClick={(e) => { e.stopPropagation(); onDelete(); }}
               className="p-2 text-zinc-600 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100 backdrop-blur-sm"
@@ -480,6 +493,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   onBatchUpload,
   onAutoProcess,
   onStopProcess,
+  onResetAndRestart,
   onOpenSettings,
   onChangePreset,
   onChangeLanguages,
@@ -642,6 +656,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
                 onDelete={() => onDeleteProject(project.id)}
                 onAutoProcess={() => onAutoProcess([project.id])}
                 onStopProcess={() => onStopProcess([project.id])}
+                onResetAndRestart={() => onResetAndRestart(project.id)}
                 onChangePreset={(preset) => onChangePreset(project.id, preset)}
                 onChangeLanguages={(source, target) => onChangeLanguages(project.id, source, target)}
                 onProgressUpdate={(progress, stage) => onProgressUpdate(project.id, progress, stage)}

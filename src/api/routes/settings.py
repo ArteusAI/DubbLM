@@ -14,6 +14,7 @@ from ..services.settings_service import (
     mask_api_key,
     API_KEY_PROVIDERS,
 )
+from ..services.preset_service import get_frontend_preset_config, get_frontend_preset_configs
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -100,3 +101,14 @@ async def update_default_settings(data: Dict[str, Any]):
     updated = update_settings({"defaults": data})
     return updated.get("defaults", {})
 
+
+@router.get("/presets")
+async def get_presets():
+    """Get preset defaults resolved from dubbing_config.yml."""
+    return get_frontend_preset_configs()
+
+
+@router.get("/presets/{preset}")
+async def get_preset(preset: str):
+    """Get one preset defaults resolved from dubbing_config.yml."""
+    return get_frontend_preset_config(preset)

@@ -18,7 +18,7 @@ const INITIAL_CONFIG: AppConfig = {
   targetLang: 'ru',
   defaultTargetLang: 'ru',
   personaId: 'normal',
-  keepBackground: true,
+  keepBackground: DEFAULT_PRESET.keepBackground ?? false,
   preset: 'hq',
   apiKeys: {},
   // Apply default preset settings
@@ -36,13 +36,18 @@ const INITIAL_CONFIG: AppConfig = {
   dubbedVolume: DEFAULT_PRESET.dubbedVolume,
   backgroundVolume: DEFAULT_PRESET.backgroundVolume,
   useTwoPassEncoding: DEFAULT_PRESET.useTwoPassEncoding,
+  videoQualityPreset: DEFAULT_PRESET.videoQualityPreset,
   maxWorkers: DEFAULT_PRESET.maxWorkers,
   pauseRemoval: DEFAULT_PRESET.pauseRemoval,
   translationPromptPrefix: '',
   speakerTtsPrompts: {},
+  speakerVoiceMappings: {},
 };
 
-const mapSegmentFromApi = (seg: SegmentResponse): Segment => ({
+const mapSegmentFromApi = (
+  seg: SegmentResponse,
+  fallback?: { speakerVoiceMappings?: Record<string, string>; ttsSystem?: string }
+): Segment => ({
   id: seg.id,
   projectId: seg.projectId,
   speaker: seg.speaker,
@@ -51,8 +56,8 @@ const mapSegmentFromApi = (seg: SegmentResponse): Segment => ({
   originalText: seg.originalText,
   translatedText: seg.translatedText || '',
   isMuted: seg.isMuted,
-  voiceId: seg.voiceId || 'alloy',
-  provider: seg.provider || 'openai',
+  voiceId: seg.voiceId || fallback?.speakerVoiceMappings?.[seg.speaker] || 'alloy',
+  provider: seg.provider || fallback?.ttsSystem || 'openai',
   audioUrl: seg.audioUrl,
   ttsPrompt: seg.ttsPrompt,
   speakerColor: seg.speakerColor,
@@ -74,7 +79,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       targetLang: cfg.targetLang || 'ru',
       personaId: cfg.personaId || 'normal',
       speakerCount: cfg.speakerCount,
-      keepBackground: cfg.keepBackground ?? (presetId !== 'fast'),
+      keepBackground: cfg.keepBackground ?? (preset.keepBackground ?? false),
       preset: presetId,
       apiKeys: {},
       // Load saved settings, fallback to preset defaults
@@ -90,6 +95,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       refinementTemperature: cfg.refinementTemperature ?? preset.refinementTemperature,
       translationPromptPrefix: cfg.translationPromptPrefix,
       speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+      speakerVoiceMappings: cfg.speakerVoiceMappings || {},
       ttsSystem: cfg.ttsSystem || preset.ttsSystem,
       ttsModel: cfg.ttsModel || preset.ttsModel,
       ttsPromptPrefix: cfg.ttsPromptPrefix ?? preset.ttsPromptPrefix,
@@ -98,6 +104,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       dubbedVolume: cfg.dubbedVolume ?? preset.dubbedVolume,
       backgroundVolume: cfg.backgroundVolume ?? preset.backgroundVolume,
       useTwoPassEncoding: cfg.useTwoPassEncoding ?? preset.useTwoPassEncoding,
+      videoQualityPreset: cfg.videoQualityPreset ?? preset.videoQualityPreset,
       maxWorkers: cfg.maxWorkers ?? preset.maxWorkers,
       pauseRemoval: cfg.pauseRemoval || preset.pauseRemoval,
       postDiarizationMergeGap: cfg.postDiarizationMergeGap,
@@ -110,7 +117,10 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       minPauseDuration: cfg.minPauseDuration,
       preservePauseDuration: cfg.preservePauseDuration,
     },
-    segments: p.segments?.map(mapSegmentFromApi) || [],
+    segments: p.segments?.map(seg => mapSegmentFromApi(seg, {
+      speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+      ttsSystem: cfg.ttsSystem || preset.ttsSystem,
+    })) || [],
     videoFile: null,
     sourceFilename: p.sourceFilename,
     sourceSize: p.sourceSize,
@@ -175,6 +185,11 @@ const App: React.FC = () => {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
+  // Reset Confirmation Dialog
+  const [showResetDialog, setShowResetDialog] = useState(false);
+  const [pendingResetId, setPendingResetId] = useState<string | null>(null);
+  const [isResetting, setIsResetting] = useState(false);
+
   // Processing State
   const [processingLogs, setProcessingLogs] = useState<ProcessingLog[]>([]);
   const [processingProgress, setProcessingProgress] = useState(0);
@@ -182,6 +197,9 @@ const App: React.FC = () => {
 
   // Derived State
   const activeProject = projects.find(p => p.id === activeProjectId) || null;
+  const pendingResetProject = pendingResetId
+    ? projects.find((p) => p.id === pendingResetId) || null
+    : null;
 
   // --- Browser History Sync ---
   
@@ -397,6 +415,7 @@ const App: React.FC = () => {
           preset: project.config.preset,
           keepBackground: project.config.keepBackground,
           pauseRemoval: project.config.pauseRemoval,
+          videoQualityPreset: project.config.videoQualityPreset,
         });
         
         project.videoFile = file;
@@ -471,10 +490,11 @@ const App: React.FC = () => {
           pauseRemoval: cfg.pauseRemoval,
           preset: cfg.preset,
           llmProvider: cfg.llmProvider,
-      llmModelName: cfg.llmModelName,
-      llmTemperature: cfg.llmTemperature,
-      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-      refinementLlmProvider: cfg.refinementLlmProvider,
+          llmModelName: cfg.llmModelName,
+          llmTemperature: cfg.llmTemperature,
+          speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+          speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+          refinementLlmProvider: cfg.refinementLlmProvider,
           refinementModelName: cfg.refinementModelName,
           refinementTemperature: cfg.refinementTemperature,
           ttsSystem: cfg.ttsSystem,
@@ -485,6 +505,7 @@ const App: React.FC = () => {
           dubbedVolume: cfg.dubbedVolume,
           backgroundVolume: cfg.backgroundVolume,
           useTwoPassEncoding: cfg.useTwoPassEncoding,
+          videoQualityPreset: cfg.videoQualityPreset,
           maxWorkers: cfg.maxWorkers,
           autoProcess: true,  // Backend will auto-start dubbing after transcription
         });
@@ -539,6 +560,78 @@ const App: React.FC = () => {
         }
       }
     }
+  };
+
+  const handleResetAndRestart = (id: string) => {
+    const project = projects.find(p => p.id === id);
+    if (!project) return;
+
+    if (project.isUploading) {
+      setError('Please wait for video upload to complete');
+      return;
+    }
+
+    setPendingResetId(id);
+    setShowResetDialog(true);
+  };
+
+  const handleConfirmResetAndRestart = async () => {
+    if (!pendingResetId) return;
+    const id = pendingResetId;
+    const project = projects.find(p => p.id === id);
+    if (!project) {
+      setShowResetDialog(false);
+      setPendingResetId(null);
+      return;
+    }
+
+    setIsResetting(true);
+    try {
+      setProjects(prev => prev.map(p =>
+        p.id === id
+          ? {
+              ...p,
+              status: 'transcribing' as ProjectStatus,
+              segments: [],
+              processProgress: 0,
+              processStage: 'Resetting cache and starting...',
+              isAutoProcessing: true,
+              error: undefined,
+            }
+          : p
+      ));
+
+      const job = await api.restartProcessing(id);
+
+      setProjects(prev => prev.map(p =>
+        p.id === id
+          ? {
+              ...p,
+              status: 'transcribing' as ProjectStatus,
+              segments: [],
+              processProgress: 0,
+              processStage: job.currentStep || 'pending',
+              currentJobId: job.jobId,
+              isAutoProcessing: true,
+              error: undefined,
+            }
+          : p
+      ));
+      setShowResetDialog(false);
+      setPendingResetId(null);
+    } catch (err) {
+      setProjects(prev => prev.map(p => (p.id === id ? project : p)));
+      console.error(`Failed to reset and restart project ${id}:`, err);
+      setError(err instanceof Error ? err.message : 'Failed to reset and restart project');
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
+  const handleCancelResetDialog = () => {
+    if (isResetting) return;
+    setShowResetDialog(false);
+    setPendingResetId(null);
   };
 
   const handleSelectProject = async (id: string) => {
@@ -630,26 +723,28 @@ const App: React.FC = () => {
   const handleChangePreset = async (projectId: string, presetId: PresetId) => {
     try {
       const preset = PRESETS.find(p => p.id === presetId) || DEFAULT_PRESET;
+      const presetFromApi = await api.getPreset(presetId).catch(() => null);
       const configUpdate = {
         preset: presetId,
         personaId: presetId === 'fast' ? 'none' : 'normal',
-        keepBackground: presetId !== 'fast',
-        llmProvider: preset.llmProvider,
-        llmModelName: preset.llmModelName,
-        llmTemperature: preset.llmTemperature,
-        refinementLlmProvider: preset.refinementLlmProvider,
-        refinementModelName: preset.refinementModelName,
-        refinementTemperature: preset.refinementTemperature,
-        ttsSystem: preset.ttsSystem,
-        ttsModel: preset.ttsModel,
-        ttsPromptPrefix: preset.ttsPromptPrefix,
-        voiceAutoSelection: preset.voiceAutoSelection,
-        enableEmotionEnrichment: preset.enableEmotionEnrichment,
-        dubbedVolume: preset.dubbedVolume,
-        backgroundVolume: preset.backgroundVolume,
-        useTwoPassEncoding: preset.useTwoPassEncoding,
-        maxWorkers: preset.maxWorkers,
-        pauseRemoval: preset.pauseRemoval,
+        keepBackground: presetFromApi?.keepBackground ?? preset.keepBackground ?? false,
+        llmProvider: (presetFromApi?.llmProvider as LlmProvider) ?? preset.llmProvider,
+        llmModelName: presetFromApi?.llmModelName ?? preset.llmModelName,
+        llmTemperature: presetFromApi?.llmTemperature ?? preset.llmTemperature,
+        refinementLlmProvider: (presetFromApi?.refinementLlmProvider as LlmProvider | undefined) ?? preset.refinementLlmProvider,
+        refinementModelName: presetFromApi?.refinementModelName ?? preset.refinementModelName,
+        refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
+        ttsSystem: presetFromApi?.ttsSystem ?? preset.ttsSystem,
+        ttsModel: presetFromApi?.ttsModel ?? preset.ttsModel,
+        ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
+        voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
+        enableEmotionEnrichment: presetFromApi?.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+        dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
+        backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
+        useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
+        videoQualityPreset: presetFromApi?.videoQualityPreset ?? preset.videoQualityPreset,
+        maxWorkers: presetFromApi?.maxWorkers ?? preset.maxWorkers,
+        pauseRemoval: presetFromApi?.pauseRemoval ?? preset.pauseRemoval,
       };
       
       await api.updateProjectConfig(projectId, configUpdate);
@@ -704,10 +799,11 @@ const App: React.FC = () => {
         transcriptionSystem: cfg.transcriptionSystem,
         whisperModel: cfg.whisperModel,
         llmProvider: cfg.llmProvider,
-      llmModelName: cfg.llmModelName,
-      llmTemperature: cfg.llmTemperature,
-      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-      refinementLlmProvider: cfg.refinementLlmProvider,
+        llmModelName: cfg.llmModelName,
+        llmTemperature: cfg.llmTemperature,
+        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+        refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
         translationPromptPrefix: cfg.translationPromptPrefix,
@@ -719,6 +815,7 @@ const App: React.FC = () => {
         dubbedVolume: cfg.dubbedVolume,
         backgroundVolume: cfg.backgroundVolume,
         useTwoPassEncoding: cfg.useTwoPassEncoding,
+        videoQualityPreset: cfg.videoQualityPreset,
         maxWorkers: cfg.maxWorkers,
         postDiarizationMergeGap: cfg.postDiarizationMergeGap,
         postTranslationMergeGap: cfg.postTranslationMergeGap,
@@ -779,10 +876,11 @@ const App: React.FC = () => {
         transcriptionSystem: cfg.transcriptionSystem,
         whisperModel: cfg.whisperModel,
         llmProvider: cfg.llmProvider,
-      llmModelName: cfg.llmModelName,
-      llmTemperature: cfg.llmTemperature,
-      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-      refinementLlmProvider: cfg.refinementLlmProvider,
+        llmModelName: cfg.llmModelName,
+        llmTemperature: cfg.llmTemperature,
+        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+        refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
         translationPromptPrefix: cfg.translationPromptPrefix,
@@ -794,6 +892,7 @@ const App: React.FC = () => {
         dubbedVolume: cfg.dubbedVolume,
         backgroundVolume: cfg.backgroundVolume,
         useTwoPassEncoding: cfg.useTwoPassEncoding,
+        videoQualityPreset: cfg.videoQualityPreset,
         maxWorkers: cfg.maxWorkers,
         postDiarizationMergeGap: cfg.postDiarizationMergeGap,
         postTranslationMergeGap: cfg.postTranslationMergeGap,
@@ -863,14 +962,16 @@ const App: React.FC = () => {
         dubbedVolume: cfg.dubbedVolume,
         backgroundVolume: cfg.backgroundVolume,
         useTwoPassEncoding: cfg.useTwoPassEncoding,
+        videoQualityPreset: cfg.videoQualityPreset,
         // Processing settings
         maxWorkers: cfg.maxWorkers,
         // LLM settings (in case they matter for dubbing)
         llmProvider: cfg.llmProvider,
-      llmModelName: cfg.llmModelName,
-      llmTemperature: cfg.llmTemperature,
-      speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-      refinementLlmProvider: cfg.refinementLlmProvider,
+        llmModelName: cfg.llmModelName,
+        llmTemperature: cfg.llmTemperature,
+        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+        refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
       });
@@ -1113,6 +1214,60 @@ const App: React.FC = () => {
         </div>
       )}
 
+      {/* Reset & Restart Confirmation Dialog */}
+      {showResetDialog && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-2xl shadow-2xl max-w-md w-full p-6 animate-in zoom-in-95 duration-200">
+            <div className="flex items-start gap-4">
+              <div className="w-12 h-12 rounded-full bg-cyan-500/10 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6 text-cyan-400" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-bold text-white mb-2">Reset Cache & Restart?</h3>
+                <p className="text-sm text-zinc-400">
+                  This will clear cache/artifacts/results
+                  {pendingResetProject ? ` for "${pendingResetProject.name}"` : ''} and start processing from scratch.
+                </p>
+                <p className="text-sm text-zinc-500 mt-2">
+                  Uploaded source video and project settings will be preserved.
+                </p>
+              </div>
+              <button
+                onClick={handleCancelResetDialog}
+                className="text-zinc-500 hover:text-white transition-colors"
+                disabled={isResetting}
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={handleCancelResetDialog}
+                disabled={isResetting}
+                className="flex-1 px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmResetAndRestart}
+                disabled={isResetting}
+                className="flex-1 px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isResetting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Restarting...
+                  </>
+                ) : (
+                  'Reset & Restart'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Navigation Bar */}
       {step !== AppStep.PROJECTS && activeProject && (
         <header className="h-14 border-b border-zinc-800 bg-zinc-900/50 backdrop-blur-sm flex items-center justify-between px-4 shrink-0 z-50">
@@ -1190,6 +1345,7 @@ const App: React.FC = () => {
             onBatchUpload={handleBatchUpload}
             onAutoProcess={handleAutoProcess}
             onStopProcess={handleStopProcess}
+            onResetAndRestart={handleResetAndRestart}
             onOpenSettings={() => setIsSettingsOpen(true)}
             onChangePreset={handleChangePreset}
             onChangeLanguages={handleChangeLanguages}
@@ -1228,12 +1384,14 @@ const App: React.FC = () => {
           <UploadView 
             config={activeProject.config}
             personas={personas}
+            voices={voices}
             projectId={activeProject.id}
             videoFile={activeProject.videoFile}
             isUploading={activeProject.isUploading || false}
             uploadProgress={activeProject.uploadProgress || 0}
             onConfigChange={(newCfg) => updateActiveProject({ config: { ...activeProject.config, ...newCfg } })}
             onNext={startProcessing}
+            onResetAndStart={() => handleResetAndRestart(activeProject.id)}
             onOpenSettings={() => setIsSettingsOpen(true)}
           />
         )}

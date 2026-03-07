@@ -36,7 +36,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             targetLang=config.get("targetLang"),
             personaId=config.get("personaId"),
             speakerCount=config.get("speakerCount"),
-            keepBackground=config.get("keepBackground", True),
+            keepBackground=config.get("keepBackground", False),
             pauseRemoval=config.get("pauseRemoval", "disabled"),
             preset=config.get("preset", "hq"),
             apiKeys=None,  # Never expose API keys
@@ -46,6 +46,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             llmModelName=config.get("llmModelName"),
             llmTemperature=config.get("llmTemperature"),
             speakerTtsPrompts=config.get("speakerTtsPrompts"),
+            speakerVoiceMappings=config.get("speakerVoiceMappings"),
             refinementLlmProvider=config.get("refinementLlmProvider"),
             refinementModelName=config.get("refinementModelName"),
             refinementTemperature=config.get("refinementTemperature"),
@@ -60,6 +61,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             dubbedVolume=config.get("dubbedVolume"),
             backgroundVolume=config.get("backgroundVolume"),
             useTwoPassEncoding=config.get("useTwoPassEncoding"),
+            videoQualityPreset=config.get("videoQualityPreset"),
             maxWorkers=config.get("maxWorkers"),
             # Processing settings
             startTime=config.get("startTime"),
@@ -171,4 +173,3 @@ async def update_project_config(
     
     
     return _project_to_response(project)
-

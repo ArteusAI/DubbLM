@@ -89,29 +89,57 @@ class AudioFileUtils:
 
 class AudioValidator:
     """Validates the quality of generated audio samples."""
+
+    @staticmethod
+    def _max_consecutive_true(mask: Any) -> int:
+        """Return longest run of truthy values in a 1D boolean-like mask."""
+        if hasattr(mask, "tolist"):
+            values = mask.tolist()
+        else:
+            values = list(mask)
+
+        max_run = 0
+        current_run = 0
+        for value in values:
+            if bool(value):
+                current_run += 1
+                if current_run > max_run:
+                    max_run = current_run
+            else:
+                current_run = 0
+        return max_run
     
     @staticmethod
     def validate_audio_sample(audio_path: Union[str, Path], 
                             expected_min_duration: float = 1.0,
                             silence_threshold_db: float = -40.0,
                             max_silence_ratio: float = 0.03,
-                            fade_detection_config: Optional[Dict[str, Any]] = None) -> tuple[bool, str, float]:
+                            trailing_silence_grace_ratio: float = 0.0,
+                            fade_detection_config: Optional[Dict[str, Any]] = None,
+                            absolute_silence_threshold_db: float = -38.0,
+                            max_total_silence_ratio: float = 0.35,
+                            max_contiguous_silence_seconds: float = 8.0) -> tuple[bool, str, float]:
         """
-        Validate audio by checking only trailing silence at the end of the segment.
+        Validate audio by checking trailing and pathological internal silence.
         
         Args:
             audio_path: Path to the audio file
             expected_min_duration: Minimum expected duration in seconds
             silence_threshold_db: Threshold below which audio is considered silence (in dB)
             max_silence_ratio: Maximum allowed ratio of trailing silence vs total duration (0.1 = 10%)
+            trailing_silence_grace_ratio: Additional tolerance for trailing silence only.
+                Example: 0.005 means allow +0.5pp above max_silence_ratio.
             fade_detection_config: Optional dict with fade detection settings:
                 - enabled: bool - Enable fade detection
                 - window_size_ms: int - Window size for fade analysis
                 - min_fade_db: float - Minimum dB drop to consider as fade
                 - percentile: int - Percentile for reference level
+            absolute_silence_threshold_db: Absolute dBFS threshold for silence mask
+            max_total_silence_ratio: Maximum allowed ratio of silence across whole segment
+            max_contiguous_silence_seconds: Maximum allowed length of uninterrupted silence
             
         Returns:
-            Tuple of (is_valid, reason, trailing_silence_ratio)
+            Tuple of (is_valid, reason, diagnostic_silence_ratio)
         """
         try:
             audio_path = Path(audio_path)
@@ -130,9 +158,27 @@ class AudioValidator:
                 return False, f"Audio too short ({duration:.2f}s < {expected_min_duration:.2f}s)", 1.0
             
             if LIBROSA_AVAILABLE:
-                return AudioValidator._validate_with_librosa(audio_path, silence_threshold_db, max_silence_ratio, fade_detection_config)
+                return AudioValidator._validate_with_librosa(
+                    audio_path,
+                    silence_threshold_db,
+                    max_silence_ratio,
+                    trailing_silence_grace_ratio,
+                    fade_detection_config,
+                    absolute_silence_threshold_db,
+                    max_total_silence_ratio,
+                    max_contiguous_silence_seconds
+                )
             elif PYTORCH_AVAILABLE:
-                return AudioValidator._validate_with_pytorch(audio_path, silence_threshold_db, max_silence_ratio, fade_detection_config)
+                return AudioValidator._validate_with_pytorch(
+                    audio_path,
+                    silence_threshold_db,
+                    max_silence_ratio,
+                    trailing_silence_grace_ratio,
+                    fade_detection_config,
+                    absolute_silence_threshold_db,
+                    max_total_silence_ratio,
+                    max_contiguous_silence_seconds
+                )
             else:
                 logger.warning("Advanced audio validation not available. Using basic checks only.")
                 return True, "Basic validation passed (advanced libraries not available)", 0.0
@@ -142,8 +188,12 @@ class AudioValidator:
             return False, f"Validation error: {str(e)}", 1.0
     
     @staticmethod
-    def _validate_with_librosa(audio_path: Path, silence_threshold_db: float, 
-                              max_silence_ratio: float, fade_detection_config: Optional[Dict[str, Any]] = None) -> tuple[bool, str, float]:
+    def _validate_with_librosa(audio_path: Path, silence_threshold_db: float,
+                              max_silence_ratio: float, trailing_silence_grace_ratio: float = 0.0,
+                              fade_detection_config: Optional[Dict[str, Any]] = None,
+                              absolute_silence_threshold_db: float = -38.0,
+                              max_total_silence_ratio: float = 0.35,
+                              max_contiguous_silence_seconds: float = 8.0) -> tuple[bool, str, float]:
         """Validate audio using librosa with fade detection."""
         try:
             fade_config = {
@@ -173,17 +223,26 @@ class AudioValidator:
                 return False, "Audio contains no energy", 1.0
                 
             rms_db = librosa.amplitude_to_db(rms, ref=ref_level)
+            # Absolute level in dBFS: robust against pathological files where relative
+            # normalization can hide near-silent content.
+            rms_dbfs = librosa.amplitude_to_db(rms + 1e-12, ref=1.0)
             
             total_frames = len(rms_db)
             if total_frames == 0:
                 return False, "Audio contains no analyzable frames", 1.0
+
+            dynamic_range = np.max(rms_db) - np.min(rms_db)
+            # Use absolute dBFS mask to detect extended near-silent sections.
+            global_silence_mask = rms_dbfs < absolute_silence_threshold_db
+            total_silence_ratio = float(np.mean(global_silence_mask))
+            frame_duration_sec = hop_length / float(sr)
+            max_contiguous_silence_sec = AudioValidator._max_consecutive_true(global_silence_mask) * frame_duration_sec
             
             if fade_config['enabled']:
                 window_size_ms = fade_config['window_size_ms']
                 window_size_frames = max(1, int((window_size_ms / 1000.0) / 0.1))
                 
                 if total_frames < window_size_frames * 2:
-                    dynamic_range = np.max(rms_db) - np.min(rms_db)
                     adaptive_threshold = max(silence_threshold_db, np.min(rms_db) + dynamic_range * 0.1)
                     silence_mask = rms_db < adaptive_threshold
                     non_silent_indices = np.where(~silence_mask)[0]
@@ -209,21 +268,20 @@ class AudioValidator:
                             trailing_silent_frames = max(0, total_frames - (last_non_faded + 1))
                             trailing_silence_ratio = trailing_silent_frames / total_frames
                     else:
-                        dynamic_range = np.max(rms_db) - np.min(rms_db)
                         adaptive_threshold = max(silence_threshold_db, np.min(rms_db) + dynamic_range * 0.1)
                         silence_mask = rms_db < adaptive_threshold
                         non_silent_indices = np.where(~silence_mask)[0]
                         trailing_silence_ratio = 1.0 if non_silent_indices.size == 0 else max(0, total_frames - (int(non_silent_indices[-1]) + 1)) / total_frames
                     
-                    dynamic_range = np.max(rms_db) - np.min(rms_db)
                     logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                                 f"Reference level: {reference_level_db:.1f}dB, "
                                 f"Trailing level: {trailing_level_db:.1f}dB, "
                                 f"Fade: {fade_db:.1f}dB, "
                                 f"Significant fade: {has_significant_fade}, "
-                                f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
+                                f"Trailing silence ratio: {trailing_silence_ratio:.2%}, "
+                                f"Total silence ratio: {total_silence_ratio:.2%}, "
+                                f"Max contiguous silence: {max_contiguous_silence_sec:.2f}s")
             else:
-                dynamic_range = np.max(rms_db) - np.min(rms_db)
                 if dynamic_range < 6:
                     adaptive_threshold = np.min(rms_db) + 1
                 else:
@@ -240,19 +298,41 @@ class AudioValidator:
                 
                 logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                             f"Adaptive threshold: {adaptive_threshold:.1f}dB, "
-                            f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
+                            f"Absolute silence threshold: {absolute_silence_threshold_db:.1f}dBFS, "
+                            f"Trailing silence ratio: {trailing_silence_ratio:.2%}, "
+                            f"Total silence ratio: {total_silence_ratio:.2%}, "
+                            f"Max contiguous silence: {max_contiguous_silence_sec:.2f}s")
             
-            if trailing_silence_ratio > max_silence_ratio:
-                return False, f"Too much trailing silence ({trailing_silence_ratio:.2%} > {max_silence_ratio:.2%})", trailing_silence_ratio
+            diagnostic_ratio = max(trailing_silence_ratio, total_silence_ratio)
+
+            if total_silence_ratio > max_total_silence_ratio:
+                return False, (
+                    f"Too much total silence ({total_silence_ratio:.2%} > {max_total_silence_ratio:.2%})"
+                ), diagnostic_ratio
             
-            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%})", trailing_silence_ratio
+            if max_contiguous_silence_sec > max_contiguous_silence_seconds:
+                return False, (
+                    f"Silence block too long ({max_contiguous_silence_sec:.2f}s > {max_contiguous_silence_seconds:.2f}s)"
+                ), diagnostic_ratio
+            
+            effective_max_silence_ratio = max_silence_ratio + max(0.0, trailing_silence_grace_ratio)
+            if trailing_silence_ratio > effective_max_silence_ratio:
+                return False, (
+                    f"Too much trailing silence ({trailing_silence_ratio:.2%} > {effective_max_silence_ratio:.2%})"
+                ), diagnostic_ratio
+            
+            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%})", diagnostic_ratio
             
         except Exception as e:
             return False, f"Librosa validation error: {str(e)}", 1.0
     
     @staticmethod
-    def _validate_with_pytorch(audio_path: Path, silence_threshold_db: float, 
-                              max_silence_ratio: float, fade_detection_config: Optional[Dict[str, Any]] = None) -> tuple[bool, str, float]:
+    def _validate_with_pytorch(audio_path: Path, silence_threshold_db: float,
+                              max_silence_ratio: float, trailing_silence_grace_ratio: float = 0.0,
+                              fade_detection_config: Optional[Dict[str, Any]] = None,
+                              absolute_silence_threshold_db: float = -38.0,
+                              max_total_silence_ratio: float = 0.35,
+                              max_contiguous_silence_seconds: float = 8.0) -> tuple[bool, str, float]:
         """Validate audio using PyTorch/torchaudio with fade detection."""
         try:
             fade_config = {
@@ -299,13 +379,19 @@ class AudioValidator:
                 return False, "Audio contains no energy", 1.0
             
             chunk_db_values = 20 * torch.log10(chunk_rms_tensor + 1e-8) - 20 * torch.log10(torch.tensor(ref_level))
+            # Absolute chunk level in dBFS for robust silence detection.
+            chunk_dbfs_values = 20 * torch.log10(chunk_rms_tensor + 1e-8)
+            dynamic_range = (torch.max(chunk_db_values) - torch.min(chunk_db_values)).item()
+            global_silence_mask = (chunk_dbfs_values < absolute_silence_threshold_db)
+            total_silence_ratio = float(torch.mean(global_silence_mask.float()).item())
+            chunk_duration_sec = chunk_size / float(sample_rate)
+            max_contiguous_silence_sec = AudioValidator._max_consecutive_true(global_silence_mask) * chunk_duration_sec
             
             if fade_config['enabled']:
                 window_size_ms = fade_config['window_size_ms']
                 window_size_chunks = max(1, int((window_size_ms / 1000.0) / 0.1))
                 
                 if num_chunks < window_size_chunks * 2:
-                    dynamic_range = (torch.max(chunk_db_values) - torch.min(chunk_db_values)).item()
                     adaptive_threshold = max(silence_threshold_db, torch.min(chunk_db_values).item() + dynamic_range * 0.1)
                     silence_mask = (chunk_db_values < adaptive_threshold)
                     non_silent_indices = torch.nonzero(~silence_mask, as_tuple=False).flatten()
@@ -331,21 +417,20 @@ class AudioValidator:
                             trailing_silent_chunks = max(0, num_chunks - (last_non_faded + 1))
                             trailing_silence_ratio = trailing_silent_chunks / num_chunks
                     else:
-                        dynamic_range = (torch.max(chunk_db_values) - torch.min(chunk_db_values)).item()
                         adaptive_threshold = max(silence_threshold_db, torch.min(chunk_db_values).item() + dynamic_range * 0.1)
                         silence_mask = (chunk_db_values < adaptive_threshold)
                         non_silent_indices = torch.nonzero(~silence_mask, as_tuple=False).flatten()
                         trailing_silence_ratio = 1.0 if non_silent_indices.numel() == 0 else max(0, num_chunks - (int(non_silent_indices[-1].item()) + 1)) / num_chunks
                     
-                    dynamic_range = (torch.max(chunk_db_values) - torch.min(chunk_db_values)).item()
                     logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                                 f"Reference level: {reference_level_db:.1f}dB, "
                                 f"Trailing level: {trailing_level_db:.1f}dB, "
                                 f"Fade: {fade_db:.1f}dB, "
                                 f"Significant fade: {has_significant_fade}, "
-                                f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
+                                f"Trailing silence ratio: {trailing_silence_ratio:.2%}, "
+                                f"Total silence ratio: {total_silence_ratio:.2%}, "
+                                f"Max contiguous silence: {max_contiguous_silence_sec:.2f}s")
             else:
-                dynamic_range = (torch.max(chunk_db_values) - torch.min(chunk_db_values)).item()
                 if dynamic_range < 6:
                     adaptive_threshold = torch.min(chunk_db_values).item() + 1
                 else:
@@ -362,12 +447,30 @@ class AudioValidator:
                 
                 logger.debug(f"Audio analysis - Dynamic range: {dynamic_range:.1f}dB, "
                             f"Adaptive threshold: {adaptive_threshold:.1f}dB, "
-                            f"Trailing silence ratio: {trailing_silence_ratio:.2%}")
+                            f"Absolute silence threshold: {absolute_silence_threshold_db:.1f}dBFS, "
+                            f"Trailing silence ratio: {trailing_silence_ratio:.2%}, "
+                            f"Total silence ratio: {total_silence_ratio:.2%}, "
+                            f"Max contiguous silence: {max_contiguous_silence_sec:.2f}s")
             
-            if trailing_silence_ratio > max_silence_ratio:
-                return False, f"Too much trailing silence ({trailing_silence_ratio:.2%} > {max_silence_ratio:.2%})", trailing_silence_ratio
+            diagnostic_ratio = max(trailing_silence_ratio, total_silence_ratio)
+
+            if total_silence_ratio > max_total_silence_ratio:
+                return False, (
+                    f"Too much total silence ({total_silence_ratio:.2%} > {max_total_silence_ratio:.2%})"
+                ), diagnostic_ratio
             
-            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%})", trailing_silence_ratio
+            if max_contiguous_silence_sec > max_contiguous_silence_seconds:
+                return False, (
+                    f"Silence block too long ({max_contiguous_silence_sec:.2f}s > {max_contiguous_silence_seconds:.2f}s)"
+                ), diagnostic_ratio
+            
+            effective_max_silence_ratio = max_silence_ratio + max(0.0, trailing_silence_grace_ratio)
+            if trailing_silence_ratio > effective_max_silence_ratio:
+                return False, (
+                    f"Too much trailing silence ({trailing_silence_ratio:.2%} > {effective_max_silence_ratio:.2%})"
+                ), diagnostic_ratio
+            
+            return True, f"Audio validation passed (trailing silence: {trailing_silence_ratio:.2%})", diagnostic_ratio
             
         except Exception as e:
             return False, f"PyTorch validation error: {str(e)}", 1.0
@@ -1049,4 +1152,3 @@ class VoiceSampleManager:
                 }
                 for voice_name, stats in self.duration_database.voice_stats.items()
             }
-

@@ -13,7 +13,7 @@ class ProjectConfig(BaseModel):
     targetLang: Optional[str] = None
     personaId: Optional[str] = None
     speakerCount: Optional[int] = None
-    keepBackground: bool = True
+    keepBackground: bool = False
     pauseRemoval: Literal["cut", "disabled"] = "disabled"
     preset: Optional[Literal["fast", "hq", "ultra"]] = "hq"
     apiKeys: Optional[Dict[str, str]] = None
@@ -27,6 +27,7 @@ class ProjectConfig(BaseModel):
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
+    speakerVoiceMappings: Optional[Dict[str, str]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None
@@ -39,6 +40,7 @@ class ProjectConfig(BaseModel):
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     useTwoPassEncoding: Optional[bool] = None
+    videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
     maxWorkers: Optional[int] = None
     postDiarizationMergeGap: Optional[float] = None
     postTranslationMergeGap: Optional[float] = None
@@ -71,6 +73,7 @@ class ProjectConfigUpdate(BaseModel):
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
+    speakerVoiceMappings: Optional[Dict[str, str]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None
@@ -83,6 +86,7 @@ class ProjectConfigUpdate(BaseModel):
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     useTwoPassEncoding: Optional[bool] = None
+    videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
     maxWorkers: Optional[int] = None
     postDiarizationMergeGap: Optional[float] = None
     postTranslationMergeGap: Optional[float] = None
@@ -278,4 +282,3 @@ class CompleteEvent(BaseModel):
 
 # Update forward references
 ProjectResponse.model_rebuild()
-

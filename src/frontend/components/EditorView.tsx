@@ -189,6 +189,15 @@ export const EditorView: React.FC<EditorViewProps> = ({
     const voice = voices.find(v => v.id === newVoiceId);
     if (!voice) return;
 
+    // Keep project-level speaker voice mappings in sync with editor voice changes.
+    const currentMappings = activeProject?.config?.speakerVoiceMappings || {};
+    onUpdateConfig?.({
+      speakerVoiceMappings: {
+        ...currentMappings,
+        [speakerName]: voice.id,
+      },
+    });
+
     // Get affected segments
     const affectedSegmentIds = segments
       .filter(s => s.speaker === speakerName)

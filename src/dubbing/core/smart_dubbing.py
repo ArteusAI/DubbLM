@@ -229,6 +229,10 @@ class SmartDubbing:
                 emotion_enrichment_model=self.config.get('emotion_enrichment_model'),
                 emotion_enrichment_temperature=self.config.get('emotion_enrichment_temperature'),
                 max_workers=self.config.get('max_workers', 4),
+                enable_voice_consistency_validation=self.config.get('enable_voice_consistency_validation', True),
+                voice_similarity_threshold=self.config.get('voice_similarity_threshold'),
+                voice_similarity_relaxed_threshold=self.config.get('voice_similarity_relaxed_threshold'),
+                min_voice_validation_duration_seconds=self.config.get('min_voice_validation_duration_seconds'),
                 cost_tracker=self.cost_tracker,
                 translator=self.translator,
                 target_language=self.config.get('target_language', 'en')  # Pass target language for language-specific TTS configuration
@@ -1138,9 +1142,14 @@ class SmartDubbing:
             voice_name = None
             voice_config = self.config.get('voice_name')
             if isinstance(voice_config, dict):
-                voice_name = voice_config.get(speaker, next(iter(voice_config.values()), "default"))
+                # Use only speaker-specific mapping; do not leak another speaker's voice.
+                voice_name = voice_config.get(speaker)
             elif isinstance(voice_config, str):
                 voice_name = voice_config
+
+            # Treat sentinel/default placeholders as "no explicit override" so mapping/auto-pin can work.
+            if isinstance(voice_name, str) and voice_name.strip().lower() == "default":
+                voice_name = None
 
             if self.config.get('debug_info', False):
                 with debug_data_lock:
@@ -1895,9 +1904,10 @@ class SmartDubbing:
         
         elif mode == 'video':
             # Video-only mode: no audio stretching, adjust video speed to exact fit
-            # If ratio < 1 (audio longer than target), we need to slow down video (speed < 1)
-            # If ratio > 1 (audio shorter than target), we need to speed up video (speed > 1)
-            video_speed = 1.0 / ratio
+            # video_speed = ratio = target_duration / actual_duration
+            # If ratio < 1 (audio longer than target), video_speed < 1 (slow down video)
+            # If ratio > 1 (audio shorter than target), video_speed > 1 (speed up video)
+            video_speed = ratio
             return 1.0, video_speed
         
         elif mode == 'audio_and_video':
@@ -1907,16 +1917,17 @@ class SmartDubbing:
                 return ratio, 1.0
             
             if ratio < comfort_min:
-                # Audio too long for target - stretch audio to comfort_min, slow down video
+                # Audio too long for target - compress audio to comfort_min, slow down video
                 audio_stretch = comfort_min
-                # Video compensates the remaining ratio exactly (no clamping)
+                # After audio stretch, new_audio_duration = actual * audio_stretch
+                # video_speed = target / new_audio = target / (actual * audio_stretch) = ratio / audio_stretch
                 remaining_ratio = ratio / comfort_min
-                video_speed = 1.0 / remaining_ratio
+                video_speed = remaining_ratio
             else:
                 # Audio too short for target - stretch audio to comfort_max, speed up video
                 audio_stretch = comfort_max
                 remaining_ratio = ratio / comfort_max
-                video_speed = 1.0 / remaining_ratio
+                video_speed = remaining_ratio
             
             return audio_stretch, video_speed
         
@@ -1968,11 +1979,26 @@ class SmartDubbing:
         # For debug: store all speaker groups for later use in debug video
         speaker_groups_info = {}
         
-        # Build speaker groups (same logic for all modes)
+        # Build speaker groups.
+        # For sequential modes (video/audio_and_video) we must preserve global
+        # conversation order and avoid groups that "jump over" other speakers.
+        # Build a stable global timeline index once and use it in grouping rules.
+        indexed_segments_by_time = sorted(
+            enumerate(segments),
+            key=lambda item: (item[1]["start"], item[1]["end"], item[0])
+        )
+        timeline_pos_by_index = {
+            orig_idx: pos for pos, (orig_idx, _) in enumerate(indexed_segments_by_time)
+        }
+
         all_groups = []  # Will hold all groups from all speakers with metadata
         
         for speaker in sorted(all_speakers):
-            speaker_segments = [(idx, segment) for idx, segment in enumerate(segments) if segment["speaker"] == speaker]
+            speaker_segments = [
+                (idx, segment)
+                for idx, segment in indexed_segments_by_time
+                if segment["speaker"] == speaker
+            ]
             logger.debug(f"Processing {len(speaker_segments)} segments for speaker {speaker}")
             
             # Group segments by continuous speech
@@ -1987,8 +2013,18 @@ class SmartDubbing:
                 elif i > 0:
                     prev_orig_idx, prev_segment = speaker_segments[i-1]
                     pause_duration = segment["start"] - prev_segment["end"]
+                    prev_timeline_pos = timeline_pos_by_index[prev_orig_idx]
+                    current_timeline_pos = timeline_pos_by_index[orig_idx]
+                    is_interleaved_by_other_speaker = current_timeline_pos != prev_timeline_pos + 1
                     
                     if pause_duration > SPLITTING_PAUSE_THRESHOLD_SECONDS:
+                        start_new_group = True
+                    # In sequential modes, never merge same-speaker segments across
+                    # intervening segments from other speakers.
+                    if (
+                        segment_stretch_mode in ("audio_and_video", "video")
+                        and is_interleaved_by_other_speaker
+                    ):
                         start_new_group = True
                 
                 if current_group and segment["end"] - current_group[0][1]["start"] > MAX_GROUP_DURATION_SECONDS:
@@ -2030,11 +2066,33 @@ class SmartDubbing:
                             segment_start_in_group_ms = len(combined_group_audio)
                     
                     segment_file = segment.get('synthesized_speech_file') or f"artifacts/audio_chunks/{orig_idx}.wav"
+                    fallback_duration_ms = max(0, int((segment["end"] - segment["start"]) * 1000))
                     if os.path.exists(segment_file):
-                        segment_audio = AudioSegment.from_file(segment_file)
+                        try:
+                            segment_audio = AudioSegment.from_file(segment_file)
+                            # Some TTS failures produce existing but empty artifacts.
+                            # Replace them with timeline-preserving silence.
+                            if len(segment_audio) <= 0:
+                                logger.warning(
+                                    "Empty synthesized audio for segment %s (%s). "
+                                    "Replacing with %sms silence to preserve sync.",
+                                    orig_idx,
+                                    segment_file,
+                                    fallback_duration_ms,
+                                )
+                                segment_audio = AudioSegment.silent(duration=fallback_duration_ms)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to load synthesized audio for segment %s (%s): %s. "
+                                "Replacing with %sms silence.",
+                                orig_idx,
+                                segment_file,
+                                exc,
+                                fallback_duration_ms,
+                            )
+                            segment_audio = AudioSegment.silent(duration=fallback_duration_ms)
                     else:
-                        duration_ms = int((segment["end"] - segment["start"]) * 1000)
-                        segment_audio = AudioSegment.silent(duration=duration_ms)
+                        segment_audio = AudioSegment.silent(duration=fallback_duration_ms)
                     
                     combined_group_audio += segment_audio
                     segment_end_in_group_ms = len(combined_group_audio)
@@ -2241,8 +2299,8 @@ class SmartDubbing:
             else:
                 prev_group = all_groups[i - 1]
                 original_gap = original_start - prev_group["original_end"]
-                # If overlap in original (gap < 0), use minimum gap
-                gap_duration_ms = max(100, int(original_gap * 1000))  # Minimum 100ms gap
+                # If overlap in original (gap < 0), do not force an artificial gap.
+                gap_duration_ms = max(0, int(original_gap * 1000))
             
             # Add gap as silent audio (video plays at normal speed during gap)
             if gap_duration_ms > 0:

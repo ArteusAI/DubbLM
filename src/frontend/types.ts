@@ -16,12 +16,14 @@ export enum TTSProvider {
 }
 
 export type PresetId = 'fast' | 'hq' | 'ultra';
+export type VideoQualityPreset = '720p' | '1080p' | 'original';
 
 export interface PresetConfig {
   id: PresetId;
   name: string;
   description: string;
   icon: string;
+  keepBackground?: boolean;
   llmProvider: LlmProvider;
   llmModelName: string;
   llmTemperature: number;
@@ -38,6 +40,7 @@ export interface PresetConfig {
   dubbedVolume?: number;
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;
+  videoQualityPreset?: VideoQualityPreset;
   maxWorkers?: number;
   pauseRemoval?: 'cut' | 'disabled';
   videoMinterpolateThreshold?: number;
@@ -109,6 +112,7 @@ export interface AppConfig {
   apiKeys: {
     openai?: string;
     gemini?: string;
+    openrouter?: string;
     minimax?: string;
     assemblyai?: string;
   };
@@ -118,6 +122,7 @@ export interface AppConfig {
   llmModelName?: string;
   llmTemperature?: number;
   speakerTtsPrompts?: Record<string, string>;
+  speakerVoiceMappings?: Record<string, string>;
   
   // Refinement model settings (Extra)
   refinementLlmProvider?: LlmProvider;
@@ -137,6 +142,7 @@ export interface AppConfig {
   dubbedVolume?: number;
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;
+  videoQualityPreset?: VideoQualityPreset;
   
   // Transcription extras
   transcriptionSystem?: 'assemblyai' | 'openai' | 'whisperx';

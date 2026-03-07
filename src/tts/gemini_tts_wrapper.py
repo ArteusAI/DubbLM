@@ -117,6 +117,25 @@ class GeminiTTSConfig(BaseModel):
     fade_window_size_ms: int = 500  # Window size for fade analysis in milliseconds
     min_fade_db: float = 10.0  # Minimum dB drop to consider as significant fade
     fade_detection_percentile: int = 75  # Percentile for reference level calculation
+    # Guardrails for pathological internal silence that trailing checks can miss
+    max_total_silence_ratio: float = 0.35
+    max_contiguous_silence_seconds: float = 8.0
+    # If all attempts fail validation, this model is tried as explicit last rescue
+    rescue_model: str = "gemini-2.5-flash-preview-tts"
+    # Hard limit to avoid accepting near-empty best-attempt audio
+    max_silence_ratio_for_invalid_fallback: float = 0.20
+    # Allow slight trailing-silence exceedance without relaxing total/internal silence checks.
+    trailing_silence_grace_ratio: float = 0.005
+    # Retry budget for the primary model before switching to fallback/rescue.
+    primary_model_max_retries: int = 4
+    # Validate generated segment voice against the cached sample voice embedding.
+    enable_voice_consistency_validation: bool = True
+    # Main quality threshold for cosine similarity to expected voice sample.
+    voice_similarity_threshold: float = 0.75
+    # Relaxed threshold allowed when we must pick the best invalid fallback.
+    voice_similarity_relaxed_threshold: float = 0.70
+    # Skip voice consistency checks for very short clips (unstable embeddings).
+    min_voice_validation_duration_seconds: float = 1.0
 
 
 
@@ -156,6 +175,17 @@ class GeminiAPIClient:
             logger.debug(f"Switched from model {old_model} to fallback model {self.current_model}")
             return True
         return False
+
+    def set_model(self, model_name: str) -> bool:
+        """Set a specific model for subsequent synthesis attempts."""
+        if not model_name:
+            return False
+        if self.current_model == model_name:
+            return False
+        old_model = self.current_model
+        self.current_model = model_name
+        logger.debug(f"Switched from model {old_model} to model {self.current_model}")
+        return True
 
     def reset_to_original_model(self) -> None:
         """Reset to the originally configured model unless we've permanently fallen back."""
@@ -439,6 +469,26 @@ class GeminiTTSWrapper(TTSInterface):
             config_kwargs["duration_stats_auto_save"] = duration_stats_auto_save
         if duration_stats_save_interval is not None:
             config_kwargs["duration_stats_save_interval"] = duration_stats_save_interval
+        if kwargs.get("max_total_silence_ratio") is not None:
+            config_kwargs["max_total_silence_ratio"] = kwargs["max_total_silence_ratio"]
+        if kwargs.get("max_contiguous_silence_seconds") is not None:
+            config_kwargs["max_contiguous_silence_seconds"] = kwargs["max_contiguous_silence_seconds"]
+        if kwargs.get("rescue_model") is not None:
+            config_kwargs["rescue_model"] = kwargs["rescue_model"]
+        if kwargs.get("max_silence_ratio_for_invalid_fallback") is not None:
+            config_kwargs["max_silence_ratio_for_invalid_fallback"] = kwargs["max_silence_ratio_for_invalid_fallback"]
+        if kwargs.get("trailing_silence_grace_ratio") is not None:
+            config_kwargs["trailing_silence_grace_ratio"] = kwargs["trailing_silence_grace_ratio"]
+        if kwargs.get("primary_model_max_retries") is not None:
+            config_kwargs["primary_model_max_retries"] = kwargs["primary_model_max_retries"]
+        if kwargs.get("enable_voice_consistency_validation") is not None:
+            config_kwargs["enable_voice_consistency_validation"] = kwargs["enable_voice_consistency_validation"]
+        if kwargs.get("voice_similarity_threshold") is not None:
+            config_kwargs["voice_similarity_threshold"] = kwargs["voice_similarity_threshold"]
+        if kwargs.get("voice_similarity_relaxed_threshold") is not None:
+            config_kwargs["voice_similarity_relaxed_threshold"] = kwargs["voice_similarity_relaxed_threshold"]
+        if kwargs.get("min_voice_validation_duration_seconds") is not None:
+            config_kwargs["min_voice_validation_duration_seconds"] = kwargs["min_voice_validation_duration_seconds"]
 
         self.config = GeminiTTSConfig(**config_kwargs)
         # Save rejected/silent attempts when debugging is enabled
@@ -778,6 +828,62 @@ class GeminiTTSWrapper(TTSInterface):
         )
         return self._validate_voice_name(raw_voice)
 
+    def _voice_similarity_gap(self, similarity: Optional[float]) -> float:
+        """Return non-negative gap to the configured voice similarity threshold."""
+        if similarity is None:
+            return 0.0
+        return max(0.0, self.config.voice_similarity_threshold - similarity)
+
+    def _validate_voice_consistency(
+        self,
+        audio_path: str,
+        expected_voice_name: str
+    ) -> Tuple[bool, str, Optional[float]]:
+        """
+        Validate synthesized audio against the expected sample voice embedding.
+
+        Returns:
+            (is_valid, reason, similarity_score)
+        """
+        if not self.config.enable_voice_consistency_validation:
+            return True, "Voice consistency check disabled", None
+
+        if not self.config.enable_voice_matching:
+            return True, "Voice matching disabled", None
+
+        if not self.voice_matcher or not self.voice_matcher.audio_embedder:
+            return True, "Voice matcher not available", None
+
+        if expected_voice_name not in self.voice_matcher.sample_embeddings:
+            logger.warning(
+                f"Voice consistency check skipped: no sample embedding for '{expected_voice_name}'"
+            )
+            return True, f"No sample embedding for '{expected_voice_name}'", None
+
+        duration_seconds = AudioFileUtils.get_audio_duration_seconds(Path(audio_path))
+        if (
+            duration_seconds is None
+            or duration_seconds < self.config.min_voice_validation_duration_seconds
+        ):
+            return True, "Voice consistency skipped for short segment", None
+
+        similarity = self.voice_matcher.get_audio_similarity_to_voice(audio_path, expected_voice_name)
+        if similarity is None:
+            logger.warning(
+                f"Voice consistency check skipped: could not compute embedding similarity for '{audio_path}'"
+            )
+            return True, "Could not compute voice similarity", None
+
+        threshold = max(0.0, min(1.0, self.config.voice_similarity_threshold))
+        if similarity < threshold:
+            return (
+                False,
+                f"Voice mismatch ({similarity:.3f} < {threshold:.3f}) for expected voice '{expected_voice_name}'",
+                similarity,
+            )
+
+        return True, f"Voice match ok ({similarity:.3f} >= {threshold:.3f})", similarity
+
     def _record_duration_stats(
         self,
         segment: TTSSegmentData,
@@ -894,16 +1000,25 @@ class GeminiTTSWrapper(TTSInterface):
 
         SILENCE_THRESHOLD_FOR_REPHRASING = 0.03
         MAX_REPHRASE_ATTEMPTS = 3
+        MAX_INVALID_SILENCE_RATIO = self.config.max_silence_ratio_for_invalid_fallback
+        MIN_VOICE_SIMILARITY_FOR_INVALID_FALLBACK = min(
+            self.config.voice_similarity_threshold,
+            self.config.voice_similarity_relaxed_threshold
+        )
+        primary_model_retries = max(max_retries_per_model, self.config.primary_model_max_retries)
+        rescue_model_name = (self.config.rescue_model or "").strip()
         
         # Store original text for rephrasing
         original_text = segment_data.text
         current_text = original_text
-        
-        # Initialize variables for tracking best attempts across rephrasing loops
-        primary_best_path = None
-        fallback_best_path = None
-        primary_silence = float('inf')
-        fallback_silence = float('inf')
+
+        def _cleanup_paths(paths: List[Optional[str]]) -> None:
+            for path in paths:
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
         
         for rephrase_attempt in range(MAX_REPHRASE_ATTEMPTS):
             # Update segment_data.text with current_text (original or rephrased)
@@ -922,8 +1037,8 @@ class GeminiTTSWrapper(TTSInterface):
             self.api_client.reset_to_original_model()
 
             # Try with original model
-            success, primary_silence, primary_best_path, primary_text, primary_model = self._attempt_segment_synthesis(
-                segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.02,
+            success, primary_silence, primary_similarity, primary_best_path, primary_text, primary_model = self._attempt_segment_synthesis(
+                segment_data, temp_output_path, language, primary_model_retries, max_silence_ratio=0.02,
                 previous_segments=previous_segments,
                 usage_tracker=usage_tracker
             )
@@ -937,9 +1052,11 @@ class GeminiTTSWrapper(TTSInterface):
             fallback_best_path = None
             fallback_text: Optional[str] = None
             fallback_silence = float('inf')
+            fallback_similarity: Optional[float] = None
+            fallback_model: Optional[str] = None
             if self.api_client.switch_to_fallback_model():
                 logger.debug(f"Attempting synthesis for speaker {segment_data.speaker} with fallback model")
-                success, fallback_silence, fallback_best_path, fallback_text, fallback_model = self._attempt_segment_synthesis(
+                success, fallback_silence, fallback_similarity, fallback_best_path, fallback_text, fallback_model = self._attempt_segment_synthesis(
                     segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05,
                     previous_segments=previous_segments,
                     usage_tracker=usage_tracker
@@ -949,82 +1066,132 @@ class GeminiTTSWrapper(TTSInterface):
                 if success:
                     if fallback_best_path:
                         shutil.move(fallback_best_path, temp_output_path)
-                    if primary_best_path and os.path.exists(primary_best_path):
-                        os.remove(primary_best_path)
+                    _cleanup_paths([primary_best_path])
                     return fallback_text, fallback_model, True
 
-            # Both models failed, check if we should retry with rephrasing
-            if primary_best_path or fallback_best_path:
-                best_silence = min(primary_silence, fallback_silence) if (primary_best_path and fallback_best_path) else (primary_silence if primary_best_path else fallback_silence)
-                
-                if best_silence > SILENCE_THRESHOLD_FOR_REPHRASING and rephrase_attempt < MAX_REPHRASE_ATTEMPTS - 1:
-                    logger.warning(f"Silence ratio {best_silence:.2f} exceeds threshold {SILENCE_THRESHOLD_FOR_REPHRASING}. Attempting rephrasing (attempt {rephrase_attempt + 1}/{MAX_REPHRASE_ATTEMPTS})...")
-                    
-                    # Attempt to rephrase
-                    rephrased_text = self._rephrase_for_tts_clarity(
-                        original_text=current_text,
-                        language=language,
-                        reason=f"silence ratio {best_silence:.2f}"
+            # If still invalid, force one extra rescue pass with a simpler model.
+            rescue_best_path: Optional[str] = None
+            rescue_text: Optional[str] = None
+            rescue_silence = float("inf")
+            rescue_similarity: Optional[float] = None
+            rescue_model_used: Optional[str] = None
+            if rescue_model_name and rescue_model_name not in {self.config.model, self.config.fallback_model}:
+                previous_model = self.api_client.current_model
+                self.api_client.set_model(rescue_model_name)
+                logger.debug(
+                    f"Attempting synthesis for speaker {segment_data.speaker} with rescue model {rescue_model_name}"
+                )
+                try:
+                    success, rescue_silence, rescue_similarity, rescue_best_path, rescue_text, rescue_model_used = self._attempt_segment_synthesis(
+                        segment_data, temp_output_path, language, max_retries_per_model, max_silence_ratio=0.05,
+                        previous_segments=previous_segments,
+                        usage_tracker=usage_tracker
                     )
-                    
-                    if rephrased_text and rephrased_text != current_text:
-                        current_text = rephrased_text
-                        logger.info(f"Text rephrased successfully. Retrying synthesis...")
-                        # Clean up best attempt files before retry
-                        if primary_best_path and os.path.exists(primary_best_path):
-                            os.remove(primary_best_path)
-                        if fallback_best_path and os.path.exists(fallback_best_path):
-                            os.remove(fallback_best_path)
-                        continue
-                    else:
-                        logger.warning("Rephrasing failed or returned same text. Using best attempt.")
-                
-                # If we get here, either silence is acceptable or we've exhausted rephrasing
-                # Compare best attempts and return
-                if primary_best_path and fallback_best_path:
-                    if primary_silence <= fallback_silence:
-                        logger.warning(f"Both models failed validation. Using best attempt from primary model (silence: {primary_silence:.2f})")
-                        shutil.move(primary_best_path, temp_output_path)
-                        os.remove(fallback_best_path)
-                        return primary_text, primary_model, False
-                    else:
-                        logger.warning(f"Both models failed validation. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
-                        shutil.move(fallback_best_path, temp_output_path)
-                        os.remove(primary_best_path)
-                        return fallback_text, fallback_model, False
+                finally:
+                    self.api_client.set_model(previous_model)
 
-                # Handle cases where one of the models didn't produce any output
-                if primary_best_path:
-                    logger.warning(f"Fallback model failed. Using best attempt from primary model (silence: {primary_silence:.2f})")
-                    shutil.move(primary_best_path, temp_output_path)
-                    return primary_text, primary_model, False
-                if fallback_best_path:
-                    logger.warning(f"Primary model failed. Using best attempt from fallback model (silence: {fallback_silence:.2f})")
-                    shutil.move(fallback_best_path, temp_output_path)
-                    return fallback_text, fallback_model, False
-        
-        # If we've exhausted all rephrase attempts and still have high silence
-        if primary_best_path or fallback_best_path:
-            best_silence = min(primary_silence, fallback_silence) if (primary_best_path and fallback_best_path) else (primary_silence if primary_best_path else fallback_silence)
-            raise RuntimeError(
-                f"Failed to synthesize segment for speaker {segment_data.speaker} after "
-                f"{MAX_REPHRASE_ATTEMPTS} rephrasing attempts. Last silence ratio: {best_silence:.2f}"
+                if success:
+                    if rescue_best_path:
+                        shutil.move(rescue_best_path, temp_output_path)
+                    _cleanup_paths([primary_best_path, fallback_best_path])
+                    return rescue_text, rescue_model_used, True
+
+            # Gather the best invalid attempts for optional rephrasing and final fallback decision.
+            candidates: List[Tuple[str, float, Optional[float], str, Optional[str], Optional[str]]] = []
+            if primary_best_path:
+                candidates.append(("primary", primary_silence, primary_similarity, primary_best_path, primary_text, primary_model))
+            if fallback_best_path:
+                candidates.append(("fallback", fallback_silence, fallback_similarity, fallback_best_path, fallback_text, fallback_model))
+            if rescue_best_path:
+                candidates.append(("rescue", rescue_silence, rescue_similarity, rescue_best_path, rescue_text, rescue_model_used))
+
+            # Models may fail without producing any usable audio for this attempt.
+            if not candidates:
+                continue
+
+            best_label, best_silence, best_similarity, best_path, best_text, best_model = min(
+                candidates,
+                key=lambda item: (self._voice_similarity_gap(item[2]), item[1])
             )
+
+            needs_voice_retry = (
+                self.config.enable_voice_consistency_validation
+                and best_similarity is not None
+                and best_similarity < self.config.voice_similarity_threshold
+            )
+
+            # We have invalid outputs, check if rephrasing can salvage the segment.
+            if best_silence > SILENCE_THRESHOLD_FOR_REPHRASING and rephrase_attempt < MAX_REPHRASE_ATTEMPTS - 1:
+                logger.warning(
+                    f"Silence ratio {best_silence:.2f} exceeds threshold {SILENCE_THRESHOLD_FOR_REPHRASING}. "
+                    f"Attempting rephrasing (attempt {rephrase_attempt + 1}/{MAX_REPHRASE_ATTEMPTS})..."
+                )
+
+                rephrased_text = self._rephrase_for_tts_clarity(
+                    original_text=current_text,
+                    language=language,
+                    reason=f"silence ratio {best_silence:.2f}"
+                )
+
+                if rephrased_text and rephrased_text != current_text:
+                    current_text = rephrased_text
+                    logger.info("Text rephrased successfully. Retrying synthesis...")
+                    _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
+                    continue
+                logger.warning("Rephrasing failed or returned same text. Evaluating best attempt.")
+            elif needs_voice_retry and rephrase_attempt < MAX_REPHRASE_ATTEMPTS - 1:
+                logger.warning(
+                    f"Voice similarity {best_similarity:.3f} below threshold {self.config.voice_similarity_threshold:.3f}. "
+                    f"Retrying synthesis (attempt {rephrase_attempt + 1}/{MAX_REPHRASE_ATTEMPTS})..."
+                )
+                _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
+                continue
+
+            if best_silence > MAX_INVALID_SILENCE_RATIO:
+                _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
+                raise RuntimeError(
+                    f"Best invalid attempt for speaker {segment_data.speaker} still too silent "
+                    f"(ratio={best_silence:.2f} > {MAX_INVALID_SILENCE_RATIO:.2f})"
+                )
+            if (
+                self.config.enable_voice_consistency_validation
+                and best_similarity is not None
+                and best_similarity < MIN_VOICE_SIMILARITY_FOR_INVALID_FALLBACK
+            ):
+                _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
+                raise RuntimeError(
+                    f"Best invalid attempt for speaker {segment_data.speaker} still too far from target voice "
+                    f"(similarity={best_similarity:.3f} < {MIN_VOICE_SIMILARITY_FOR_INVALID_FALLBACK:.3f})"
+                )
+
+            logger.warning(
+                f"All models failed validation. Using best attempt from {best_label} model "
+                f"(silence: {best_silence:.2f}, voice_similarity: "
+                f"{'n/a' if best_similarity is None else f'{best_similarity:.3f}'})"
+            )
+            shutil.move(best_path, temp_output_path)
+            for label, _, _, candidate_path, _, _ in candidates:
+                if label != best_label and candidate_path:
+                    _cleanup_paths([candidate_path])
+            return best_text, best_model, False
         
         raise RuntimeError(f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts.")
 
     def _attempt_segment_synthesis(self, segment_data: TTSSegmentData, temp_output_path: str,
                                  language: str, max_retries: int, max_silence_ratio: float = 0.02,
                                  previous_segments: Optional[List[str]] = None,
-                                 usage_tracker: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Optional[str], Optional[str], Optional[str]]:
+                                 usage_tracker: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Optional[float], Optional[str], Optional[str], Optional[str]]:
         """
         Attempt segment synthesis with the current model.
-        Returns a tuple of (success, silence_ratio, best_attempt_path, best_attempt_text, model_used).
+        Returns a tuple of
+        (success, silence_ratio, voice_similarity, best_attempt_path, best_attempt_text, model_used).
         """
         best_attempt_path: Optional[str] = None
         best_attempt_text: Optional[str] = None
         best_model: Optional[str] = None
         best_silence_ratio = float('inf')
+        best_voice_similarity: Optional[float] = None
+        best_quality_rank: Tuple[float, float] = (float('inf'), float('inf'))
         speaker_id = segment_data.speaker
         text_to_synthesize = segment_data.text
 
@@ -1123,57 +1290,92 @@ class GeminiTTSWrapper(TTSInterface):
                     is_valid, reason, silence_ratio = AudioValidator.validate_audio_sample(
                         temp_attempt_path, 
                         max_silence_ratio=max_silence_ratio,
-                        fade_detection_config=fade_config
+                        trailing_silence_grace_ratio=self.config.trailing_silence_grace_ratio,
+                        fade_detection_config=fade_config,
+                        max_total_silence_ratio=self.config.max_total_silence_ratio,
+                        max_contiguous_silence_seconds=self.config.max_contiguous_silence_seconds
+                    )
+                else:
+                    # Keep synthesis available even when silence validation is explicitly disabled.
+                    is_valid, reason, silence_ratio = True, "Audio validation disabled", 0.0
+
+                voice_valid = True
+                voice_reason = "Voice consistency check skipped"
+                voice_similarity: Optional[float] = None
+                if is_valid:
+                    voice_valid, voice_reason, voice_similarity = self._validate_voice_consistency(
+                        temp_attempt_path,
+                        voice_name
                     )
 
-                    # If invalid due to silence and debug saving enabled, persist rejected attempt
-                    if (not is_valid) and self.debug_save_rejected:
-                        try:
-                            reason_lower = (reason or "").lower()
-                            if ("silence" in reason_lower) or ("no energy" in reason_lower) or ("flat/constant" in reason_lower):
-                                base_path_for_debug = Path(segment_data.output_path) if getattr(segment_data, "output_path", None) else Path(temp_attempt_path)
-                                debug_dir = base_path_for_debug.parent
-                                debug_dir.mkdir(parents=True, exist_ok=True)
-                                # Convert silence ratio to integer percent for postfix
-                                silence_percent = int(round(max(0.0, min(1.0, silence_ratio)) * 100))
-                                debug_name = f"{base_path_for_debug.stem}_attempt{attempt}_{self.api_client.current_model}_silence_{silence_percent}.wav"
-                                debug_path = debug_dir / debug_name
-                                shutil.copy(temp_attempt_path, debug_path)
-                                logger.debug(f"Saved rejected silent attempt to {debug_path}")
-                        except Exception as save_exc:
-                            logger.warning(f"Could not save rejected silent attempt: {save_exc}")
+                # If invalid due to silence and debug saving enabled, persist rejected attempt
+                if (not is_valid) and self.debug_save_rejected:
+                    try:
+                        reason_lower = (reason or "").lower()
+                        if ("silence" in reason_lower) or ("no energy" in reason_lower) or ("flat/constant" in reason_lower):
+                            base_path_for_debug = Path(segment_data.output_path) if getattr(segment_data, "output_path", None) else Path(temp_attempt_path)
+                            debug_dir = base_path_for_debug.parent
+                            debug_dir.mkdir(parents=True, exist_ok=True)
+                            # Convert silence ratio to integer percent for postfix
+                            silence_percent = int(round(max(0.0, min(1.0, silence_ratio)) * 100))
+                            debug_name = f"{base_path_for_debug.stem}_attempt{attempt}_{self.api_client.current_model}_silence_{silence_percent}.wav"
+                            debug_path = debug_dir / debug_name
+                            shutil.copy(temp_attempt_path, debug_path)
+                            logger.debug(f"Saved rejected silent attempt to {debug_path}")
+                    except Exception as save_exc:
+                        logger.warning(f"Could not save rejected silent attempt: {save_exc}")
 
-                    if silence_ratio < best_silence_ratio:
-                        if best_attempt_path and os.path.exists(best_attempt_path):
-                            try:
-                                os.remove(best_attempt_path)
-                            except OSError as e:
-                                logger.warning(f"Could not remove old best_attempt_path: {e}")
-                        best_silence_ratio = silence_ratio
-                        best_attempt_path = temp_attempt_path
-                        best_attempt_text = final_text
-                        best_model = current_model
-                    elif temp_attempt_path != best_attempt_path:
+                if (not voice_valid) and self.debug_save_rejected:
+                    try:
+                        base_path_for_debug = Path(segment_data.output_path) if getattr(segment_data, "output_path", None) else Path(temp_attempt_path)
+                        debug_dir = base_path_for_debug.parent
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        similarity_suffix = "na" if voice_similarity is None else f"{int(round(max(0.0, min(1.0, voice_similarity)) * 100)):02d}"
+                        debug_name = f"{base_path_for_debug.stem}_attempt{attempt}_{self.api_client.current_model}_voice_{similarity_suffix}.wav"
+                        debug_path = debug_dir / debug_name
+                        shutil.copy(temp_attempt_path, debug_path)
+                        logger.debug(f"Saved rejected voice-mismatch attempt to {debug_path}")
+                    except Exception as save_exc:
+                        logger.warning(f"Could not save rejected voice-mismatch attempt: {save_exc}")
+
+                quality_rank = (self._voice_similarity_gap(voice_similarity), silence_ratio)
+                if quality_rank < best_quality_rank:
+                    if best_attempt_path and os.path.exists(best_attempt_path):
                         try:
-                            os.remove(temp_attempt_path)
+                            os.remove(best_attempt_path)
                         except OSError as e:
-                            logger.warning(f"Could not remove temp_attempt_path: {e}")
-
-                    if is_valid:
-                        best_model = current_model
-                        return True, silence_ratio, best_attempt_path, final_text, current_model
-                    else:
-                        logger.debug(f"Segment validation failed for {speaker_id} (attempt {attempt + 1}): {reason}")
-                else:
-                    # If validation is disabled, we can't determine the best path, so we just return the first successful one.
+                            logger.warning(f"Could not remove old best_attempt_path: {e}")
+                    best_quality_rank = quality_rank
+                    best_silence_ratio = silence_ratio
+                    best_voice_similarity = voice_similarity
+                    best_attempt_path = temp_attempt_path
+                    best_attempt_text = final_text
                     best_model = current_model
-                    return True, 0.0, temp_attempt_path, final_text, current_model
+                elif temp_attempt_path != best_attempt_path:
+                    try:
+                        os.remove(temp_attempt_path)
+                    except OSError as e:
+                        logger.warning(f"Could not remove temp_attempt_path: {e}")
+
+                if is_valid and voice_valid:
+                    best_model = current_model
+                    return True, silence_ratio, voice_similarity, best_attempt_path, final_text, current_model
+
+                failure_reasons: List[str] = []
+                if not is_valid:
+                    failure_reasons.append(reason)
+                if not voice_valid:
+                    failure_reasons.append(voice_reason)
+                logger.debug(
+                    f"Segment validation failed for {speaker_id} (attempt {attempt + 1}): "
+                    f"{'; '.join([r for r in failure_reasons if r])}"
+                )
 
             except Exception as e:
                 logger.error(f"Error synthesizing segment for {speaker_id} (attempt {attempt + 1}): {e}")
                 time.sleep(2)
 
-        return False, best_silence_ratio, best_attempt_path, best_attempt_text, best_model
+        return False, best_silence_ratio, best_voice_similarity, best_attempt_path, best_attempt_text, best_model
 
     def _process_single_segment(
         self,
@@ -1241,7 +1443,13 @@ class GeminiTTSWrapper(TTSInterface):
 
             # Get duration of the synthesized audio
             duration = AudioFileUtils.get_audio_duration_seconds(segment_file_path) or 0.0
-            self._record_duration_stats(segment, synthesized_text, duration, language)
+            if is_valid:
+                self._record_duration_stats(segment, synthesized_text, duration, language)
+            else:
+                logger.debug(
+                    f"Skipping duration stats update for invalid segment "
+                    f"{segment_index+1}/{total_segments} (speaker='{segment.speaker}')"
+                )
             if duration and model_used:
                 self._register_usage(usage_tracker, model_used, audio_seconds=duration)
 

@@ -6,6 +6,7 @@ import json
 import tempfile
 import shutil
 from typing import Optional, List, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..debug.performance_tracker import PerformanceTracker
 from ..audio.audio_processor import AudioProcessor
@@ -29,6 +30,12 @@ class VideoProcessor:
 
         # Extract video processing settings
         self.video_minterpolate_threshold = self.config.get('video_minterpolate_threshold', 0.75)
+        # Coarse pre-seek for per-segment processing.
+        # We still do exact trim in filters, so timing precision is preserved.
+        self.video_segment_seek_padding = max(
+            0.0,
+            float(self.config.get('video_segment_seek_padding', 1.0))
+        )
     
     def _get_video_info(self, video_path: str) -> Dict[str, any]:
         """Get detailed video information including codec, bitrate, and other parameters.
@@ -617,6 +624,78 @@ class VideoProcessor:
                 break
         
         return ",".join(filters) if filters else "atempo=1.0"
+
+    def _align_audio_duration_to_video(
+        self,
+        audio_path: str,
+        target_duration: float,
+        tolerance_seconds: float = 0.25,
+        log_callback: Optional[callable] = None,
+    ) -> str:
+        """Apply a tiny global tempo correction so dubbed audio matches rendered video duration.
+
+        Per-segment video rendering can accumulate fractional duration drift on long timelines.
+        This correction keeps final A/V sync stable without altering segment-level timing logic.
+        """
+        def log(message: str):
+            logger.info(message)
+            if log_callback:
+                log_callback(message)
+
+        if target_duration <= 0 or not os.path.exists(audio_path):
+            return audio_path
+
+        source_duration = self._get_video_duration(audio_path)
+        if source_duration <= 0:
+            logger.warning(
+                "Could not measure translated audio duration for '%s', skipping A/V duration alignment.",
+                audio_path,
+            )
+            return audio_path
+
+        duration_delta = source_duration - target_duration
+        if abs(duration_delta) <= tolerance_seconds:
+            return audio_path
+
+        tempo_speed = source_duration / target_duration
+        atempo_filter = self._build_atempo_chain(tempo_speed)
+        base, ext = os.path.splitext(audio_path)
+        if not ext:
+            ext = ".wav"
+        synced_audio_path = f"{base}_synced{ext}"
+
+        log(
+            "Translated audio/video duration mismatch detected: "
+            f"audio={source_duration:.3f}s, video={target_duration:.3f}s "
+            f"(delta={duration_delta:+.3f}s). "
+            f"Applying global tempo correction (speed={tempo_speed:.6f})."
+        )
+
+        try:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                audio_path,
+                "-filter:a",
+                atempo_filter,
+                "-vn",
+                synced_audio_path,
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            synced_duration = self._get_video_duration(synced_audio_path)
+            log(
+                "Duration alignment complete: "
+                f"new_audio={synced_duration:.3f}s (target_video={target_duration:.3f}s)."
+            )
+            return synced_audio_path
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "Failed to align translated audio duration to video: %s. "
+                "Using original translated audio.",
+                exc.stderr if hasattr(exc, "stderr") else exc,
+            )
+            return audio_path
     
     def _apply_per_segment_video_speed(
         self,
@@ -650,121 +729,246 @@ class VideoProcessor:
         if not speed_segments:
             log("No video speed segments provided, returning original video")
             return video_path, []
-        
+
         log(f"Applying per-segment video speed adjustment to {len(speed_segments)} segments...")
-        
+
         # Get video info for quality settings
         video_info = self._get_video_info(video_path)
         total_original_duration = video_info.get('duration', 0)
-        
-        # Build filter complex for all segments
-        filter_parts = []
-        video_labels = []
-        
-        # Track timing adjustments for subtitle synchronization
-        timing_adjustments = []
-        cumulative_new_time = 0.0
-        
+
+        # Build valid segments.
+        # We compute subtitle timing adjustments from actual rendered segment durations
+        # later to avoid drift from per-segment encoder/mux rounding.
+        valid_segments = []
+        requested_total_new_time = 0.0
         for i, seg in enumerate(speed_segments):
-            original_start = seg.get('original_start', 0)
-            original_end = seg.get('original_end', 0)
-            video_speed = seg.get('video_speed', 1.0)
-            use_minterpolate = seg.get('use_minterpolate', False)
-            
+            original_start = float(seg.get('original_start', 0))
+            original_end = float(seg.get('original_end', 0))
+            video_speed = float(seg.get('video_speed', 1.0))
+            use_minterpolate = bool(seg.get('use_minterpolate', False))
+
             original_duration = original_end - original_start
             if original_duration <= 0:
                 continue
-            
-            # Calculate new duration after speed change
-            # speed > 1 = faster playback = shorter duration
-            # speed < 1 = slower playback = longer duration
-            new_duration = original_duration / video_speed
-            
-            start_s = f"{original_start:.6f}"
-            end_s = f"{original_end:.6f}"
-            
-            # Build video filter for this segment
-            if use_minterpolate and video_speed < self.video_minterpolate_threshold:
-                # Smooth slowdown with motion interpolation
-                # setpts factor = 1/speed (slower = larger factor)
-                setpts_factor = 1.0 / video_speed
-                video_filter = (
-                    f"[0:v]trim=start={start_s}:end={end_s},"
-                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS),"
-                    f"minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1,"
-                    f"setpts=PTS-STARTPTS[v{i}]"
-                )
-                log(f"Segment {i}: {original_start:.2f}-{original_end:.2f}s, "
-                    f"speed={video_speed:.2f}x with minterpolate")
-            else:
-                # Simple speed change via setpts
-                setpts_factor = 1.0 / video_speed
-                video_filter = (
-                    f"[0:v]trim=start={start_s}:end={end_s},"
-                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS)[v{i}]"
-                )
-                log(f"Segment {i}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
-            
-            filter_parts.append(video_filter)
-            video_labels.append(f"[v{i}]")
-            
-            # Record timing adjustment for this segment
-            timing_adjustments.append({
+
+            if video_speed <= 0:
+                logger.warning(f"Invalid video_speed={video_speed} for segment {i}, using 1.0")
+                video_speed = 1.0
+
+            requested_new_duration = original_duration / video_speed
+            valid_segments.append({
+                "index": i,
                 "original_start": original_start,
                 "original_end": original_end,
-                "new_start": cumulative_new_time,
-                "new_end": cumulative_new_time + new_duration,
                 "video_speed": video_speed,
-                "offset": cumulative_new_time - original_start
+                "use_minterpolate": use_minterpolate,
+                "requested_new_duration": requested_new_duration
             })
-            
-            cumulative_new_time += new_duration
-        
-        if not video_labels:
+            requested_total_new_time += requested_new_duration
+
+        if not valid_segments:
             log("No valid segments to process")
             return video_path, []
-        
-        # Concat all video segments
-        filter_parts.append(
-            f"{''.join(video_labels)}concat=n={len(video_labels)}:v=1:a=0[outv]"
-        )
-        
-        # Build FFmpeg command (video only, no audio)
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-filter_complex", ";".join(filter_parts),
-            "-map", "[outv]",
-            "-an",  # No audio - will be added separately
-            "-c:v", "libx264",
-            "-crf", "18",
-            "-preset", "medium",
-            "-pix_fmt", "yuv420p",
-            output_path
-        ]
-        
-        log(f"Processing {len(video_labels)} video segments with variable speed...")
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-        
-        try:
-            # Run FFmpeg with progress tracking
-            self._run_ffmpeg_with_progress(
-                cmd,
-                cumulative_new_time,  # Expected output duration
-                progress_callback,
-                "Video speed adjustment"
+        segment_meta_by_index = {seg["index"]: seg for seg in valid_segments}
+
+        cpu_total = os.cpu_count() or 1
+        segment_workers = max(1, cpu_total - 1)
+        log(f"Parallel video speed stretching: workers={segment_workers} (host_cpu={cpu_total})")
+
+        temp_dir = tempfile.mkdtemp(prefix="video_speed_segments_")
+        segment_outputs: List[Tuple[int, str]] = []
+        completed = 0
+
+        def process_segment(seg_meta: Dict[str, Any]) -> Tuple[int, str]:
+            seg_idx = seg_meta["index"]
+            original_start = seg_meta["original_start"]
+            original_end = seg_meta["original_end"]
+            video_speed = seg_meta["video_speed"]
+            use_minterpolate = seg_meta["use_minterpolate"]
+
+            # Use coarse input seek to avoid decoding from the beginning for each segment.
+            # Precision is preserved by applying exact trim on top of the seeked input.
+            input_seek = max(0.0, original_start - self.video_segment_seek_padding)
+            trim_start = max(0.0, original_start - input_seek)
+            trim_end = max(trim_start, original_end - input_seek)
+
+            start_s = f"{trim_start:.6f}"
+            end_s = f"{trim_end:.6f}"
+            setpts_factor = 1.0 / video_speed
+            speed_is_unity = abs(video_speed - 1.0) < 0.001
+            logger.debug(
+                "Segment %s seek plan: input_seek=%.6f, trim_start=%.6f, trim_end=%.6f, "
+                "original=[%.6f, %.6f], speed=%.4f",
+                seg_idx,
+                input_seek,
+                trim_start,
+                trim_end,
+                original_start,
+                original_end,
+                video_speed,
             )
-            
-            log(f"Video speed adjustment complete. New duration: {cumulative_new_time:.2f}s "
-                f"(original: {total_original_duration:.2f}s)")
-            
+
+            segment_output = os.path.join(temp_dir, f"segment_{seg_idx:06d}.mp4")
+            segment_cmd = ["ffmpeg", "-y"]
+            if input_seek > 0:
+                segment_cmd.extend(["-ss", f"{input_seek:.6f}"])
+            segment_cmd.extend(["-i", video_path])
+
+            if use_minterpolate and video_speed < self.video_minterpolate_threshold:
+                vf = (
+                    f"trim=start={start_s}:end={end_s},"
+                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS),"
+                    f"minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1,"
+                    "setpts=PTS-STARTPTS"
+                )
+                log(
+                    f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
+                    f"speed={video_speed:.2f}x with minterpolate"
+                )
+            elif speed_is_unity:
+                # Fast path for 1.0x segments: exact trim without speed transform.
+                vf = f"trim=start={start_s}:end={end_s},setpts=PTS-STARTPTS"
+                log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed=1.00x")
+            else:
+                vf = f"trim=start={start_s}:end={end_s},setpts={setpts_factor:.6f}*(PTS-STARTPTS)"
+                log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
+
+            segment_cmd.extend([
+                "-vf", vf,
+                "-an",
+                "-threads", "1",
+                "-c:v", "libx264",
+                "-crf", "18",
+                "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                segment_output
+            ])
+            logger.debug(f"Segment {seg_idx} FFmpeg command: {' '.join(segment_cmd)}")
+            subprocess.run(segment_cmd, capture_output=True, text=True, check=True)
+            return seg_idx, segment_output
+
+        try:
+            with ThreadPoolExecutor(max_workers=segment_workers) as executor:
+                futures = [executor.submit(process_segment, seg_meta) for seg_meta in valid_segments]
+                for future in as_completed(futures):
+                    seg_idx, seg_path = future.result()
+                    segment_outputs.append((seg_idx, seg_path))
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, len(valid_segments), "Video speed segment processing")
+
+            segment_outputs.sort(key=lambda item: item[0])
+
+            # Build timing adjustments from the real encoded segment durations.
+            timing_adjustments = []
+            cumulative_actual_time = 0.0
+            for seg_idx, seg_path in segment_outputs:
+                seg_meta = segment_meta_by_index.get(seg_idx)
+                if not seg_meta:
+                    continue
+                original_start = seg_meta["original_start"]
+                original_end = seg_meta["original_end"]
+                requested_speed = seg_meta["video_speed"]
+                original_duration = max(0.0, original_end - original_start)
+                segment_actual_duration = self._get_video_duration(seg_path)
+                if segment_actual_duration <= 0:
+                    segment_actual_duration = seg_meta.get("requested_new_duration", 0.0)
+                    logger.warning(
+                        "Could not measure rendered duration for segment %s. "
+                        "Falling back to requested duration %.6fs.",
+                        seg_idx,
+                        segment_actual_duration,
+                    )
+
+                effective_video_speed = requested_speed
+                if segment_actual_duration > 0 and original_duration > 0:
+                    effective_video_speed = original_duration / segment_actual_duration
+
+                timing_adjustments.append({
+                    "original_start": original_start,
+                    "original_end": original_end,
+                    "new_start": cumulative_actual_time,
+                    "new_end": cumulative_actual_time + segment_actual_duration,
+                    "video_speed": effective_video_speed,
+                    "requested_video_speed": requested_speed,
+                    "offset": cumulative_actual_time - original_start
+                })
+                cumulative_actual_time += segment_actual_duration
+            concat_list_file = os.path.join(temp_dir, "concat_list.txt")
+            with open(concat_list_file, "w", encoding="utf-8") as f:
+                for _, seg_path in segment_outputs:
+                    safe_path = seg_path.replace("'", "'\\''")
+                    f.write(f"file '{safe_path}'\n")
+
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            concat_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_file,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                output_path
+            ]
+            logger.debug(f"Concat FFmpeg command: {' '.join(concat_cmd)}")
+            try:
+                subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as concat_err:
+                # Fallback for strict muxers/container edge cases.
+                logger.warning("Concat with stream copy failed, retrying with re-encode")
+                logger.debug(f"Concat copy stderr: {concat_err.stderr if hasattr(concat_err, 'stderr') else 'N/A'}")
+                concat_reencode_cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_list_file,
+                    "-an",
+                    "-c:v", "libx264",
+                    "-crf", "18",
+                    "-preset", "medium",
+                    "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    output_path
+                ]
+                logger.debug(f"Concat fallback FFmpeg command: {' '.join(concat_reencode_cmd)}")
+                subprocess.run(concat_reencode_cmd, capture_output=True, text=True, check=True)
+
+            muxed_duration = self._get_video_duration(output_path)
+            if muxed_duration > 0 and cumulative_actual_time > 0:
+                # Concat muxing/copy can slightly shift cumulative duration.
+                # Scale the timing map so subtitles follow the real muxed output.
+                duration_scale = muxed_duration / cumulative_actual_time
+                if abs(duration_scale - 1.0) > 1e-4:
+                    for adj in timing_adjustments:
+                        adj["new_start"] *= duration_scale
+                        adj["new_end"] *= duration_scale
+                        adj["offset"] = adj["new_start"] - adj["original_start"]
+                    logger.warning(
+                        "Applied timing scale %.8f to subtitle mapping "
+                        "(segment_sum=%.6fs, muxed=%.6fs).",
+                        duration_scale,
+                        cumulative_actual_time,
+                        muxed_duration,
+                    )
+                    cumulative_actual_time = muxed_duration
+
+            log(
+                "Video speed adjustment complete. "
+                f"Requested duration: {requested_total_new_time:.2f}s, "
+                f"Rendered segments: {cumulative_actual_time:.2f}s "
+                f"(original: {total_original_duration:.2f}s)"
+            )
             return output_path, timing_adjustments
-            
+
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to apply video speed adjustment: {e}")
             logger.error(f"FFmpeg stderr: {e.stderr if hasattr(e, 'stderr') else 'N/A'}")
-            # Fall back to original video
             return video_path, []
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
     def combine_audio_with_video(self,
                                 video_path: str,
@@ -788,6 +992,7 @@ class VideoProcessor:
                                 ffmpeg_batch_size: int = 50,
                                 dubbed_volume: float = 1.0,
                                 background_volume: float = 0.562341,
+                                max_output_height: Optional[int] = None,
                                 upscale_factor: float = 1.0,
                                 upscale_sharpen: bool = True,
                                 progress_callback: Optional[callable] = None,
@@ -818,6 +1023,7 @@ class VideoProcessor:
             dubbed_volume: Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
             upscale_factor: Video scale factor (>1.0 to upscale; default 1.0 disables)
             upscale_sharpen: Apply mild sharpening after scaling
+            max_output_height: Maximum output video height (e.g., 720/1080). None preserves original.
             progress_callback: Optional callback(current, total, message) for progress updates
             log_callback: Optional callback(message) for logging to external systems
             video_speed_segments: Optional list of VideoSpeedSegment dicts for per-segment video speed adjustment
@@ -887,6 +1093,7 @@ class VideoProcessor:
         # Audio normalization is now done per-segment before combination
         # Skip whole-track normalization since segments are already normalized
         normalized_translated_audio_path = translated_audio_path
+        duration_synced_audio_temp = None
         logger.debug("Using pre-normalized per-segment audio (normalization disabled at track level)")
 
         # Initialize logo dimensions to default values
@@ -900,6 +1107,24 @@ class VideoProcessor:
             raise FileNotFoundError(f"Normalized translated audio file not found: {normalized_translated_audio_path}")
         if background_audio_path and not os.path.exists(background_audio_path):
             raise FileNotFoundError(f"Background audio file not found: {background_audio_path}")
+
+        # In video/audio_and_video modes, align dubbed audio duration to the
+        # real rendered speed-adjusted video duration to prevent cumulative drift.
+        if effective_video_path != video_path:
+            effective_video_duration = self._get_video_duration(effective_video_path)
+            if effective_video_duration > 0:
+                maybe_synced_audio = self._align_audio_duration_to_video(
+                    normalized_translated_audio_path,
+                    effective_video_duration,
+                    tolerance_seconds=0.25,
+                    log_callback=log_callback,
+                )
+                if maybe_synced_audio != normalized_translated_audio_path:
+                    duration_synced_audio_temp = maybe_synced_audio
+                    normalized_translated_audio_path = maybe_synced_audio
+
+        # Get source video metadata once for filter and encoding decisions.
+        video_info = self._get_video_info(video_path)
 
         # Use list-based approach to build command to avoid quoting issues
         command = ["ffmpeg", "-y"]
@@ -952,6 +1177,28 @@ class VideoProcessor:
 
         # Optional upscaling and quality enhancement (applied before overlays/text)
         current_video_label = "0:v"
+
+        # Optional output resolution cap (downscale only, never upscale).
+        try:
+            requested_max_height = int(max_output_height) if max_output_height is not None else None
+        except (TypeError, ValueError):
+            requested_max_height = None
+
+        source_height = 0
+        if video_info.get("video_stream"):
+            source_height = int(video_info["video_stream"].get("height") or 0)
+
+        if requested_max_height and requested_max_height > 0 and source_height > requested_max_height:
+            all_filter_complex_parts.append(
+                f"[{current_video_label}]scale=-2:{requested_max_height}:flags=lanczos[vid_capped]"
+            )
+            current_video_label = "vid_capped"
+            video_map_option = "[vid_capped]"
+            log(
+                f"Applying video quality cap: {requested_max_height}p "
+                f"(source height: {source_height}p)"
+            )
+
         try:
             if upscale_factor and float(upscale_factor) > 1.0:
                 # Clamp factor to a reasonable range
@@ -1086,9 +1333,7 @@ class VideoProcessor:
             if not can_trim_with_stream_copy:
                 need_video_reencode = True
                 logger.debug("Video trimming requires re-encoding due to keyframe alignment")
-        
-        # Get video info for quality decisions
-        video_info = self._get_video_info(video_path)
+
         original_bitrate = video_info.get('video_bitrate')
         original_codec = video_info.get('video_codec', 'h264')
         
@@ -1199,6 +1444,8 @@ class VideoProcessor:
         # Handle pause processing based on mode
         pause_adjustments = []
         temp_files_to_cleanup = []
+        if duration_synced_audio_temp and duration_synced_audio_temp != translated_audio_path:
+            temp_files_to_cleanup.append(duration_synced_audio_temp)
         
         logger.info(f"Pause removal mode: {pause_removal}")
         

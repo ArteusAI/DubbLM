@@ -26,7 +26,9 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN printf "setuptools<81\n" > /tmp/pip-constraints.txt \
+    && PIP_CONSTRAINT=/tmp/pip-constraints.txt pip install --no-cache-dir --upgrade "pip==25.1.1" "setuptools<81" wheel \
+    && PIP_CONSTRAINT=/tmp/pip-constraints.txt pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
@@ -39,4 +41,3 @@ EXPOSE 8000
 
 # Default command (overridden in docker-compose)
 CMD ["python", "run_api.py"]
-

@@ -1,9 +1,10 @@
 """Download routes for results."""
 
 from pathlib import Path
+import re
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
 
 from ..database.session import get_db
@@ -11,6 +12,64 @@ from ..database.models import Project, ProjectStatus
 from ..services.project_manager import ProjectManager
 
 router = APIRouter(prefix="/projects", tags=["download"])
+
+
+def _resolve_result_video_path(project_id: str, project: Project) -> Path:
+    """Resolve dubbed video path for a project."""
+    pm = ProjectManager(project_id)
+    config = project.config or {}
+    target_lang = config.get("targetLang", "ru")
+
+    video_path = pm.get_result_video_path(target_lang)
+    if video_path.exists():
+        return video_path
+
+    videos = list(pm.results_dir.glob("*.mp4"))
+    if videos:
+        return videos[0]
+
+    raise HTTPException(status_code=404, detail="Dubbed video not found")
+
+
+def _iter_file_range(file_path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    """Yield file bytes from start to end (inclusive)."""
+    with file_path.open("rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            read_size = min(chunk_size, remaining)
+            data = f.read(read_size)
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
+
+
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse a single HTTP Range header in bytes units."""
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match:
+        return None
+
+    start_str, end_str = match.groups()
+    if not start_str and not end_str:
+        return None
+
+    if start_str:
+        start = int(start_str)
+        end = int(end_str) if end_str else file_size - 1
+    else:
+        suffix_length = int(end_str)
+        if suffix_length <= 0:
+            return None
+        start = max(0, file_size - suffix_length)
+        end = file_size - 1
+
+    if start < 0 or end < start or start >= file_size:
+        return None
+
+    end = min(end, file_size - 1)
+    return start, end
 
 
 @router.get("/{project_id}/download/video")
@@ -23,24 +82,65 @@ async def download_video(project_id: str, db: Session = Depends(get_db)):
     if project.status != ProjectStatus.DUBBED:
         raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
     
-    pm = ProjectManager(project_id)
-    config = project.config or {}
-    target_lang = config.get("targetLang", "ru")
-    
-    video_path = pm.get_result_video_path(target_lang)
-    
-    if not video_path.exists():
-        # Try to find any video in results
-        videos = list(pm.results_dir.glob("*.mp4"))
-        if videos:
-            video_path = videos[0]
-        else:
-            raise HTTPException(status_code=404, detail="Dubbed video not found")
+    video_path = _resolve_result_video_path(project_id, project)
     
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",
         filename=video_path.name
+    )
+
+
+@router.get("/{project_id}/stream/video")
+async def stream_dubbed_video(project_id: str, request: Request, db: Session = Depends(get_db)):
+    """Stream dubbed video with HTTP Range support for immediate playback."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status != ProjectStatus.DUBBED:
+        raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
+
+    video_path = _resolve_result_video_path(project_id, project)
+    file_size = video_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-cache",
+    }
+
+    if not range_header:
+        headers = {
+            **base_headers,
+            "Content-Length": str(file_size),
+        }
+        return StreamingResponse(
+            _iter_file_range(video_path, 0, file_size - 1),
+            media_type="video/mp4",
+            headers=headers,
+            status_code=status.HTTP_200_OK,
+        )
+
+    byte_range = _parse_range_header(range_header, file_size)
+    if byte_range is None:
+        return Response(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+    start, end = byte_range
+    content_length = end - start + 1
+    headers = {
+        **base_headers,
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Length": str(content_length),
+    }
+    return StreamingResponse(
+        _iter_file_range(video_path, start, end),
+        media_type="video/mp4",
+        headers=headers,
+        status_code=status.HTTP_206_PARTIAL_CONTENT,
     )
 
 
@@ -153,4 +253,3 @@ async def get_project_stats(project_id: str, db: Session = Depends(get_db)):
         "processingTimeSec": result_stats.get("processingTimeSec", 0),
         "totalCost": result_stats.get("totalCost", 0),
     }
-

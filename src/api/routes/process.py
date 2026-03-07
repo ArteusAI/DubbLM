@@ -1,21 +1,72 @@
 """Processing routes for transcription and dubbing."""
 
 import logging
+import shutil
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 logger = logging.getLogger(__name__)
 
 from ..database.session import get_db
-from ..database.models import Project, Job, JobType, JobStatus, ProjectStatus, generate_job_id
+from ..database.models import Project, Segment, Job, JobType, JobStatus, ProjectStatus, generate_job_id
 from ..models.schemas import JobResponse
 from ..services.project_manager import ProjectManager
 from ..workers.tasks import transcribe_project, dub_project
 from ..workers.celery_app import celery_app
 
 router = APIRouter(prefix="/projects", tags=["process"])
+
+
+def _enqueue_transcription_job(
+    db: Session,
+    project: Project,
+    *,
+    allow_existing: bool = True,
+) -> JobResponse:
+    """Create and dispatch a transcription job for a project."""
+    if allow_existing:
+        active_job = db.query(Job).filter(
+            Job.project_id == project.id,
+            Job.job_type == JobType.TRANSCRIBE,
+            Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
+        ).first()
+        if active_job:
+            return JobResponse(
+                jobId=active_job.id,
+                status=active_job.status.value,
+                projectId=project.id,
+                type="transcribe",
+                progress=active_job.progress,
+                currentStep=active_job.current_step,
+            )
+
+    job = Job(
+        id=generate_job_id("transcribe"),
+        project_id=project.id,
+        job_type=JobType.TRANSCRIBE,
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+
+    project.status = ProjectStatus.TRANSCRIBING
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    task = transcribe_project.delay(project.id, job.id)
+    job.celery_task_id = task.id
+    db.commit()
+
+    return JobResponse(
+        jobId=job.id,
+        status="processing",
+        projectId=project.id,
+        type="transcribe",
+        progress=0,
+        currentStep="pending",
+    )
 
 
 @router.post("/{project_id}/process/transcribe", response_model=JobResponse, status_code=202)
@@ -45,53 +96,58 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
             detail="Source and target languages must be configured before transcription"
         )
     
-    # Check if there's already an active transcription job
-    active_job = db.query(Job).filter(
-        Job.project_id == project_id,
-        Job.job_type == JobType.TRANSCRIBE,
-        Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
-    ).first()
-    
-    if active_job:
-        return JobResponse(
-            jobId=active_job.id,
-            status=active_job.status.value,
-            projectId=project_id,
-            type="transcribe",
-            progress=active_job.progress,
-            currentStep=active_job.current_step,
+    return _enqueue_transcription_job(db, project, allow_existing=True)
+
+
+@router.post("/{project_id}/process/restart", response_model=JobResponse, status_code=202)
+async def restart_processing(project_id: str, db: Session = Depends(get_db)):
+    """Reset project cache/artifacts and restart end-to-end processing from scratch."""
+    db.expire_all()
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    pm = ProjectManager(project_id)
+    source_video = pm.get_source_video_path()
+    if not source_video or not source_video.exists():
+        raise HTTPException(status_code=400, detail="No video uploaded for this project")
+
+    config = dict(project.config or {})
+    if not config.get("sourceLang") or not config.get("targetLang"):
+        raise HTTPException(
+            status_code=400,
+            detail="Source and target languages must be configured before restart"
         )
-    
-    # Create new job
-    job = Job(
-        id=generate_job_id("transcribe"),
-        project_id=project_id,
-        job_type=JobType.TRANSCRIBE,
-        status=JobStatus.PENDING,
-    )
-    db.add(job)
-    
-    # Update project status
-    project.status = ProjectStatus.TRANSCRIBING
+
+    active_jobs = db.query(Job).filter(
+        Job.project_id == project_id,
+        Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+    ).all()
+    for job in active_jobs:
+        if job.celery_task_id:
+            celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+        job.status = JobStatus.CANCELLED
+        job.completed_at = datetime.now(timezone.utc)
+        job.add_log("Processing cancelled for restart", "info")
+
+    # Remove segment data and project artifacts/cache/results.
+    db.query(Segment).filter(Segment.project_id == project_id).delete()
+    pm.cleanup_artifacts()
+    if pm.results_dir.exists():
+        shutil.rmtree(pm.results_dir)
+    pm.ensure_directories()
+
+    # Ensure restart runs full pipeline automatically.
+    config["autoProcess"] = True
+    config.pop("resultStats", None)
+    project.config = config
+    flag_modified(project, "config")
+    project.status = ProjectStatus.DRAFT
     project.updated_at = datetime.now(timezone.utc)
-    
     db.commit()
-    
-    # Dispatch Celery task
-    task = transcribe_project.delay(project_id, job.id)
-    
-    # Update job with celery task ID
-    job.celery_task_id = task.id
-    db.commit()
-    
-    return JobResponse(
-        jobId=job.id,
-        status="processing",
-        projectId=project_id,
-        type="transcribe",
-        progress=0,
-        currentStep="pending",
-    )
+
+    return _enqueue_transcription_job(db, project, allow_existing=False)
 
 
 @router.post("/{project_id}/process/dub", response_model=JobResponse, status_code=202)
@@ -222,4 +278,3 @@ async def stop_processing(project_id: str, db: Session = Depends(get_db)):
     db.commit()
     
     return {"message": f"Stopped {stopped_count} job(s)", "stopped": True}
-

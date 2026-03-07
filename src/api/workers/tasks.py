@@ -5,7 +5,7 @@ import sys
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, cast
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -17,58 +17,27 @@ from ..database.session import get_db_session
 from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, JobType
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
+from ..services.preset_service import get_preset_config
 
 logger = logging.getLogger(__name__)
 
 
-PresetType = Literal["fast", "hq", "ultra"]
+VideoQualityPreset = Literal["720p", "1080p", "original"]
 
-PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
-    "fast": {
-        "llm_provider": "gemini",
-        "llm_model_name": "gemini-flash-lite-latest",
-        "llm_temperature": 0.5,
-        "tts_system": "openai",
-        "tts_model": "gpt-4o-mini-tts",
-        "tts_fallback_model": "gpt-4o-mini-tts",
-        "tts_prompt_prefix": None,
-        "pause_removal": "disabled",
-    },
-    "hq": {
-        "llm_provider": "gemini",
-        "llm_model_name": "gemini-flash-latest",
-        "llm_temperature": 0.5,
-        "refinement_llm_provider": "gemini",
-        "refinement_model_name": "gemini-2.5-pro",
-        "refinement_temperature": 1.0,
-        "tts_system": "gemini",
-        "tts_model": "gemini-2.5-flash-preview-tts",
-        "tts_fallback_model": "gemini-2.5-flash-preview-tts",
-        "tts_prompt_prefix": "Speak with natural conversational energy, clear articulation:",
-        "pause_removal": "cut",
-    },
-    "ultra": {
-        "llm_provider": "gemini",
-        "llm_model_name": "gemini-2.5-pro",
-        "llm_temperature": 0.5,
-        "refinement_llm_provider": "gemini",
-        "refinement_model_name": "gemini-2.5-pro",
-        "refinement_temperature": 1.0,
-        "tts_system": "gemini",
-        "tts_model": "gemini-2.5-pro-preview-tts",
-        "tts_fallback_model": "gemini-2.5-pro-preview-tts",
-        "tts_prompt_prefix": "Speak with natural conversational energy, clear articulation:",
-        "pause_removal": "cut",
-        "video_minterpolate_threshold": 1.0,  # Enable smooth slowdown for all slowdowns
-    },
+VIDEO_QUALITY_MAX_HEIGHT: Dict[VideoQualityPreset, Optional[int]] = {
+    "720p": 720,
+    "1080p": 1080,
+    "original": None,
 }
 
+def get_video_quality_preset(config_data: Dict[str, Any], preset_config: Dict[str, Any]) -> VideoQualityPreset:
+    """Resolve effective video quality preset from project config and preset defaults."""
+    requested = config_data.get("videoQualityPreset") or preset_config.get("video_quality_preset") or "original"
+    if requested in VIDEO_QUALITY_MAX_HEIGHT:
+        return cast(VideoQualityPreset, requested)
 
-def get_preset_config(preset: Optional[str]) -> Dict[str, Any]:
-    """Get configuration values for a given preset."""
-    if preset and preset in PRESET_CONFIGS:
-        return PRESET_CONFIGS[preset]
-    return PRESET_CONFIGS["hq"]
+    logger.warning(f"Unknown videoQualityPreset={requested!r}, falling back to 'original'")
+    return "original"
 
 
 def _apply_api_keys(project_api_keys: Optional[Dict[str, str]] = None) -> None:
@@ -81,6 +50,20 @@ def _apply_api_keys(project_api_keys: Optional[Dict[str, str]] = None) -> None:
         for provider, key in project_api_keys.items():
             if key and provider in API_KEY_PROVIDERS:
                 os.environ[API_KEY_PROVIDERS[provider]] = key
+
+
+def _normalize_speaker_voice_mappings(value: Any) -> Dict[str, str]:
+    """Normalize speaker->voice mapping payload from project config."""
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: Dict[str, str] = {}
+    for speaker_name, voice_id in value.items():
+        speaker = str(speaker_name).strip()
+        voice = str(voice_id).strip() if voice_id is not None else ""
+        if speaker and voice:
+            normalized[speaker] = voice
+    return normalized
 
 
 def update_job_progress(job_id: str, progress: int, step: str, message: Optional[str] = None, text: Optional[str] = None) -> None:
@@ -229,13 +212,18 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             logger.info(f"[DEBUG TRANSCRIBE] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
             logger.info(f"[DEBUG TRANSCRIBE] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
             logger.info(f"[DEBUG TRANSCRIBE] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
+            video_quality_preset = get_video_quality_preset(config_data, preset_config)
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
                 "input": str(source_file),
                 "source_language": source_lang,
                 "target_language": target_lang,
-                "keep_background": config_data.get("keepBackground", True),
+                "keep_background": config_data.get(
+                    "keepBackground",
+                    preset_config.get("keep_background", False)
+                ),
                 "pause_removal": config_data.get("pauseRemoval", "disabled"),
                 "speakers_expected": speaker_count,
                 "exit_before_synthesis": True,  # Stop after translation
@@ -245,6 +233,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
                 "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
                 "tts_prompt_prefix": config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
@@ -266,6 +255,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
+                "video_quality_preset": video_quality_preset,
                 # Processing settings
                 "max_workers": config_data.get("maxWorkers", 4),
                 # Video processing settings
@@ -458,13 +448,20 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             logger.info(f"[DEBUG DUB] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
             logger.info(f"[DEBUG DUB] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
             logger.info(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
+            speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
+            video_quality_preset = get_video_quality_preset(config_data, preset_config)
+            max_output_height = VIDEO_QUALITY_MAX_HEIGHT[video_quality_preset]
+            logger.info(f"[DEBUG DUB] videoQualityPreset: {video_quality_preset} -> max_output_height={max_output_height}")
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
                 "input": str(source_file),
                 "source_language": config_data.get("sourceLang", "en"),
                 "target_language": target_lang,
-                "keep_background": config_data.get("keepBackground", True),
+                "keep_background": config_data.get(
+                    "keepBackground",
+                    preset_config.get("keep_background", False)
+                ),
                 "pause_removal": pause_removal_value,
                 "output": str(pm.get_result_video_path(target_lang)),
                 "save_translated_subtitles": True,
@@ -473,6 +470,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
                 "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
                 "tts_prompt_prefix": tts_prompt_prefix,
+                "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
@@ -482,6 +480,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
+                "video_quality_preset": video_quality_preset,
                 # Video processing settings
                 "video_minterpolate_threshold": config_data.get("videoMinterpolateThreshold") or preset_config.get("video_minterpolate_threshold"),
                 # Translation settings (for any re-translation)
@@ -572,7 +571,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Process background with progress callback
             background_audio_path = None
-            if config_data.get("keepBackground", True):
+            if config_data.get("keepBackground", preset_config.get("keep_background", False)):
                 update_job_progress(job_id, 74, "background_audio", "Processing background audio")
                 def background_progress(current: int, total: int, message: str = ""):
                     # Progress from 74% to 84% during background audio extraction
@@ -588,9 +587,17 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Progress callback for video combining (84% to 99%)
             def video_combine_progress(current: int, total: int, message: str = ""):
                 progress = 84 + int((current / total) * 15) if total > 0 else 84
-                update_job_progress(job_id, progress, "video_combine", message or f"Processing video: {current}/{total}s")
+                if message == "Video speed segment processing" and total > 0:
+                    # Keep a stable "Label: current/total" format so frontend renders a single inline progress bar.
+                    ui_message = f"Video speed segment processing: {current}/{total}"
+                else:
+                    ui_message = message or f"Processing video: {current}/{total}s"
+                update_job_progress(job_id, progress, "video_combine", ui_message)
             
             def video_combine_log(message: str):
+                # Segment-level speed logs are useful in debug files but too noisy for SSE UI logs.
+                if message.startswith("Segment ") and "speed=" in message:
+                    return
                 add_job_log(job_id, message)
             
             # Combine with video
@@ -598,6 +605,9 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Determine effective pause removal
             pause_removal = dubbing_config.get("pause_removal", "disabled")
+            
+            # Get video speed segments for video/audio_and_video modes
+            video_speed_segments = getattr(dubber, 'video_speed_segments', None)
             
             output_video_path, _ = dubber.video_processor.combine_audio_with_video(
                 video_path=str(source_file),
@@ -609,8 +619,10 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
+                max_output_height=max_output_height,
                 progress_callback=video_combine_progress,
                 log_callback=video_combine_log,
+                video_speed_segments=video_speed_segments,
             )
             
             # Save subtitles to results directory
@@ -688,7 +700,8 @@ def generate_preview(
                 raise ValueError(f"Project {project_id} not found")
             
             config_data = project.config or {}
-            voice_id = segment.voice_id
+            speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
+            voice_id = segment.voice_id or speaker_voice_mappings.get(segment.speaker)
         finally:
             db.close()
         
@@ -727,6 +740,7 @@ def generate_preview(
             tts = TTSFactory.create_tts(
                 tts_system=tts_system,
                 device="cpu",
+                voice_config=speaker_voice_mappings,
                 voice_prompt=config_data.get("speakerTtsPrompts", {}),
                 prompt_prefix=tts_prompt_prefix,
                 model=config_data.get("ttsModel"),

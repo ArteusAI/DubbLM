@@ -5,6 +5,67 @@ watermark_path: logo.png
 # Required parameters (input must be provided via CLI --input)
 source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
 target_language: "ru"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
+default_preset: "hq"  # Default UI preset: fast, hq, ultra
+
+# UI/API preset defaults (source of truth for preset values)
+presets:
+  fast:
+    llm_provider: "gemini"
+    llm_model_name: "gemini-flash-lite-latest"
+    llm_temperature: 0.5
+    tts_system: "openai"
+    tts_model: "gpt-4o-mini-tts"
+    tts_fallback_model: "gpt-4o-mini-tts"
+    keep_background: false
+    pause_removal: "disabled"
+    video_quality_preset: "720p"
+    voice_auto_selection: true
+    enable_emotion_enrichment: false
+    dubbed_volume: 1.0
+    background_volume: 0.56
+    use_two_pass_encoding: true
+    max_workers: 4
+  hq:
+    llm_provider: "gemini"
+    llm_model_name: "gemini-flash-latest"
+    llm_temperature: 0.5
+    refinement_llm_provider: "gemini"
+    refinement_model_name: "gemini-2.5-pro"
+    refinement_temperature: 1.0
+    tts_system: "gemini"
+    tts_model: "gemini-2.5-flash-preview-tts"
+    tts_fallback_model: "gemini-2.5-flash-preview-tts"
+    tts_prompt_prefix: "Speak with natural conversational energy, clear articulation:"
+    keep_background: false
+    pause_removal: "disabled"
+    video_quality_preset: "1080p"
+    voice_auto_selection: true
+    enable_emotion_enrichment: false
+    dubbed_volume: 1.0
+    background_volume: 0.56
+    use_two_pass_encoding: true
+    max_workers: 4
+  ultra:
+    llm_provider: "openrouter"
+    llm_model_name: "anthropic/claude-opus-4.6"
+    llm_temperature: 0.5
+    refinement_llm_provider: "openrouter"
+    refinement_model_name: "anthropic/claude-opus-4.6"
+    refinement_temperature: 1.0
+    tts_system: "gemini"
+    tts_model: "gemini-2.5-pro-preview-tts"
+    tts_fallback_model: "gemini-2.5-pro-preview-tts"
+    tts_prompt_prefix: "Speak with natural conversational energy, clear articulation:"
+    keep_background: false
+    pause_removal: "disabled"
+    video_quality_preset: "original"
+    video_minterpolate_threshold: 1.0
+    voice_auto_selection: true
+    enable_emotion_enrichment: true
+    dubbed_volume: 1.0
+    background_volume: 0.56
+    use_two_pass_encoding: true
+    max_workers: 4
 
 # Debug options
 debug_info: false  # Generate debug video with speaker labels and timing info
@@ -18,7 +79,7 @@ debug_tts: true  # Save rejected/silent attempts for TTS
 whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
 keep_background: true  # Preserve background music/sounds in output
 no_cache: false  # Disable caching (slower but fresh processing)
-remove_pauses: true  # Automatically shorten long silence periods
+remove_pauses: false  # Automatically shorten long silence periods
 normalize_audio: true  # Normalize audio volume for consistent output
 dubbed_volume: 1.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
 use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)

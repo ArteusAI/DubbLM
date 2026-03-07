@@ -149,6 +149,13 @@ class ApiClient {
     );
   }
 
+  async restartProcessing(projectId: string): Promise<JobResponse> {
+    return this.request<JobResponse>(
+      `/projects/${projectId}/process/restart`,
+      { method: 'POST' }
+    );
+  }
+
   // --- Segments ---
 
   async getSegments(projectId: string): Promise<SegmentResponse[]> {
@@ -276,6 +283,14 @@ class ApiClient {
     return this.request<Record<string, ApiKeyStatus>>('/settings/api-keys');
   }
 
+  async getPresets(): Promise<Record<string, PresetDefaultsResponse>> {
+    return this.request<Record<string, PresetDefaultsResponse>>('/settings/presets');
+  }
+
+  async getPreset(preset: string): Promise<PresetDefaultsResponse> {
+    return this.request<PresetDefaultsResponse>(`/settings/presets/${preset}`);
+  }
+
   async setApiKey(
     provider: string,
     key: string
@@ -300,6 +315,10 @@ class ApiClient {
 
   getDownloadVideoUrl(projectId: string): string {
     return `${this.baseUrl}/projects/${projectId}/download/video`;
+  }
+
+  getStreamVideoUrl(projectId: string): string {
+    return `${this.baseUrl}/projects/${projectId}/stream/video`;
   }
 
   getDownloadSubtitlesUrl(projectId: string, format: 'srt' | 'vtt' = 'srt', lang: 'source' | 'target' = 'target'): string {
@@ -430,6 +449,7 @@ export interface ProjectConfig {
   llmModelName?: string;
   llmTemperature?: number;
   speakerTtsPrompts?: Record<string, string>;
+  speakerVoiceMappings?: Record<string, string>;
   refinementLlmProvider?: string;
   refinementModelName?: string;
   refinementTemperature?: number;
@@ -442,6 +462,7 @@ export interface ProjectConfig {
   dubbedVolume?: number;
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;
+  videoQualityPreset?: '720p' | '1080p' | 'original';
   maxWorkers?: number;
   postDiarizationMergeGap?: number;
   postTranslationMergeGap?: number;
@@ -598,6 +619,29 @@ export interface ApiKeyStatus {
   provider?: string;
 }
 
+export interface PresetDefaultsResponse {
+  keepBackground?: boolean;
+  llmProvider?: string;
+  llmModelName?: string;
+  llmTemperature?: number;
+  refinementLlmProvider?: string;
+  refinementModelName?: string;
+  refinementTemperature?: number;
+  ttsSystem?: string;
+  ttsModel?: string;
+  ttsFallbackModel?: string;
+  ttsPromptPrefix?: string;
+  voiceAutoSelection?: boolean;
+  enableEmotionEnrichment?: boolean;
+  dubbedVolume?: number;
+  backgroundVolume?: number;
+  useTwoPassEncoding?: boolean;
+  videoQualityPreset?: '720p' | '1080p' | 'original';
+  maxWorkers?: number;
+  pauseRemoval?: 'cut' | 'disabled';
+  videoMinterpolateThreshold?: number;
+}
+
 export interface StatusEventHandlers {
   onProgress?: (percent: number, step: string) => void;
   onLog?: (log: LogEntry) => void;
@@ -610,4 +654,3 @@ export interface StatusEventHandlers {
 export const api = new ApiClient();
 
 export default api;
-

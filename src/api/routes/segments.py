@@ -6,6 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..database.session import get_db
 from ..database.models import Project, Segment, TTSProvider, Job, JobType, JobStatus
@@ -135,6 +136,15 @@ async def update_speaker_voice(
         "provider": provider,
         "audio_url": None,  # Clear cached audio
     })
+
+    # Persist mapping at project-config level so full dubbing can reuse it.
+    config = dict(project.config or {})
+    mappings = dict(config.get("speakerVoiceMappings") or {})
+    mappings[voice_data.speakerName] = voice_data.voiceId
+    config["speakerVoiceMappings"] = mappings
+    project.config = config
+    flag_modified(project, "config")
+    project.updated_at = datetime.now(timezone.utc)
     
     db.commit()
     
@@ -282,4 +292,3 @@ async def get_preview_status(
         return PreviewStatusResponse(status="processing", jobId=active_job.id)
     
     return PreviewStatusResponse(status="none")
-

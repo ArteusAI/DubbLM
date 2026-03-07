@@ -1,5 +1,5 @@
 from typing import Optional, Dict, List, Tuple
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from src.dubbing.core.log_config import get_logger
 
 logger = get_logger(__name__)
@@ -16,6 +16,20 @@ class TTSSegmentData(BaseModel):
     reference_audio_path: Optional[str] = Field(None, description="Path to a reference audio file for voice cloning for this specific segment/speaker.")
     reference_text: Optional[str] = Field(None, description="Text corresponding to the reference_audio_path, if required by the TTS system.")
     output_path: Optional[str] = Field(None, description="Path to save the synthesized audio for this specific segment.")
+
+    @validator("voice", pre=True)
+    def normalize_voice_override(cls, value: Optional[str]) -> Optional[str]:
+        """Normalize placeholder/default voice values to 'unset'."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip()
+            if not normalized:
+                return None
+            if normalized.lower() == "default":
+                return None
+            return normalized
+        return value
 
     class Config:
         extra = 'allow' # Allow other kwargs to be passed through if a TTS system needs them beyond this model

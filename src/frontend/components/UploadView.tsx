@@ -1,15 +1,21 @@
 
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain, Plus, Trash2, Users } from 'lucide-react';
-import { AppConfig, Persona, PresetId, LlmProvider } from '../types';
+import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain, Plus, Trash2, Users, Play, Pause, RotateCcw } from 'lucide-react';
+import { AppConfig, Persona, PresetId, LlmProvider, VideoQualityPreset } from '../types';
 import { LANGUAGES, PRESETS, LLM_PROVIDERS, TTS_PROVIDERS, TRANSCRIPTION_PROVIDERS, WHISPER_MODELS } from '../constants';
-import api from '../api';
+import api, { VoiceResponse } from '../api';
 
 const TTS_DEFAULT_MODELS: Record<string, string> = {
   gemini: 'gemini-2.5-flash-preview-tts',
   openai: 'gpt-4o-mini-tts',
   minimax: 'speech-02-hd',
 };
+
+const VIDEO_QUALITY_OPTIONS: Array<{ value: VideoQualityPreset; label: string }> = [
+  { value: '720p', label: 'Fast - 720p' },
+  { value: '1080p', label: 'HQ - 1080p' },
+  { value: 'original', label: 'Ultra - Original quality' },
+];
 
 const InfoTip: React.FC<{ text: string }> = ({ text }) => (
   <span className="relative group ml-1 cursor-help">
@@ -43,36 +49,51 @@ const LANG_FLAGS: Record<string, string> = {
 interface UploadViewProps {
   config: AppConfig;
   personas: Persona[];
+  voices: VoiceResponse[];
   projectId: string;
   videoFile: File | null;
   isUploading: boolean;
   uploadProgress: number;
   onConfigChange: (cfg: Partial<AppConfig>) => void;
   onNext: () => void;
+  onResetAndStart: () => void;
   onOpenSettings: () => void;
 }
 
 export const UploadView: React.FC<UploadViewProps> = ({ 
   config, 
   personas,
+  voices,
   projectId,
   videoFile,
   isUploading,
   uploadProgress,
   onConfigChange, 
   onNext,
+  onResetAndStart,
 }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showExtra, setShowExtra] = useState(false);
   const [newSpeakerName, setNewSpeakerName] = useState('');
   const [newSpeakerPrompt, setNewSpeakerPrompt] = useState('');
+  const [newSpeakerVoiceName, setNewSpeakerVoiceName] = useState('');
+  const [newSpeakerVoiceId, setNewSpeakerVoiceId] = useState('');
+  const [playingSampleKey, setPlayingSampleKey] = useState<string | null>(null);
+  const [showStartMenu, setShowStartMenu] = useState(false);
   
   // Use ref to track latest speakerTtsPrompts to avoid race conditions with async state updates
   const speakerPromptsRef = useRef<Record<string, string>>(config.speakerTtsPrompts || {});
+  const speakerVoiceMappingsRef = useRef<Record<string, string>>(config.speakerVoiceMappings || {});
+  const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
+  const startMenuRef = useRef<HTMLDivElement | null>(null);
   
   useEffect(() => {
     speakerPromptsRef.current = config.speakerTtsPrompts || {};
   }, [config.speakerTtsPrompts]);
+
+  useEffect(() => {
+    speakerVoiceMappingsRef.current = config.speakerVoiceMappings || {};
+  }, [config.speakerVoiceMappings]);
 
   const handleAddSpeakerPrompt = () => {
     if (!newSpeakerName.trim()) return;
@@ -102,6 +123,94 @@ export const UploadView: React.FC<UploadViewProps> = ({
     PRESETS.find(p => p.id === (config.preset || 'hq')) || PRESETS[1],
     [config.preset]
   );
+
+  const selectedTtsProvider = config.ttsSystem || currentPreset.ttsSystem;
+  const providerVoices = useMemo(
+    () => voices.filter((voice) => voice.provider === selectedTtsProvider),
+    [voices, selectedTtsProvider]
+  );
+  const defaultProviderVoiceId = providerVoices[0]?.id || '';
+  const getVoiceKey = (voice: VoiceResponse): string => `${voice.provider}:${voice.id}`;
+
+  useEffect(() => {
+    setNewSpeakerVoiceId((prev) => {
+      if (prev && providerVoices.some((voice) => voice.id === prev)) {
+        return prev;
+      }
+      return defaultProviderVoiceId;
+    });
+  }, [providerVoices, defaultProviderVoiceId]);
+
+  const handleAddSpeakerVoiceMapping = () => {
+    const speakerName = newSpeakerVoiceName.trim();
+    const voiceId = newSpeakerVoiceId || defaultProviderVoiceId;
+    if (!speakerName || !voiceId) return;
+
+    const currentMappings = { ...speakerVoiceMappingsRef.current };
+    currentMappings[speakerName] = voiceId;
+    speakerVoiceMappingsRef.current = currentMappings;
+    onConfigChange({ speakerVoiceMappings: currentMappings });
+
+    setNewSpeakerVoiceName('');
+    setNewSpeakerVoiceId(defaultProviderVoiceId);
+  };
+
+  const handleRemoveSpeakerVoiceMapping = (speakerName: string) => {
+    const currentMappings = { ...speakerVoiceMappingsRef.current };
+    delete currentMappings[speakerName];
+    speakerVoiceMappingsRef.current = currentMappings;
+    onConfigChange({ speakerVoiceMappings: currentMappings });
+  };
+
+  const handleUpdateSpeakerVoiceMapping = (speakerName: string, voiceId: string) => {
+    const currentMappings = { ...speakerVoiceMappingsRef.current };
+    currentMappings[speakerName] = voiceId;
+    speakerVoiceMappingsRef.current = currentMappings;
+    onConfigChange({ speakerVoiceMappings: currentMappings });
+  };
+
+  const stopSamplePlayback = () => {
+    if (sampleAudioRef.current) {
+      sampleAudioRef.current.pause();
+      sampleAudioRef.current.currentTime = 0;
+      sampleAudioRef.current = null;
+    }
+    setPlayingSampleKey(null);
+  };
+
+  const handleToggleVoiceSample = (voice?: VoiceResponse) => {
+    if (!voice?.preview_url) return;
+
+    const voiceKey = getVoiceKey(voice);
+    if (playingSampleKey === voiceKey) {
+      stopSamplePlayback();
+      return;
+    }
+
+    stopSamplePlayback();
+
+    const audio = new Audio(voice.preview_url);
+    sampleAudioRef.current = audio;
+    setPlayingSampleKey(voiceKey);
+    audio.onended = () => stopSamplePlayback();
+    audio.onerror = () => stopSamplePlayback();
+    audio.play().catch(() => stopSamplePlayback());
+  };
+
+  useEffect(() => {
+    return () => stopSamplePlayback();
+  }, []);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!startMenuRef.current) return;
+      if (!startMenuRef.current.contains(event.target as Node)) {
+        setShowStartMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const videoPreviewUrl = useMemo(() => {
     if (videoFile) {
@@ -187,27 +296,29 @@ export const UploadView: React.FC<UploadViewProps> = ({
               return (
                 <button
                   key={preset.id}
-                  onClick={() => {
+                  onClick={async () => {
+                    const presetFromApi = await api.getPreset(preset.id).catch(() => null);
                     const updates: Partial<AppConfig> = { 
                       preset: preset.id as PresetId,
                       personaId: preset.id === 'fast' ? 'none' : 'normal',
-                      keepBackground: preset.id !== 'fast',
-                      llmProvider: preset.llmProvider,
-                      llmModelName: preset.llmModelName,
-                      llmTemperature: preset.llmTemperature,
-                      refinementLlmProvider: preset.refinementLlmProvider,
-                      refinementModelName: preset.refinementModelName,
-                      refinementTemperature: preset.refinementTemperature,
-                      ttsSystem: preset.ttsSystem,
-                      ttsModel: preset.ttsModel,
-                      ttsPromptPrefix: preset.ttsPromptPrefix,
-                      voiceAutoSelection: preset.voiceAutoSelection,
-                      enableEmotionEnrichment: preset.enableEmotionEnrichment,
-                      dubbedVolume: preset.dubbedVolume,
-                      backgroundVolume: preset.backgroundVolume,
-                      useTwoPassEncoding: preset.useTwoPassEncoding,
-                      maxWorkers: preset.maxWorkers,
-                      pauseRemoval: preset.pauseRemoval,
+                      keepBackground: presetFromApi?.keepBackground ?? preset.keepBackground ?? false,
+                      llmProvider: (presetFromApi?.llmProvider as LlmProvider) ?? preset.llmProvider,
+                      llmModelName: presetFromApi?.llmModelName ?? preset.llmModelName,
+                      llmTemperature: presetFromApi?.llmTemperature ?? preset.llmTemperature,
+                      refinementLlmProvider: (presetFromApi?.refinementLlmProvider as LlmProvider | undefined) ?? preset.refinementLlmProvider,
+                      refinementModelName: presetFromApi?.refinementModelName ?? preset.refinementModelName,
+                      refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
+                      ttsSystem: presetFromApi?.ttsSystem ?? preset.ttsSystem,
+                      ttsModel: presetFromApi?.ttsModel ?? preset.ttsModel,
+                      ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
+                      voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
+                      enableEmotionEnrichment: presetFromApi?.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+                      dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
+                      backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
+                      useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
+                      videoQualityPreset: presetFromApi?.videoQualityPreset ?? preset.videoQualityPreset,
+                      maxWorkers: presetFromApi?.maxWorkers ?? preset.maxWorkers,
+                      pauseRemoval: presetFromApi?.pauseRemoval ?? preset.pauseRemoval,
                     };
                     onConfigChange(updates);
                   }}
@@ -505,7 +616,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             <InfoTip text="TTS provider (openai, gemini, minimax)" />
                           </label>
                           <select 
-                            value={config.ttsSystem || currentPreset.ttsSystem}
+                            value={selectedTtsProvider}
                             onChange={(e) => {
                               const provider = e.target.value;
                               onConfigChange({ 
@@ -558,21 +669,121 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         </label>
                       </div>
                       <div className="space-y-1">
-                        <label className={`text-[10px] flex items-center ${(config.ttsSystem || currentPreset.ttsSystem) === 'gemini' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                        <label className={`text-[10px] flex items-center ${selectedTtsProvider === 'gemini' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                           TTS Prompt Prefix
                           <InfoTip text="Global instruction prefix for TTS (Gemini only)" />
                         </label>
                         <input 
                           type="text"
-                          value={(config.ttsSystem || currentPreset.ttsSystem) === 'gemini' ? (config.ttsPromptPrefix || currentPreset.ttsPromptPrefix || '') : ''}
+                          value={selectedTtsProvider === 'gemini' ? (config.ttsPromptPrefix || currentPreset.ttsPromptPrefix || '') : ''}
                           onChange={(e) => onConfigChange({ ttsPromptPrefix: e.target.value || undefined })}
-                          disabled={(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini'}
-                          className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          placeholder={(config.ttsSystem || currentPreset.ttsSystem) === 'gemini' ? "Speak with natural conversational energy..." : "Only available for Gemini"}/>
+                          disabled={selectedTtsProvider !== 'gemini'}
+                          className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${selectedTtsProvider !== 'gemini' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          placeholder={selectedTtsProvider === 'gemini' ? "Speak with natural conversational energy..." : "Only available for Gemini"}/>
+                      </div>
+
+                      {/* Per-Speaker Voice Mapping */}
+                      <div className="space-y-2 pt-2 border-t border-zinc-800/30">
+                        <label className="text-[10px] text-zinc-500 flex items-center gap-1">
+                          <Users className="w-3 h-3" />
+                          Per-Speaker Voice Mapping
+                          <InfoTip text="Pin a voice for each speaker using the selected TTS provider. Speaker names are matched after transcription." />
+                        </label>
+
+                        {Object.entries(config.speakerVoiceMappings || {}).length > 0 && (
+                          <div className="space-y-1.5">
+                            {Object.entries(config.speakerVoiceMappings || {}).map(([speaker, voiceId]) => {
+                              const selectedVoice = providerVoices.find((voice) => voice.id === voiceId);
+                              const hasProviderVoice = providerVoices.some((voice) => voice.id === voiceId);
+                              const canPreview = Boolean(selectedVoice?.preview_url);
+                              const isPlaying = selectedVoice ? playingSampleKey === getVoiceKey(selectedVoice) : false;
+
+                              return (
+                                <div key={speaker} className="flex items-center gap-2 bg-zinc-950/50 rounded p-1.5">
+                                  <span className="text-[10px] font-medium text-zinc-400 min-w-[70px] shrink-0">{speaker}</span>
+                                  <select
+                                    value={voiceId}
+                                    onChange={(e) => handleUpdateSpeakerVoiceMapping(speaker, e.target.value)}
+                                    className="flex-1 bg-zinc-900 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                  >
+                                    {!hasProviderVoice && (
+                                      <option value={voiceId}>{voiceId} (from another provider)</option>
+                                    )}
+                                    {providerVoices.map((voice) => (
+                                      <option key={voice.id} value={voice.id}>
+                                        {voice.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    onClick={() => handleToggleVoiceSample(selectedVoice)}
+                                    disabled={!canPreview}
+                                    className="p-1 text-zinc-500 hover:text-brand-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                                    title={canPreview ? (isPlaying ? 'Stop sample' : 'Play sample') : 'Sample unavailable'}
+                                  >
+                                    {isPlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+                                  </button>
+                                  <button
+                                    onClick={() => handleRemoveSpeakerVoiceMapping(speaker)}
+                                    className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                                    title="Remove mapping"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newSpeakerVoiceName}
+                            onChange={(e) => setNewSpeakerVoiceName(e.target.value)}
+                            className="w-[90px] bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            placeholder="Speaker"
+                          />
+                          <select
+                            value={newSpeakerVoiceId}
+                            onChange={(e) => setNewSpeakerVoiceId(e.target.value)}
+                            disabled={providerVoices.length === 0}
+                            className={`flex-1 bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${providerVoices.length === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          >
+                            {providerVoices.length === 0 ? (
+                              <option value="">No voices for {selectedTtsProvider}</option>
+                            ) : (
+                              providerVoices.map((voice) => (
+                                <option key={voice.id} value={voice.id}>
+                                  {voice.name}
+                                </option>
+                              ))
+                            )}
+                          </select>
+                          <button
+                            onClick={() => handleToggleVoiceSample(providerVoices.find((voice) => voice.id === newSpeakerVoiceId))}
+                            disabled={!providerVoices.find((voice) => voice.id === newSpeakerVoiceId)?.preview_url}
+                            className="p-1 text-zinc-500 hover:text-brand-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            title="Play selected voice sample"
+                          >
+                            <Play className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={handleAddSpeakerVoiceMapping}
+                            disabled={!newSpeakerVoiceName.trim() || !newSpeakerVoiceId}
+                            className="p-1 text-zinc-500 hover:text-brand-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                            title="Add speaker voice mapping"
+                          >
+                            <Plus className="w-4 h-4" />
+                          </button>
+                        </div>
+                        <p className="text-[9px] text-zinc-600">
+                          Example speaker names: SPEAKER_00, SPEAKER_01
+                        </p>
                       </div>
 
                       {/* Per-Speaker TTS Prompts */}
-                      <div className={`space-y-2 pt-2 border-t border-zinc-800/30 ${(config.ttsSystem || currentPreset.ttsSystem) !== 'gemini' ? 'opacity-40 pointer-events-none' : ''}`}>
+                      <div className={`space-y-2 pt-2 border-t border-zinc-800/30 ${selectedTtsProvider !== 'gemini' ? 'opacity-40 pointer-events-none' : ''}`}>
                         <label className="text-[10px] text-zinc-500 flex items-center gap-1">
                           <Users className="w-3 h-3" />
                           Per-Speaker TTS Prompts
@@ -680,6 +891,21 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           <span className="text-[10px] text-zinc-400">2-Pass</span>
                           <InfoTip text="Higher quality video encoding (slower)" />
                         </label>
+                      </div>
+                      <div className="space-y-1 max-w-[240px]">
+                        <label className="text-[10px] text-zinc-500 flex items-center">
+                          Video Quality
+                          <InfoTip text="Final output resolution cap: Fast (720p), HQ (1080p), Ultra (keep original)." />
+                        </label>
+                        <select
+                          value={config.videoQualityPreset || currentPreset.videoQualityPreset || '1080p'}
+                          onChange={(e) => onConfigChange({ videoQualityPreset: e.target.value as VideoQualityPreset })}
+                          className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                        >
+                          {VIDEO_QUALITY_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
                       </div>
                     </div>
 
@@ -879,20 +1105,54 @@ export const UploadView: React.FC<UploadViewProps> = ({
         </div>
 
         {/* Start Processing Button */}
-        <button 
-          onClick={onNext}
-          disabled={!canProceed}
-          className="w-full py-3.5 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-semibold transition-all shadow-lg shadow-brand-500/20 active:scale-[0.98]"
-        >
-          {isUploading ? (
-            <span className="flex items-center justify-center gap-2 text-sm">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              Uploading... {Math.round(uploadProgress)}%
-            </span>
-          ) : (
-            'Start Processing'
+        <div className="w-full relative" ref={startMenuRef}>
+          <div className="w-full flex">
+            <button 
+              onClick={onNext}
+              disabled={!canProceed}
+              className="flex-1 py-3.5 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-l-lg font-semibold transition-all shadow-lg shadow-brand-500/20 active:scale-[0.98]"
+            >
+              {isUploading ? (
+                <span className="flex items-center justify-center gap-2 text-sm">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Uploading... {Math.round(uploadProgress)}%
+                </span>
+              ) : (
+                'Start'
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowStartMenu((prev) => !prev)}
+              disabled={!canProceed}
+              className="px-4 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-r-lg border-l border-brand-400/40 transition-colors"
+              title="More Start Options"
+            >
+              <ChevronDown className={`w-4 h-4 transition-transform ${showStartMenu ? 'rotate-180' : ''}`} />
+            </button>
+          </div>
+
+          {showStartMenu && canProceed && !isUploading && (
+            <div className="absolute right-0 mt-2 w-64 bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl overflow-hidden z-30">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowStartMenu(false);
+                  onResetAndStart();
+                }}
+                className="w-full px-4 py-3 text-left hover:bg-zinc-800 transition-colors"
+              >
+                <span className="flex items-center gap-2 text-sm text-white font-medium">
+                  <RotateCcw className="w-4 h-4 text-cyan-400" />
+                  Reset & Start Processing
+                </span>
+                <span className="block mt-1 text-[11px] text-zinc-400">
+                  Clear cache/artifacts and run the whole pipeline from scratch.
+                </span>
+              </button>
+            </div>
           )}
-        </button>
+        </div>
       </div>
     </div>
   );

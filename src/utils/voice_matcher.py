@@ -255,6 +255,45 @@ class VoiceMatcher:
         logger.debug(f"Voice '{best_voice}' won tie-breaker with {max_votes}/{len(reference_embeddings)} votes (avg distance: {best_avg_distance:.3f})")
         return best_voice
 
+    def get_voice_similarity(self, audio_embedding: np.ndarray, voice_name: str) -> Optional[float]:
+        """
+        Compute cosine similarity between an audio embedding and a cached sample voice embedding.
+
+        Returns similarity in [0, 1] where higher means closer voice match.
+        """
+        if not self.enable_matching:
+            return None
+        if audio_embedding is None:
+            return None
+
+        sample_embedding = self.sample_embeddings.get(voice_name)
+        if sample_embedding is None:
+            logger.debug(f"No cached sample embedding for voice '{voice_name}'")
+            return None
+
+        try:
+            similarity = 1.0 - float(cosine(audio_embedding, sample_embedding))
+            if np.isnan(similarity):
+                return None
+            return similarity
+        except Exception as e:
+            logger.error(f"Error calculating similarity for voice '{voice_name}': {e}")
+            return None
+
+    def get_audio_similarity_to_voice(self, audio_path: Union[str, Path], voice_name: str) -> Optional[float]:
+        """
+        Extract an embedding from audio and compare it to a cached sample voice embedding.
+
+        Returns similarity in [0, 1] where higher means closer voice match.
+        """
+        if not self.enable_matching or not self.audio_embedder:
+            return None
+
+        embedding = self.extract_embedding_for_audio_file(audio_path)
+        if embedding is None:
+            return None
+        return self.get_voice_similarity(embedding, voice_name)
+
     def _get_audio_duration_seconds(self, audio_path: Union[str, Path]) -> Optional[float]:
         """Gets the duration of an audio file in seconds."""
         try:
