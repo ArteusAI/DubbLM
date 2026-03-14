@@ -254,6 +254,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 "video_quality_preset": video_quality_preset,
                 # Processing settings
@@ -479,6 +480,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 "video_quality_preset": video_quality_preset,
                 # Video processing settings

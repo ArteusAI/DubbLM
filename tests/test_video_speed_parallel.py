@@ -77,6 +77,21 @@ def test_apply_per_segment_video_speed_uses_cpu_minus_one_workers(monkeypatch, t
     for cmd in captured["segment_cmds"]:
         assert "-threads" in cmd
         assert cmd[cmd.index("-threads") + 1] == "1"
+        assert "-vsync" in cmd
+        assert cmd[cmd.index("-vsync") + 1] == "cfr"
+        assert "-r" in cmd
+        assert "-tag:v" in cmd
+        assert cmd[cmd.index("-tag:v") + 1] == "avc1"
     assert len(captured["concat_cmds"]) == 1
+    concat_cmd = captured["concat_cmds"][0]
+    assert "-c" not in concat_cmd
+    assert "-c:v" in concat_cmd
+    assert concat_cmd[concat_cmd.index("-c:v") + 1] == "libx264"
+    assert "-fflags" in concat_cmd
+    assert concat_cmd[concat_cmd.index("-fflags") + 1] == "+genpts"
+    assert "-vsync" in concat_cmd
+    assert concat_cmd[concat_cmd.index("-vsync") + 1] == "cfr"
+    assert "-tag:v" in concat_cmd
+    assert concat_cmd[concat_cmd.index("-tag:v") + 1] == "avc1"
     assert result_path == str(output_video)
     assert len(timing_adjustments) == 2

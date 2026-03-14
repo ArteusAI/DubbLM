@@ -60,6 +60,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             # Audio settings
             dubbedVolume=config.get("dubbedVolume"),
             backgroundVolume=config.get("backgroundVolume"),
+            keepOriginalAudioRanges=config.get("keepOriginalAudioRanges"),
             useTwoPassEncoding=config.get("useTwoPassEncoding"),
             videoQualityPreset=config.get("videoQualityPreset"),
             maxWorkers=config.get("maxWorkers"),

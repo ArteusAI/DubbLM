@@ -141,6 +141,7 @@ export interface AppConfig {
   // Audio extras
   dubbedVolume?: number;
   backgroundVolume?: number;
+  keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: VideoQualityPreset;
   

@@ -157,6 +157,44 @@ class VideoProcessor:
             logger.error(f"Failed to get video duration for {video_path}: {e}")
             return 0.0
 
+    def _parse_ffprobe_fps(self, raw_fps: Any) -> Optional[float]:
+        """Parse ffprobe frame-rate strings like '30000/1001' or '30'."""
+        if raw_fps is None:
+            return None
+        text = str(raw_fps).strip()
+        if not text or text in {"0/0", "N/A"}:
+            return None
+        try:
+            if "/" in text:
+                num_str, den_str = text.split("/", 1)
+                num = float(num_str)
+                den = float(den_str)
+                if den <= 0:
+                    return None
+                fps = num / den
+            else:
+                fps = float(text)
+            if fps <= 0:
+                return None
+            return fps
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _resolve_speed_output_fps(self, video_info: Dict[str, Any], needs_high_fps: bool) -> float:
+        """Resolve a stable CFR target FPS for per-segment speed rendering."""
+        default_fps = 30.0
+        video_stream = video_info.get("video_stream") or {}
+        parsed_fps = (
+            self._parse_ffprobe_fps(video_stream.get("avg_frame_rate"))
+            or self._parse_ffprobe_fps(video_stream.get("r_frame_rate"))
+            or default_fps
+        )
+        # Clamp to a sane playback range.
+        parsed_fps = max(15.0, min(parsed_fps, 120.0))
+        if needs_high_fps:
+            return max(parsed_fps, 60.0)
+        return parsed_fps
+
     def _run_ffmpeg_with_progress(
         self,
         cmd: List[str],
@@ -770,6 +808,13 @@ class VideoProcessor:
             log("No valid segments to process")
             return video_path, []
         segment_meta_by_index = {seg["index"]: seg for seg in valid_segments}
+        uses_minterpolate = any(
+            seg["use_minterpolate"] and seg["video_speed"] < self.video_minterpolate_threshold
+            for seg in valid_segments
+        )
+        target_output_fps = self._resolve_speed_output_fps(video_info, uses_minterpolate)
+        target_output_fps_arg = f"{target_output_fps:.6f}"
+        log(f"Using stable CFR for speed segments: {target_output_fps:.2f} fps")
 
         cpu_total = os.cpu_count() or 1
         segment_workers = max(1, cpu_total - 1)
@@ -815,32 +860,44 @@ class VideoProcessor:
             segment_cmd.extend(["-i", video_path])
 
             if use_minterpolate and video_speed < self.video_minterpolate_threshold:
-                vf = (
-                    f"trim=start={start_s}:end={end_s},"
-                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS),"
-                    f"minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1,"
-                    "setpts=PTS-STARTPTS"
-                )
+                vf_parts = [
+                    f"trim=start={start_s}:end={end_s}",
+                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS)",
+                    "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1",
+                    "setpts=PTS-STARTPTS",
+                ]
                 log(
                     f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
                     f"speed={video_speed:.2f}x with minterpolate"
                 )
             elif speed_is_unity:
                 # Fast path for 1.0x segments: exact trim without speed transform.
-                vf = f"trim=start={start_s}:end={end_s},setpts=PTS-STARTPTS"
+                vf_parts = [
+                    f"trim=start={start_s}:end={end_s}",
+                    "setpts=PTS-STARTPTS",
+                ]
                 log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed=1.00x")
             else:
-                vf = f"trim=start={start_s}:end={end_s},setpts={setpts_factor:.6f}*(PTS-STARTPTS)"
+                vf_parts = [
+                    f"trim=start={start_s}:end={end_s}",
+                    f"setpts={setpts_factor:.6f}*(PTS-STARTPTS)",
+                ]
                 log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
+            # Keep all rendered segments on one constant frame rate/timebase.
+            vf_parts.append(f"fps=fps={target_output_fps_arg}")
+            vf = ",".join(vf_parts)
 
             segment_cmd.extend([
                 "-vf", vf,
                 "-an",
                 "-threads", "1",
+                "-vsync", "cfr",
+                "-r", target_output_fps_arg,
                 "-c:v", "libx264",
                 "-crf", "18",
                 "-preset", "medium",
                 "-pix_fmt", "yuv420p",
+                "-tag:v", "avc1",
                 segment_output
             ])
             logger.debug(f"Segment {seg_idx} FFmpeg command: {' '.join(segment_cmd)}")
@@ -908,37 +965,26 @@ class VideoProcessor:
                 "ffmpeg", "-y",
                 "-f", "concat",
                 "-safe", "0",
+                "-fflags", "+genpts",
                 "-i", concat_list_file,
-                "-c", "copy",
+                "-an",
+                "-vsync", "cfr",
+                "-r", target_output_fps_arg,
+                "-c:v", "libx264",
+                "-crf", "16",
+                "-preset", "medium",
+                "-pix_fmt", "yuv420p",
+                "-profile:v", "high",
+                "-tag:v", "avc1",
                 "-movflags", "+faststart",
                 output_path
             ]
             logger.debug(f"Concat FFmpeg command: {' '.join(concat_cmd)}")
-            try:
-                subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
-            except subprocess.CalledProcessError as concat_err:
-                # Fallback for strict muxers/container edge cases.
-                logger.warning("Concat with stream copy failed, retrying with re-encode")
-                logger.debug(f"Concat copy stderr: {concat_err.stderr if hasattr(concat_err, 'stderr') else 'N/A'}")
-                concat_reencode_cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", concat_list_file,
-                    "-an",
-                    "-c:v", "libx264",
-                    "-crf", "18",
-                    "-preset", "medium",
-                    "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart",
-                    output_path
-                ]
-                logger.debug(f"Concat fallback FFmpeg command: {' '.join(concat_reencode_cmd)}")
-                subprocess.run(concat_reencode_cmd, capture_output=True, text=True, check=True)
+            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
 
             muxed_duration = self._get_video_duration(output_path)
             if muxed_duration > 0 and cumulative_actual_time > 0:
-                # Concat muxing/copy can slightly shift cumulative duration.
+                # Concat muxing/re-encode can slightly shift cumulative duration.
                 # Scale the timing map so subtitles follow the real muxed output.
                 duration_scale = muxed_duration / cumulative_actual_time
                 if abs(duration_scale - 1.0) > 1e-4:

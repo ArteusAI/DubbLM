@@ -461,6 +461,7 @@ export interface ProjectConfig {
   enableEmotionEnrichment?: boolean;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: '720p' | '1080p' | 'original';
   maxWorkers?: number;

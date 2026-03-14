@@ -17,6 +17,30 @@ const VIDEO_QUALITY_OPTIONS: Array<{ value: VideoQualityPreset; label: string }>
   { value: 'original', label: 'Ultra - Original quality' },
 ];
 
+interface TimeRangeRow {
+  id: string;
+  start: string;
+  end: string;
+}
+
+const createRangeRow = (start = '', end = ''): TimeRangeRow => ({
+  id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  start,
+  end,
+});
+
+const parseTimeRange = (range: string): TimeRangeRow => {
+  const separatorIndex = range.indexOf('-');
+  if (separatorIndex === -1) {
+    return createRangeRow(range.trim(), '');
+  }
+
+  return createRangeRow(
+    range.slice(0, separatorIndex).trim(),
+    range.slice(separatorIndex + 1).trim(),
+  );
+};
+
 const InfoTip: React.FC<{ text: string }> = ({ text }) => (
   <span className="relative group ml-1 cursor-help">
     <Info className="w-3 h-3 text-zinc-500 hover:text-zinc-300 transition-colors" />
@@ -80,6 +104,9 @@ export const UploadView: React.FC<UploadViewProps> = ({
   const [newSpeakerVoiceId, setNewSpeakerVoiceId] = useState('');
   const [playingSampleKey, setPlayingSampleKey] = useState<string | null>(null);
   const [showStartMenu, setShowStartMenu] = useState(false);
+  const [originalAudioRanges, setOriginalAudioRanges] = useState<TimeRangeRow[]>(
+    () => (config.keepOriginalAudioRanges || []).map(parseTimeRange)
+  );
   
   // Use ref to track latest speakerTtsPrompts to avoid race conditions with async state updates
   const speakerPromptsRef = useRef<Record<string, string>>(config.speakerTtsPrompts || {});
@@ -94,6 +121,10 @@ export const UploadView: React.FC<UploadViewProps> = ({
   useEffect(() => {
     speakerVoiceMappingsRef.current = config.speakerVoiceMappings || {};
   }, [config.speakerVoiceMappings]);
+
+  useEffect(() => {
+    setOriginalAudioRanges((config.keepOriginalAudioRanges || []).map(parseTimeRange));
+  }, [projectId]);
 
   const handleAddSpeakerPrompt = () => {
     if (!newSpeakerName.trim()) return;
@@ -167,6 +198,35 @@ export const UploadView: React.FC<UploadViewProps> = ({
     currentMappings[speakerName] = voiceId;
     speakerVoiceMappingsRef.current = currentMappings;
     onConfigChange({ speakerVoiceMappings: currentMappings });
+  };
+
+  const syncOriginalAudioRanges = (rows: TimeRangeRow[]) => {
+    setOriginalAudioRanges(rows);
+    onConfigChange({
+      keepOriginalAudioRanges: rows
+        .map((row) => {
+          const start = row.start.trim();
+          const end = row.end.trim();
+          return start && end ? `${start}-${end}` : '';
+        })
+        .filter(Boolean),
+    });
+  };
+
+  const handleAddOriginalAudioRange = () => {
+    setOriginalAudioRanges((prev) => [...prev, createRangeRow()]);
+  };
+
+  const handleUpdateOriginalAudioRange = (id: string, field: 'start' | 'end', value: string) => {
+    syncOriginalAudioRanges(
+      originalAudioRanges.map((row) => (
+        row.id === id ? { ...row, [field]: value } : row
+      ))
+    );
+  };
+
+  const handleRemoveOriginalAudioRange = (id: string) => {
+    syncOriginalAudioRanges(originalAudioRanges.filter((row) => row.id !== id));
   };
 
   const stopSamplePlayback = () => {
@@ -906,6 +966,60 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             <option key={option.value} value={option.value}>{option.label}</option>
                           ))}
                         </select>
+                      </div>
+                      <div className="space-y-2 pt-2 border-t border-zinc-800/30">
+                        <div className="flex items-center justify-between gap-2">
+                          <label className="text-[10px] text-zinc-500 flex items-center gap-1">
+                            Keep Original Audio Ranges
+                            <InfoTip text="Keep the source speech instead of dubbed audio for selected ranges. Time format: SS, MM:SS, or HH:MM:SS." />
+                          </label>
+                          <button
+                            onClick={handleAddOriginalAudioRange}
+                            className="p-1 text-zinc-500 hover:text-brand-400 transition-colors"
+                            title="Add original audio range"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {originalAudioRanges.length > 0 ? (
+                          <div className="space-y-1.5">
+                            {originalAudioRanges.map((range) => (
+                              <div key={range.id} className="flex items-center gap-2 bg-zinc-950/50 rounded p-1.5">
+                                <input
+                                  type="text"
+                                  value={range.start}
+                                  onChange={(e) => handleUpdateOriginalAudioRange(range.id, 'start', e.target.value)}
+                                  className="w-[110px] bg-zinc-900 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                  placeholder="00:10"
+                                />
+                                <span className="text-[10px] text-zinc-600">to</span>
+                                <input
+                                  type="text"
+                                  value={range.end}
+                                  onChange={(e) => handleUpdateOriginalAudioRange(range.id, 'end', e.target.value)}
+                                  className="w-[110px] bg-zinc-900 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                  placeholder="00:24.5"
+                                />
+                                <button
+                                  onClick={() => handleRemoveOriginalAudioRange(range.id)}
+                                  className="p-1 text-zinc-500 hover:text-red-400 transition-colors"
+                                  title="Remove range"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-[9px] text-zinc-600">
+                            Add ranges where the original audio should stay without translation.
+                          </p>
+                        )}
+
+                        <p className="text-[9px] text-zinc-600">
+                          Examples: 12.5 to 18, 01:10 to 01:24, 00:10:05 to 00:10:22
+                        </p>
                       </div>
                     </div>
 

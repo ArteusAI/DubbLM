@@ -39,6 +39,7 @@ class ProjectConfig(BaseModel):
     enableEmotionEnrichment: Optional[bool] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
+    keepOriginalAudioRanges: Optional[List[str]] = None
     useTwoPassEncoding: Optional[bool] = None
     videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
     maxWorkers: Optional[int] = None
@@ -85,6 +86,7 @@ class ProjectConfigUpdate(BaseModel):
     enableEmotionEnrichment: Optional[bool] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
+    keepOriginalAudioRanges: Optional[List[str]] = None
     useTwoPassEncoding: Optional[bool] = None
     videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
     maxWorkers: Optional[int] = None
