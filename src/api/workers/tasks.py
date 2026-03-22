@@ -311,10 +311,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Diarize and transcribe
             speakers_rolls, transcription = dubber.diarize_and_transcribe(audio_file)
-            
+            # Filter out segments in keep-original-audio ranges
+            transcription = dubber._filter_keep_original_segments(transcription)
+
             if not speakers_rolls or len(speakers_rolls) == 0:
                 raise ValueError("No speakers found in the video")
-            
+
             update_job_progress(job_id, 15, "translation", "Translating segments")
             
             # Extract speaker audio
@@ -587,12 +589,18 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             update_job_progress(job_id, 84, "video_combine", "Combining audio with video")
             
             # Progress callback for video combining (84% to 99%)
+            # Segment processing: 84% → 93%, Encoding: 93% → 99%
             def video_combine_progress(current: int, total: int, message: str = ""):
-                progress = 84 + int((current / total) * 15) if total > 0 else 84
                 if message == "Video speed segment processing" and total > 0:
-                    # Keep a stable "Label: current/total" format so frontend renders a single inline progress bar.
+                    # Segments: 84% → 93%
+                    progress = 84 + int((current / total) * 9)
                     ui_message = f"Video speed segment processing: {current}/{total}"
+                elif message.startswith("Encoding video") or message.startswith("Combining audio"):
+                    # Encoding: 93% → 99%
+                    progress = 93 + int((current / total) * 6) if total > 0 else 93
+                    ui_message = f"{message}: {current}%"
                 else:
+                    progress = 84 + int((current / total) * 15) if total > 0 else 84
                     ui_message = message or f"Processing video: {current}/{total}s"
                 update_job_progress(job_id, progress, "video_combine", ui_message)
             
@@ -618,6 +626,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 output_file=str(pm.get_result_video_path(config_data.get("targetLang", "ru"))),
                 source_language=config_data.get("sourceLang", "en"),
                 target_language=config_data.get("targetLang", "ru"),
+                keep_original_audio_ranges=dubbing_config.get("keep_original_audio_ranges"),
                 pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),

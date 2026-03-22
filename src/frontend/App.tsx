@@ -622,6 +622,10 @@ const App: React.FC = () => {
       ));
       setShowResetDialog(false);
       setPendingResetId(null);
+      setProcessingLogs([]);
+      setProcessingProgress(0);
+      setProcessingStep('Resetting cache and starting...');
+      setStep(AppStep.PROCESSING_TRANSCRIPTION);
     } catch (err) {
       setProjects(prev => prev.map(p => (p.id === id ? project : p)));
       console.error(`Failed to reset and restart project ${id}:`, err);

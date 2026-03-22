@@ -290,6 +290,8 @@ class SmartDubbing:
 
             # Perform speaker diarization and transcription
             speakers_rolls, transcription = self.diarize_and_transcribe(audio_file)
+            # Filter out segments in keep-original-audio ranges
+            transcription = self._filter_keep_original_segments(transcription)
             if speakers_rolls is None or len(speakers_rolls) == 0:
                 raise ValueError("No speakers found in the video")
             
@@ -491,6 +493,41 @@ class SmartDubbing:
         
         return output_video_path
     
+    def _filter_keep_original_segments(self, segments: list) -> list:
+        """Remove segments that overlap with keep_original_audio_ranges."""
+        ranges = self.config.get('keep_original_audio_ranges')
+        if not ranges:
+            return segments
+
+        filtered = []
+        removed_count = 0
+        for seg in segments:
+            seg_start = seg.get('start', 0)
+            seg_end = seg.get('end', 0)
+            seg_duration = seg_end - seg_start
+            if seg_duration <= 0:
+                filtered.append(seg)
+                continue
+
+            # Calculate total overlap with all keep-original ranges
+            total_overlap = 0
+            for range_start, range_end in ranges:
+                overlap_start = max(seg_start, range_start)
+                overlap_end = min(seg_end, range_end)
+                if overlap_start < overlap_end:
+                    total_overlap += overlap_end - overlap_start
+
+            # Remove if >50% of segment duration overlaps
+            if total_overlap / seg_duration > 0.5:
+                removed_count += 1
+            else:
+                filtered.append(seg)
+
+        if removed_count:
+            logger.info(f"Filtered {removed_count} segments in keep-original-audio ranges "
+                        f"({len(filtered)} remaining)")
+        return filtered
+
     def _handle_debug_diarize_only(self, audio_file: str, speakers_rolls: Dict) -> str:
         """Handle debug diarize-only mode."""
         logger.info("Debug diarization only mode: Generating debug video after diarization and exiting")
@@ -1340,11 +1377,19 @@ class SmartDubbing:
             segment_dict['chosen_text'] = best_text
             segment_dict['selected_track_type'] = best_track_type
 
-            if self.cache_manager.use_cache and len(audio_info) > 0:
+            # Skip pipeline-level cache for segments produced by a fallback model
+            # so they can be regenerated with the primary model on the next run.
+            is_fallback = (
+                hasattr(tts_instance, 'is_fallback_output')
+                and tts_instance.is_fallback_output(current_segment_output_path)
+            )
+            if self.cache_manager.use_cache and len(audio_info) > 0 and not is_fallback:
                 try:
                     shutil.copy(current_segment_output_path, segment_cached_file_path)
                 except Exception as cache_exc:
                     logger.error(f"Error caching segment {segment_index+1}: {cache_exc}")
+            elif is_fallback:
+                logger.debug(f"Skipping pipeline cache for fallback segment {segment_index+1}")
 
             original_dur = segment_dict["end"] - segment_dict["start"]
             actual_dur = segment_dict['synthesized_speech_len']

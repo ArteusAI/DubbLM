@@ -5,6 +5,7 @@ import subprocess
 import json
 import tempfile
 import shutil
+import threading
 from typing import Optional, List, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -37,6 +38,78 @@ class VideoProcessor:
             float(self.config.get('video_segment_seek_padding', 1.0))
         )
     
+    def _run_ffmpeg_with_progress(
+        self,
+        command: List[str],
+        total_duration: float,
+        log_callback: Optional[callable] = None,
+        progress_callback: Optional[callable] = None,
+        label: str = "Encoding video",
+    ) -> subprocess.CompletedProcess:
+        """Run an FFmpeg command while reporting progress via callbacks.
+
+        Uses ``-progress pipe:1`` so FFmpeg writes machine-parseable key=value
+        lines to stdout.  We parse ``out_time_us`` to derive a percentage.
+
+        Falls back to a plain ``subprocess.run`` when *total_duration* is
+        unknown (≤0) or no callbacks are provided.
+        """
+        has_callbacks = log_callback or progress_callback
+        if total_duration <= 0 or not has_callbacks:
+            return subprocess.run(
+                command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+
+        # Inject -progress flag right after "ffmpeg"
+        cmd = list(command)
+        # Insert after the first element (ffmpeg binary)
+        cmd.insert(1, "-progress")
+        cmd.insert(2, "pipe:1")
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+
+        last_pct = -1
+        total_us = total_duration * 1_000_000
+
+        # Read stderr in a background thread so it doesn't block
+        stderr_lines: list = []
+        def _drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+        t = threading.Thread(target=_drain_stderr, daemon=True)
+        t.start()
+
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        current_us = int(line.split("=", 1)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    pct = min(int(current_us * 100 / total_us), 99)
+                    if pct != last_pct and pct % 5 == 0:
+                        last_pct = pct
+                        if progress_callback:
+                            progress_callback(pct, 100, label)
+                        if log_callback:
+                            log_callback(f"{label}: {pct}%")
+        finally:
+            proc.wait()
+            t.join(timeout=5)
+
+        if proc.returncode != 0:
+            stderr_text = "".join(stderr_lines)
+            raise subprocess.CalledProcessError(
+                proc.returncode, cmd, output="", stderr=stderr_text
+            )
+
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout="", stderr="".join(stderr_lines)
+        )
+
     def _get_video_info(self, video_path: str) -> Dict[str, any]:
         """Get detailed video information including codec, bitrate, and other parameters.
         
@@ -195,66 +268,6 @@ class VideoProcessor:
             return max(parsed_fps, 60.0)
         return parsed_fps
 
-    def _run_ffmpeg_with_progress(
-        self,
-        cmd: List[str],
-        total_duration: float,
-        progress_callback: Optional[callable] = None,
-        operation_name: str = "FFmpeg"
-    ) -> subprocess.CompletedProcess:
-        """Run FFmpeg command with progress tracking.
-        
-        Args:
-            cmd: FFmpeg command as list of arguments
-            total_duration: Expected output duration in seconds for progress calculation
-            progress_callback: Optional callback(current, total, message) for progress updates
-            operation_name: Name of the operation for logging
-            
-        Returns:
-            CompletedProcess result
-        """
-        import re
-        
-        if not progress_callback or total_duration <= 0:
-            return subprocess.run(cmd, capture_output=True, text=True, check=True)
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        stderr_lines = []
-        last_progress = 0
-        time_pattern = re.compile(r'time=(\d+):(\d+):(\d+\.?\d*)')
-        
-        for line in process.stderr:
-            stderr_lines.append(line)
-            match = time_pattern.search(line)
-            if match:
-                hours, minutes, seconds = match.groups()
-                current_time = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-                progress_pct = min(100, int((current_time / total_duration) * 100))
-                
-                if progress_pct > last_progress:
-                    last_progress = progress_pct
-                    progress_callback(
-                        int(current_time),
-                        int(total_duration),
-                        f"{operation_name}: {progress_pct}%"
-                    )
-        
-        stdout, _ = process.communicate()
-        stderr = ''.join(stderr_lines)
-        
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(
-                process.returncode, cmd, stdout, stderr
-            )
-        
-        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
-
     def _detect_silence(self, audio_or_video_path: str, min_silence_duration: float) -> List[Tuple[float, float]]:
         """Detect periods of silence in an audio file or video's audio stream."""
         import re
@@ -392,6 +405,36 @@ class VideoProcessor:
                 logger.debug(f"Allowing pause removal: {pause_start:.2f}s-{pause_end:.2f}s")
         
         return filtered_pauses
+
+    def _build_crossfade_volume_exprs(self, ranges, crossfade_duration=1.0):
+        """Build FFmpeg volume expressions with smooth crossfade for keep-original ranges.
+
+        Uses min(max(x,0),1) to clamp values since FFmpeg has no clip() function.
+        """
+        half = crossfade_duration / 2.0
+
+        def _clamp01(expr):
+            """Clamp expression to [0,1] using FFmpeg-compatible min/max."""
+            return f"min(max({expr},0),1)"
+
+        def range_expr(s, e):
+            fade_in_start = s - half
+            fade_out_end = e + half
+            fade_in = _clamp01(f"(t-({fade_in_start}))/{crossfade_duration}")
+            fade_out = _clamp01(f"(({fade_out_end})-t)/{crossfade_duration}")
+            return f"min({fade_in},{fade_out})"
+
+        if len(ranges) == 1:
+            orig_expr = range_expr(*ranges[0])
+        else:
+            expr = range_expr(*ranges[0])
+            for s, e in ranges[1:]:
+                expr = f"max({expr},{range_expr(s, e)})"
+            orig_expr = expr
+
+        original_volume_expr = orig_expr
+        dubbed_volume_expr = f"1-{orig_expr}"
+        return original_volume_expr, dubbed_volume_expr
 
     def _format_filter_input_label(self, label: str) -> str:
         """Return a filter_complex input label bracketed exactly once.
@@ -702,12 +745,13 @@ class VideoProcessor:
             ext = ".wav"
         synced_audio_path = f"{base}_synced{ext}"
 
-        log(
+        logger.info(
             "Translated audio/video duration mismatch detected: "
             f"audio={source_duration:.3f}s, video={target_duration:.3f}s "
             f"(delta={duration_delta:+.3f}s). "
             f"Applying global tempo correction (speed={tempo_speed:.6f})."
         )
+        log("Aligning audio duration with video...")
 
         try:
             cmd = [
@@ -722,7 +766,7 @@ class VideoProcessor:
             ]
             subprocess.run(cmd, capture_output=True, text=True, check=True)
             synced_duration = self._get_video_duration(synced_audio_path)
-            log(
+            logger.info(
                 "Duration alignment complete: "
                 f"new_audio={synced_duration:.3f}s (target_video={target_duration:.3f}s)."
             )
@@ -768,7 +812,7 @@ class VideoProcessor:
             log("No video speed segments provided, returning original video")
             return video_path, []
 
-        log(f"Applying per-segment video speed adjustment to {len(speed_segments)} segments...")
+        log(f"Adjusting video speed ({len(speed_segments)} segments)...")
 
         # Get video info for quality settings
         video_info = self._get_video_info(video_path)
@@ -814,11 +858,11 @@ class VideoProcessor:
         )
         target_output_fps = self._resolve_speed_output_fps(video_info, uses_minterpolate)
         target_output_fps_arg = f"{target_output_fps:.6f}"
-        log(f"Using stable CFR for speed segments: {target_output_fps:.2f} fps")
+        logger.info(f"Using stable CFR for speed segments: {target_output_fps:.2f} fps")
 
         cpu_total = os.cpu_count() or 1
         segment_workers = max(1, cpu_total - 1)
-        log(f"Parallel video speed stretching: workers={segment_workers} (host_cpu={cpu_total})")
+        logger.info(f"Parallel video speed stretching: workers={segment_workers} (host_cpu={cpu_total})")
 
         temp_dir = tempfile.mkdtemp(prefix="video_speed_segments_")
         segment_outputs: List[Tuple[int, str]] = []
@@ -866,7 +910,7 @@ class VideoProcessor:
                     "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1",
                     "setpts=PTS-STARTPTS",
                 ]
-                log(
+                logger.info(
                     f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
                     f"speed={video_speed:.2f}x with minterpolate"
                 )
@@ -876,13 +920,13 @@ class VideoProcessor:
                     f"trim=start={start_s}:end={end_s}",
                     "setpts=PTS-STARTPTS",
                 ]
-                log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed=1.00x")
+                logger.info(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed=1.00x")
             else:
                 vf_parts = [
                     f"trim=start={start_s}:end={end_s}",
                     f"setpts={setpts_factor:.6f}*(PTS-STARTPTS)",
                 ]
-                log(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
+                logger.info(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
             # Keep all rendered segments on one constant frame rate/timebase.
             vf_parts.append(f"fps=fps={target_output_fps_arg}")
             vf = ",".join(vf_parts)
@@ -1001,12 +1045,13 @@ class VideoProcessor:
                     )
                     cumulative_actual_time = muxed_duration
 
-            log(
+            logger.info(
                 "Video speed adjustment complete. "
                 f"Requested duration: {requested_total_new_time:.2f}s, "
                 f"Rendered segments: {cumulative_actual_time:.2f}s "
                 f"(original: {total_original_duration:.2f}s)"
             )
+            log("Video speed adjustment complete")
             return output_path, timing_adjustments
 
         except subprocess.CalledProcessError as e:
@@ -1086,11 +1131,7 @@ class VideoProcessor:
         # Start timing
         self.performance_tracker.start_timing("video_creation")
 
-        log("Combining audio with video with smart quality preservation...")
-        log("Video processing strategy:")
-        log("• Stream copy (lossless) when no video filters needed")
-        log("• Conservative re-encoding only when necessary")
-        log("• Original bitrate preservation when possible")
+        log("Combining audio with video...")
         
         output_video_path = output_file if output_file else "artifacts/output_video.mp4"
         # Ensure output directory exists
@@ -1104,7 +1145,7 @@ class VideoProcessor:
         # Apply per-segment video speed if provided (video/audio_and_video modes)
         effective_video_path = video_path
         if video_speed_segments and len(video_speed_segments) > 0:
-            log(f"Applying per-segment video speed adjustment ({len(video_speed_segments)} segments)...")
+            logger.info(f"Applying per-segment video speed adjustment ({len(video_speed_segments)} segments)")
             temp_speed_adjusted_video = "artifacts/temp_speed_adjusted_video.mp4"
             
             # Convert VideoSpeedSegment dataclass instances to dicts if needed
@@ -1130,10 +1171,10 @@ class VideoProcessor:
             )
             
             if effective_video_path != video_path:
-                log(f"Video speed adjustment complete, using adjusted video")
+                logger.info("Video speed adjustment complete, using adjusted video")
                 # In video/audio_and_video modes, disable pause_removal as timing is already adjusted
                 if pause_removal != 'disabled':
-                    log("Disabling pause_removal for video speed modes (timing already adjusted)")
+                    logger.info("Disabling pause_removal for video speed modes (timing already adjusted)")
                     pause_removal = 'disabled'
 
         # Audio normalization is now done per-segment before combination
@@ -1191,6 +1232,15 @@ class VideoProcessor:
 
         current_ffmpeg_input_idx = 1  # 0 is video, 1 is normalized translated audio
 
+        # If video was speed-adjusted (no audio track), add original video as
+        # a separate input so keep_original_audio_ranges can reference its audio.
+        original_audio_ffmpeg_idx = "0"  # default: original video is input 0
+        if effective_video_path != video_path and keep_original_audio_ranges:
+            current_ffmpeg_input_idx += 1
+            original_audio_ffmpeg_idx = str(current_ffmpeg_input_idx)
+            command.extend(["-i", video_path])
+            logger.debug(f"Added original video as input {original_audio_ffmpeg_idx} for keep-original-audio")
+
         background_audio_ffmpeg_idx_str = None
         if background_audio_path:
             current_ffmpeg_input_idx += 1
@@ -1240,7 +1290,7 @@ class VideoProcessor:
             )
             current_video_label = "vid_capped"
             video_map_option = "[vid_capped]"
-            log(
+            logger.info(
                 f"Applying video quality cap: {requested_max_height}p "
                 f"(source height: {source_height}p)"
             )
@@ -1322,26 +1372,18 @@ class VideoProcessor:
         # Main audio track selection logic
         if keep_original_audio_ranges and len(keep_original_audio_ranges) > 0:
             logger.debug(f"Keeping original audio for ranges: {keep_original_audio_ranges}")
-            keep_conditions = "+".join([f"between(t,{s},{e})" for s, e in keep_original_audio_ranges])
-            
-            if not keep_conditions:
-                logger.warning("Warning: keep_original_audio_ranges was specified but resulted in empty conditions. Defaulting to full dubbed audio.")
-                final_audio_stream_label = processed_dubbed_audio_stream_label
-            else:
-                # Use conditional volume adjustments instead of aselect to avoid timing issues
-                original_volume_expr = f"if({keep_conditions},1,0)"
-                dubbed_volume_expr = f"if({keep_conditions},0,1)"
+            original_volume_expr, dubbed_volume_expr = self._build_crossfade_volume_exprs(keep_original_audio_ranges)
 
-                all_filter_complex_parts.append(
-                    f"[0:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]"
-                )
-                all_filter_complex_parts.append(
-                    f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]"
-                )
-                all_filter_complex_parts.append(
-                    f"[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_mixed_audio]"
-                )
-                final_audio_stream_label = "[final_mixed_audio]"
+            all_filter_complex_parts.append(
+                f"[{original_audio_ffmpeg_idx}:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]"
+            )
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]"
+            )
+            all_filter_complex_parts.append(
+                f"[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_mixed_audio]"
+            )
+            final_audio_stream_label = "[final_mixed_audio]"
         else:
             final_audio_stream_label = processed_dubbed_audio_stream_label
         
@@ -1389,11 +1431,11 @@ class VideoProcessor:
         # Video encoding strategy
         if not need_video_reencode:
             # No video filters applied – use stream copy (LOSSLESS)
-            log("No video processing needed - using lossless stream copy")
+            logger.info("No video processing needed - using lossless stream copy")
             command.extend(["-c:v", "copy"])
         else:
             # Video filters applied – need to re-encode with high quality
-            log("Video filters detected - using high-quality re-encoding")
+            logger.info("Video filters detected - using high-quality re-encoding")
             
             # Check if we should use two-pass encoding
             # Disable two-pass encoding for complex filter operations that can cause frame count mismatches
@@ -1496,6 +1538,7 @@ class VideoProcessor:
         logger.info(f"Pause removal mode: {pause_removal}")
         
         if pause_removal == "cut":
+            log("Detecting and removing long pauses...")
             logger.info("Detecting and removing long pauses with smart quality preservation...")
             logger.info("Pause removal strategy:")
             logger.info("• Analyze pauses in final translated audio")
@@ -1561,34 +1604,38 @@ class VideoProcessor:
             if os.path.exists(final_audio_path):
                 os.remove(final_audio_path)
 
+        # Get total duration for progress reporting
+        encode_total_duration = self._get_video_duration(effective_video_path)
+
         # Execute the FFmpeg command
         try:
             # Check if we need to use two-pass encoding
-            if (use_two_pass_encoding and need_video_reencode and original_bitrate and 
+            if (use_two_pass_encoding and need_video_reencode and original_bitrate and
                 original_bitrate.isdigit() and int(original_bitrate) > 1000000):
                 # Use two-pass encoding for better quality
+                log("Encoding video (two-pass)...")
                 logger.info("Using two-pass encoding for combine operation")
                 # Remove output path from command and codec settings for two-pass
                 base_cmd = command[:-1]  # Remove output path
-                
+
                 # Remove all video codec settings
                 while "-c:v" in base_cmd:
                     idx = base_cmd.index("-c:v")
                     base_cmd.pop(idx)  # Remove -c:v
                     base_cmd.pop(idx)  # Remove libx264
-                
+
                 # Remove audio codec settings to avoid duplicates
                 while "-c:a" in base_cmd:
                     idx = base_cmd.index("-c:a")
                     base_cmd.pop(idx)  # Remove -c:a
                     base_cmd.pop(idx)  # Remove aac
-                
+
                 # Remove audio bitrate settings
                 while "-b:a" in base_cmd:
                     idx = base_cmd.index("-b:a")
                     base_cmd.pop(idx)  # Remove -b:a
                     base_cmd.pop(idx)  # Remove bitrate value
-                
+
                 # Remove other video encoding parameters that will be set in two-pass
                 params_to_remove = ["-crf", "-b:v", "-profile:v", "-pix_fmt", "-preset"]
                 for param in params_to_remove:
@@ -1596,28 +1643,35 @@ class VideoProcessor:
                         idx = base_cmd.index(param)
                         base_cmd.pop(idx)  # Remove parameter
                         base_cmd.pop(idx)  # Remove value
-                
+
                 # Remove movflags as it will be added in second pass
                 while "-movflags" in base_cmd:
                     idx = base_cmd.index("-movflags")
                     base_cmd.pop(idx)  # Remove -movflags
                     base_cmd.pop(idx)  # Remove value
-                
-                self._encode_with_two_pass(base_cmd, output_video_path, video_info)
+
+                self._encode_with_two_pass(
+                    base_cmd, output_video_path, video_info,
+                    total_duration=encode_total_duration,
+                    log_callback=log_callback,
+                    progress_callback=progress_callback,
+                )
             else:
                 # Use single-pass encoding
+                encode_label = "Encoding video" if need_video_reencode else "Combining audio with video"
+                log(f"{encode_label}...")
                 logger.debug(f"Running FFmpeg command: {' '.join(command)}")
-                result = subprocess.run(
+                result = self._run_ffmpeg_with_progress(
                     command,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
+                    total_duration=encode_total_duration,
+                    log_callback=log_callback,
+                    progress_callback=progress_callback,
+                    label=encode_label,
                 )
 
             # Only print stderr if it contains error messages that aren't just informational
             # (Only for single-pass encoding - two-pass encoding handles its own error reporting)
-            if not (use_two_pass_encoding and need_video_reencode and original_bitrate and 
+            if not (use_two_pass_encoding and need_video_reencode and original_bitrate and
                    original_bitrate.isdigit() and int(original_bitrate) > 1000000):
                 stderr = result.stderr
                 if stderr and ('error' in stderr.lower() or 'fatal' in stderr.lower()):
@@ -1626,6 +1680,7 @@ class VideoProcessor:
                         if 'error' in line.lower() or 'fatal' in line.lower():
                             logger.error(f"  {line}")
 
+            log("Video encoding complete")
             logger.info(f"Output video saved to {output_video_path}")
         except subprocess.CalledProcessError as e:
             error_output = e.stderr if e.stderr else "No error details available"
@@ -1732,16 +1787,22 @@ class VideoProcessor:
         
         return cmd
 
-    def _encode_with_two_pass(self, base_cmd: List[str], output_path: str, 
-                             video_info: Dict[str, any], 
-                             use_original_bitrate: bool = True) -> None:
+    def _encode_with_two_pass(self, base_cmd: List[str], output_path: str,
+                             video_info: Dict[str, any],
+                             use_original_bitrate: bool = True,
+                             total_duration: float = 0,
+                             log_callback: Optional[callable] = None,
+                             progress_callback: Optional[callable] = None) -> None:
         """Perform two-pass encoding for better quality.
-        
+
         Args:
             base_cmd: Base FFmpeg command without codec/output settings
             output_path: Path for the final output file
             video_info: Video information dictionary
             use_original_bitrate: Whether to use original bitrate or calculate optimal
+            total_duration: Total video duration for progress reporting
+            log_callback: Optional callback(message) for logging
+            progress_callback: Optional callback(current, total, message) for progress
         """
         # Determine target bitrate
         original_bitrate = video_info.get('video_bitrate')
@@ -1759,19 +1820,21 @@ class VideoProcessor:
             try:
                 # First pass
                 logger.info("Starting first pass of two-pass encoding...")
+                if log_callback:
+                    log_callback("Encoding video (pass 1/2)...")
                 first_pass_cmd = self._build_two_pass_command(
                     base_cmd, 1, target_bitrate, output_path, video_info, temp_dir
                 )
-                
+
                 logger.debug(f"First pass command: {' '.join(first_pass_cmd)}")
-                result = subprocess.run(
+                result = self._run_ffmpeg_with_progress(
                     first_pass_cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
+                    total_duration=total_duration,
+                    log_callback=log_callback,
+                    progress_callback=progress_callback,
+                    label="Encoding video (pass 1/2)",
                 )
-                
+
                 # Check if pass log file was created successfully
                 passlogfile = os.path.join(temp_dir, "ffmpeg2pass-0.log")
                 passlogfile_alt = os.path.join(temp_dir, "ffmpeg2pass-0.log.mbtree")
@@ -1779,20 +1842,22 @@ class VideoProcessor:
                     logger.warning("First pass log file not found, two-pass encoding may fail")
                 else:
                     logger.debug("First pass completed successfully, log files created")
-                
+
                 # Second pass
                 logger.info("Starting second pass of two-pass encoding...")
+                if log_callback:
+                    log_callback("Encoding video (pass 2/2)...")
                 second_pass_cmd = self._build_two_pass_command(
                     base_cmd, 2, target_bitrate, output_path, video_info, temp_dir
                 )
-                
+
                 logger.debug(f"Second pass command: {' '.join(second_pass_cmd)}")
-                result = subprocess.run(
+                result = self._run_ffmpeg_with_progress(
                     second_pass_cmd,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
+                    total_duration=total_duration,
+                    log_callback=log_callback,
+                    progress_callback=progress_callback,
+                    label="Encoding video (pass 2/2)",
                 )
                 
                 logger.info("Two-pass encoding completed successfully")
@@ -1877,15 +1942,11 @@ class VideoProcessor:
             
             # Handle original audio ranges if needed
             if keep_original_audio_ranges and original_audio_input_idx is not None:
-                keep_conditions = "+".join([f"between(t,{s},{e})" for s, e in keep_original_audio_ranges])
-                if keep_conditions:
-                    original_volume_expr = f"if({keep_conditions},1,0)"
-                    dubbed_volume_expr = f"if({keep_conditions},0,1)"
-                    
-                    filter_parts.append(f"[{original_audio_input_idx}:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]")
-                    filter_parts.append(f"{self._format_filter_input_label(current_audio_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]")
-                    filter_parts.append("[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_audio]")
-                    current_audio_label = "[final_audio]"
+                original_volume_expr, dubbed_volume_expr = self._build_crossfade_volume_exprs(keep_original_audio_ranges)
+                filter_parts.append(f"[{original_audio_input_idx}:a:0]volume='{original_volume_expr}':eval=frame[original_conditional]")
+                filter_parts.append(f"{self._format_filter_input_label(current_audio_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]")
+                filter_parts.append("[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_audio]")
+                current_audio_label = "[final_audio]"
             
             # Apply final normalization to bring the entire mix to optimal loudness
             filter_parts.append(

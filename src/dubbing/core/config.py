@@ -206,6 +206,8 @@ class DubbingConfig:
                     logger.warning(f"Warning: Could not parse range '{range_str}' in keep_original_audio_ranges: {e}. Skipping.")
             
             self.config['keep_original_audio_ranges'] = parsed_ranges if parsed_ranges else None
+            if parsed_ranges:
+                logger.info(f"Parsed {len(parsed_ranges)} keep-original-audio ranges: {parsed_ranges}")
         
         # Process tts_system_mapping parameter
         tts_system_mapping = self.config.get('tts_system_mapping')

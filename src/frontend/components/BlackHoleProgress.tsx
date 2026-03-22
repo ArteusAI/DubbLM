@@ -3,6 +3,10 @@ import React, { useRef, useEffect } from 'react';
 interface BlackHoleProgressProps {
   progress: number; // 0-100
   size?: number;
+  // Dynamic growth settings
+  growable?: boolean;
+  minSize?: number;
+  maxSize?: number;
 }
 
 interface Star {
@@ -12,9 +16,12 @@ interface Star {
   pz: number;
 }
 
-export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({ 
-  progress, 
-  size = 162 
+export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
+  progress,
+  size: staticSize = 162,
+  growable = false,
+  minSize = 115,
+  maxSize = 520,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -24,8 +31,17 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
   const cameraRef = useRef({ x: 0, y: 0 });
   const targetProgressRef = useRef(progress / 100);
   const displayProgressRef = useRef(progress / 100);
+  const currentSizeRef = useRef(growable ? minSize : staticSize);
 
   targetProgressRef.current = progress / 100;
+
+  // Compute current size based on progress
+  const computeSize = (p: number) => {
+    if (!growable) return staticSize;
+    const t = Math.min(1, p);
+    const eased = 1 - Math.pow(1 - t, 2);
+    return minSize + (maxSize - minSize) * eased;
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -35,16 +51,16 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    canvas.width = size;
-    canvas.height = size;
+    // Canvas is always maxSize width, maxSize height for growable
+    const canvasW = growable ? maxSize : staticSize;
+    const canvasH = growable ? maxSize : staticSize;
+    canvas.width = canvasW;
+    canvas.height = canvasH;
 
-    const cx = size / 2;
-    const cy = size / 2;
-    const numStars = 800;
-    const maxDepth = size * 4;
-    const starSpread = size * 8; // Reduced spread for denser visible stars
+    const numStars = 1800;
+    const maxDepth = canvasW * 4;
+    const starSpread = canvasW * 8;
 
-    // Always reinitialize stars on mount for consistent density
     starsRef.current = [];
     for (let i = 0; i < numStars; i++) {
       const star: Star = {
@@ -58,14 +74,36 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
     }
 
     const animate = () => {
-      // Smooth interpolation towards target progress
       const lerpSpeed = 0.08;
       displayProgressRef.current += (targetProgressRef.current - displayProgressRef.current) * lerpSpeed;
       const currentProgress = displayProgressRef.current;
-      
-      // Clear with fade effect - more transparent at higher progress
+
+      // Compute dynamic size
+      const targetSize = computeSize(currentProgress);
+      currentSizeRef.current += (targetSize - currentSizeRef.current) * 0.06;
+      const curSize = currentSizeRef.current;
+      const circleRadius = curSize / 2;
+
+      ctx.clearRect(0, 0, canvasW, canvasH);
+
+      // Circle center: horizontally centered, vertically anchored so TOP edge stays at y=0
+      // center = (canvasW/2, circleRadius) => top of circle is at y=0
+      const cx = canvasW / 2;
+      const cy = circleRadius;
+
+      // Clip to circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, circleRadius, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Background
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvasW, canvasH);
+
+      // Fade effect
       ctx.fillStyle = `rgba(0, 0, 0, ${0.45 - (currentProgress * 0.2)})`;
-      ctx.fillRect(0, 0, size, size);
+      ctx.fillRect(0, 0, canvasW, canvasH);
 
       timeRef.current += 0.01 + (currentProgress * 0.04);
 
@@ -77,8 +115,8 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
       cameraRef.current.y += (targetCamY - cameraRef.current.y) * 0.08;
 
       // Speed based on progress
-      const baseSpeed = 2;
-      const warpSpeed = baseSpeed + (currentProgress * 40);
+      const baseSpeed = 0.8;
+      const warpSpeed = baseSpeed + (currentProgress * 6);
       const rotation = timeRef.current * 0.2 * currentProgress;
       const cos = Math.cos(rotation);
       const sin = Math.sin(rotation);
@@ -88,11 +126,9 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
       starsRef.current.forEach(star => {
         star.z -= warpSpeed;
 
-        // Apply rotation
         let rx = star.x * cos - star.y * sin;
         let ry = star.x * sin + star.y * cos;
 
-        // Respawn star if too close
         if (star.z <= 1) {
           star.z = maxDepth;
           star.pz = star.z;
@@ -102,7 +138,6 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
           ry = star.y;
         }
 
-        // Projection
         const scale = fov / star.z;
         const x2d = cx + (rx - cameraRef.current.x) * scale;
         const y2d = cy + (ry - cameraRef.current.y) * scale;
@@ -110,52 +145,33 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
         const x2d_prev = cx + (rx - cameraRef.current.x) * scaleP;
         const y2d_prev = cy + (ry - cameraRef.current.y) * scaleP;
 
-        // Only draw visible stars
-        if (x2d > -20 && x2d < size + 20 && y2d > -20 && y2d < size + 20) {
-          const distRatio = star.z / maxDepth;
-          const alpha = Math.max(0, (1 - distRatio) * 1.5);
+        const distRatio = star.z / maxDepth;
+        const alpha = Math.min(1, Math.max(0.15, (1 - distRatio) * 5));
 
-          // Color based on progress - sky blue theme
-          let r = 255, g = 255, b = 255;
-          if (currentProgress > 0.3) { r = 56; g = 189; b = 248; }  // brand-400 #38bdf8
-          if (currentProgress > 0.7) { r = 14; g = 165; b = 233; }  // brand-500 #0ea5e9
+        let r = 255, g = 255, b = 255;
+        if (currentProgress > 0.3) { r = 56; g = 189; b = 248; }
+        if (currentProgress > 0.7) { r = 14; g = 165; b = 233; }
 
-          ctx.beginPath();
-          ctx.moveTo(x2d_prev, y2d_prev);
-          ctx.lineTo(x2d, y2d);
-          ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
-          ctx.lineWidth = Math.min(2.5, scale * 0.6);
-          ctx.stroke();
-        }
+        ctx.beginPath();
+        ctx.moveTo(x2d_prev, y2d_prev);
+        ctx.lineTo(x2d, y2d);
+        ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+        ctx.lineWidth = Math.min(2.5, scale * 0.6);
+        ctx.stroke();
       });
 
+      ctx.restore(); // Remove clip
+
       // Draw progress ring
-      drawProgressFrame(ctx, cx, cy, size, currentProgress);
-      
-      // Draw percentage in center
-      drawPercentage(ctx, cx, cy, currentProgress);
-
-      animationRef.current = requestAnimationFrame(animate);
-    };
-
-    const drawProgressFrame = (
-      ctx: CanvasRenderingContext2D, 
-      cx: number, 
-      cy: number, 
-      size: number, 
-      currentProgress: number
-    ) => {
       const margin = 4;
-      const r = (size / 2) - margin;
+      const ringR = circleRadius - margin;
       const startAngle = -Math.PI / 2;
       const endAngle = startAngle + (Math.PI * 2 * currentProgress);
-      
-      // Sky blue brand color (hsl 199)
       const light = 50 + (currentProgress * 15);
       const color = `hsl(199, 90%, ${light}%)`;
 
       ctx.beginPath();
-      ctx.arc(cx, cy, r, startAngle, endAngle);
+      ctx.arc(cx, cy, ringR, startAngle, endAngle);
       ctx.strokeStyle = color;
       ctx.lineWidth = 5;
       ctx.lineCap = 'butt';
@@ -163,27 +179,30 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
       ctx.shadowColor = color;
       ctx.stroke();
       ctx.shadowBlur = 0;
-    };
 
-    const drawPercentage = (
-      ctx: CanvasRenderingContext2D,
-      cx: number,
-      cy: number,
-      currentProgress: number
-    ) => {
+      // Draw percentage text
+      // As circle grows, the percentage stays near the top visible area
+      // It shifts down slightly but never past the original circle size position
       const percent = Math.round(currentProgress * 100);
-      const fontSize = size * 0.22;
-      
+      const baseFontSize = (growable ? minSize : staticSize) * 0.22;
+      const growFactor = growable ? Math.min(1.4, curSize / minSize * 0.6 + 0.4) : 1;
+      const fontSize = baseFontSize * growFactor;
+      // Text Y: starts at circle center for small circle, but as it grows
+      // the text stays near the top portion (around minSize/2 from top)
+      const textY = growable
+        ? Math.min(cy, minSize / 2 + (curSize - minSize) * 0.08)
+        : cy;
+
       ctx.font = `bold ${fontSize}px system-ui, -apple-system, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      
-      // Glow effect - sky blue brand color
       ctx.shadowBlur = 15;
       ctx.shadowColor = `hsl(199, 90%, 60%)`;
       ctx.fillStyle = '#fff';
-      ctx.fillText(`${percent}%`, cx, cy);
+      ctx.fillText(`${percent}%`, cx, textY);
       ctx.shadowBlur = 0;
+
+      animationRef.current = requestAnimationFrame(animate);
     };
 
     animate();
@@ -193,7 +212,7 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
         cancelAnimationFrame(animationRef.current);
       }
     };
-  }, [size]);
+  }, [growable ? maxSize : staticSize]);
 
   // Shake effect for high progress (>80%)
   useEffect(() => {
@@ -210,11 +229,13 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
     }
   }, [progress]);
 
+  const canvasW = growable ? maxSize : staticSize;
+  const canvasH = growable ? maxSize : staticSize;
+
   return (
     <div
-      className="animate-pulse-subtle"
       style={{
-        animation: 'pulse-subtle 3s ease-in-out infinite',
+        animation: growable ? 'none' : 'pulse-subtle 3s ease-in-out infinite',
       }}
     >
       <style>{`
@@ -223,24 +244,19 @@ export const BlackHoleProgress: React.FC<BlackHoleProgressProps> = ({
           50% { transform: scale(1.03); }
         }
       `}</style>
-      <div 
+      <div
         ref={containerRef}
         style={{
           position: 'relative',
-          width: size,
-          height: size,
-          borderRadius: '50%',
-          background: '#000',
-          boxShadow: '0 0 35px rgba(14, 165, 233, 0.25)',
-          overflow: 'hidden',
+          width: canvasW,
+          height: canvasH,
         }}
       >
-        <canvas 
-          ref={canvasRef} 
-          style={{ 
-            display: 'block', 
-            borderRadius: '50%' 
-          }} 
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: 'block',
+          }}
         />
       </div>
     </div>

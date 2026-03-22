@@ -151,6 +151,7 @@ class GeminiAPIClient:
         self.config = config
         self.client: Optional[genai.Client] = None
         self.current_model = config.model
+        self.original_model = config.model  # Preserved even during permanent fallback
         self.fallback_model = config.fallback_model
         # Indicates whether we've permanently switched to the fallback model due to quota limits
         self.permanent_fallback = False
@@ -537,6 +538,17 @@ class GeminiTTSWrapper(TTSInterface):
         self._cache_dir = None
         self.cost_tracker = cost_tracker
         self.translator = translator
+
+        # Track output paths produced by fallback/rescue models (not primary).
+        # smart_dubbing checks this to avoid caching fallback results at the
+        # pipeline level, allowing them to be regenerated with the primary model.
+        self._fallback_output_paths: set = set()
+        self._fallback_paths_lock = threading.Lock()
+
+    def is_fallback_output(self, output_path: str) -> bool:
+        """Check if a given output path was produced by a fallback/rescue model."""
+        with self._fallback_paths_lock:
+            return os.path.abspath(output_path) in self._fallback_output_paths
 
     def _register_usage(
         self,
@@ -1147,16 +1159,31 @@ class GeminiTTSWrapper(TTSInterface):
                 _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
                 continue
 
-            if best_silence > MAX_INVALID_SILENCE_RATIO:
+            # For very short segments (< 3s of text), Gemini often produces
+            # audio with a disproportionately high silence ratio because even a
+            # small absolute amount of trailing silence dominates the percentage.
+            # Relax the hard rejection thresholds so we use the best attempt
+            # instead of raising an error that leaves the segment silent.
+            estimated_duration = len(segment_data.text) / 15.0  # rough chars-per-second estimate
+            is_short_segment = estimated_duration < 3.0
+
+            if best_silence > MAX_INVALID_SILENCE_RATIO and not is_short_segment:
                 _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
                 raise RuntimeError(
                     f"Best invalid attempt for speaker {segment_data.speaker} still too silent "
                     f"(ratio={best_silence:.2f} > {MAX_INVALID_SILENCE_RATIO:.2f})"
                 )
+            elif best_silence > MAX_INVALID_SILENCE_RATIO and is_short_segment:
+                logger.warning(
+                    f"Short segment for speaker {segment_data.speaker} exceeds silence threshold "
+                    f"(ratio={best_silence:.2f} > {MAX_INVALID_SILENCE_RATIO:.2f}) "
+                    f"but using best attempt anyway due to short text length"
+                )
             if (
                 self.config.enable_voice_consistency_validation
                 and best_similarity is not None
                 and best_similarity < MIN_VOICE_SIMILARITY_FOR_INVALID_FALLBACK
+                and not is_short_segment
             ):
                 _cleanup_paths([candidate_path for _, _, _, candidate_path, _, _ in candidates])
                 raise RuntimeError(
@@ -1454,13 +1481,30 @@ class GeminiTTSWrapper(TTSInterface):
                 self._register_usage(usage_tracker, model_used, audio_seconds=duration)
 
             # Cache the generated audio only if synthesis was successful (passed validation)
-            if self._cache_dir and is_valid:
+            # and was produced by the primary model (not fallback/rescue).
+            # Fallback results are intentionally not cached so they can be
+            # regenerated with the primary model on the next run.
+            used_fallback = (
+                model_used is not None
+                and model_used != self.api_client.original_model
+            )
+            if self._cache_dir and is_valid and not used_fallback:
                 cache_path = os.path.join(self._cache_dir, f"{cache_key}.wav")
                 shutil.copy(segment_file_path, cache_path)
                 self._audio_cache[cache_key] = (cache_path, duration)
                 logger.debug(f"Cached valid segment for speaker '{segment.speaker}'")
+            elif used_fallback:
+                logger.debug(
+                    f"Skipping cache for fallback segment (speaker '{segment.speaker}', "
+                    f"model '{model_used}') to allow primary-model retry next time"
+                )
             elif not is_valid:
                 logger.debug(f"Skipping cache for invalid segment (speaker '{segment.speaker}') to allow retry next time")
+
+            # Track fallback output paths so the pipeline cache can skip them too
+            if used_fallback and segment.output_path:
+                with self._fallback_paths_lock:
+                    self._fallback_output_paths.add(os.path.abspath(segment.output_path))
 
             # Save to output path if specified
             if segment.output_path:

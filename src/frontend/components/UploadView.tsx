@@ -433,12 +433,15 @@ export const UploadView: React.FC<UploadViewProps> = ({
                   <label className="text-xs font-medium text-zinc-400 h-4 flex items-center gap-1.5">
                     <Speaker className="w-3 h-3" /> Speakers
                   </label>
-                  <input 
-                    type="number" 
+                  <input
+                    type="number"
                     min="1"
                     placeholder="Auto"
-                    value={config.speakerCount || ''}
-                    onChange={(e) => onConfigChange({ speakerCount: e.target.value ? parseInt(e.target.value) : undefined })}
+                    value={config.speakerCount ?? ''}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      onConfigChange({ speakerCount: val === '' ? undefined : Math.max(1, parseInt(val) || 1) });
+                    }}
                     className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500"
                   />
                 </div>
