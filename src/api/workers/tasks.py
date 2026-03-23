@@ -283,6 +283,18 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            if config_data.get("geminiMultiSpeakerEnabled") is not None:
+                segments_opt["gemini_multi_speaker_enabled"] = config_data["geminiMultiSpeakerEnabled"]
+            if config_data.get("geminiMultiSpeakerMaxBatchTokens") is not None:
+                segments_opt["gemini_multi_speaker_max_batch_tokens"] = config_data["geminiMultiSpeakerMaxBatchTokens"]
+            if config_data.get("geminiMultiSpeakerMaxTurns") is not None:
+                segments_opt["gemini_multi_speaker_max_turns"] = config_data["geminiMultiSpeakerMaxTurns"]
+            if config_data.get("geminiMultiSpeakerPauseRepeats") is not None:
+                segments_opt["gemini_multi_speaker_pause_repeats"] = config_data["geminiMultiSpeakerPauseRepeats"]
+            if config_data.get("geminiMultiSpeakerMinPauseMs") is not None:
+                segments_opt["gemini_multi_speaker_min_pause_ms"] = config_data["geminiMultiSpeakerMinPauseMs"]
+            if config_data.get("geminiMultiSpeakerBoundaryRetryAttempts") is not None:
+                segments_opt["gemini_multi_speaker_boundary_retry_attempts"] = config_data["geminiMultiSpeakerBoundaryRetryAttempts"]
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -516,6 +528,18 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
             if config_data.get("comfortMaxAdjustmentRatio") is not None:
                 segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            if config_data.get("geminiMultiSpeakerEnabled") is not None:
+                segments_opt["gemini_multi_speaker_enabled"] = config_data["geminiMultiSpeakerEnabled"]
+            if config_data.get("geminiMultiSpeakerMaxBatchTokens") is not None:
+                segments_opt["gemini_multi_speaker_max_batch_tokens"] = config_data["geminiMultiSpeakerMaxBatchTokens"]
+            if config_data.get("geminiMultiSpeakerMaxTurns") is not None:
+                segments_opt["gemini_multi_speaker_max_turns"] = config_data["geminiMultiSpeakerMaxTurns"]
+            if config_data.get("geminiMultiSpeakerPauseRepeats") is not None:
+                segments_opt["gemini_multi_speaker_pause_repeats"] = config_data["geminiMultiSpeakerPauseRepeats"]
+            if config_data.get("geminiMultiSpeakerMinPauseMs") is not None:
+                segments_opt["gemini_multi_speaker_min_pause_ms"] = config_data["geminiMultiSpeakerMinPauseMs"]
+            if config_data.get("geminiMultiSpeakerBoundaryRetryAttempts") is not None:
+                segments_opt["gemini_multi_speaker_boundary_retry_attempts"] = config_data["geminiMultiSpeakerBoundaryRetryAttempts"]
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -607,6 +631,9 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             def video_combine_log(message: str):
                 # Segment-level speed logs are useful in debug files but too noisy for SSE UI logs.
                 if message.startswith("Segment ") and "speed=" in message:
+                    return
+                # Skip — already shown via update_job_progress on line above
+                if message.startswith("Combining audio"):
                     return
                 add_job_log(job_id, message)
             

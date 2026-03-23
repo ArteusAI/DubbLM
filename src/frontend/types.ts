@@ -171,6 +171,14 @@ export interface AppConfig {
   // Pause processing
   minPauseDuration?: number;
   preservePauseDuration?: number;
+
+  // Experimental Gemini multi-speaker batching
+  geminiMultiSpeakerEnabled?: boolean;
+  geminiMultiSpeakerMaxBatchTokens?: number;
+  geminiMultiSpeakerMaxTurns?: number;
+  geminiMultiSpeakerPauseRepeats?: number;
+  geminiMultiSpeakerMinPauseMs?: number;
+  geminiMultiSpeakerBoundaryRetryAttempts?: number;
 }
 
 export interface Project {

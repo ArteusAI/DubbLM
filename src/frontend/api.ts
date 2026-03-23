@@ -474,6 +474,12 @@ export interface ProjectConfig {
   segmentStretch?: 'audio' | 'audio_and_video' | 'video';
   minPauseDuration?: number;
   preservePauseDuration?: number;
+  geminiMultiSpeakerEnabled?: boolean;
+  geminiMultiSpeakerMaxBatchTokens?: number;
+  geminiMultiSpeakerMaxTurns?: number;
+  geminiMultiSpeakerPauseRepeats?: number;
+  geminiMultiSpeakerMinPauseMs?: number;
+  geminiMultiSpeakerBoundaryRetryAttempts?: number;
 }
 
 export interface ProjectListResponse {

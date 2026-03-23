@@ -215,6 +215,7 @@ class SmartDubbing:
         self.default_tts = None
         
         try:
+            segments_opt = self.config.get('segments_optimization', {})
             tts_instance = TTSFactory.create_tts(
                 tts_system=self.config.get('tts_system', 'coqui'),
                 device=self.device,
@@ -233,6 +234,12 @@ class SmartDubbing:
                 voice_similarity_threshold=self.config.get('voice_similarity_threshold'),
                 voice_similarity_relaxed_threshold=self.config.get('voice_similarity_relaxed_threshold'),
                 min_voice_validation_duration_seconds=self.config.get('min_voice_validation_duration_seconds'),
+                enable_multi_speaker_experimental=segments_opt.get('gemini_multi_speaker_enabled', False),
+                multi_speaker_max_batch_tokens=segments_opt.get('gemini_multi_speaker_max_batch_tokens'),
+                multi_speaker_max_turns=segments_opt.get('gemini_multi_speaker_max_turns'),
+                multi_speaker_pause_repeats=segments_opt.get('gemini_multi_speaker_pause_repeats'),
+                multi_speaker_min_pause_ms=segments_opt.get('gemini_multi_speaker_min_pause_ms'),
+                multi_speaker_boundary_retry_attempts=segments_opt.get('gemini_multi_speaker_boundary_retry_attempts'),
                 cost_tracker=self.cost_tracker,
                 translator=self.translator,
                 target_language=self.config.get('target_language', 'en')  # Pass target language for language-specific TTS configuration
@@ -1163,7 +1170,11 @@ class SmartDubbing:
             )
             return best_text, best_ratio, best_deviation, best_track_type
 
-        def handle_segment(segment_index: int) -> Optional[Dict[str, Any]]:
+        experimental_multi_speaker_enabled = bool(
+            segments_opt.get('gemini_multi_speaker_enabled', False)
+        )
+
+        def build_segment_job(segment_index: int) -> Optional[Dict[str, Any]]:
             segment_dict = segments[segment_index]
             speaker = segment_dict["speaker"]
             tts_system = self._get_tts_system_for_speaker(speaker)
@@ -1312,15 +1323,25 @@ class SmartDubbing:
                     if prev_text:
                         previous_texts.append(prev_text)
 
+            tts_lock = tts_locks.get(tts_system)
+            if tts_lock is None:
+                tts_lock = threading.Lock()
+                tts_locks[tts_system] = tts_lock
+                setattr(tts_instance, "_synthesis_lock", tts_lock)
+
             metadata = {
                 "index": segment_index,
+                "speaker": speaker,
                 "segment_dict": segment_dict,
                 "cache_path": segment_cached_file_path,
                 "output_path": current_segment_output_path,
                 "chosen_text": best_text,
                 "estimated_ratio": best_ratio,
                 "tts_system": tts_system,
+                "tts_instance": tts_instance,
+                "tts_lock": tts_lock,
                 "segment_data_args": tts_segment_data_args,
+                "final_segment_data": final_segment_data,
                 "selected_track_type": best_track_type,
                 "previous_context": previous_texts,
             }
@@ -1333,44 +1354,63 @@ class SmartDubbing:
             seg_info = "segment" if total_segments == 1 else f"segment {segment_index+1}/{total_segments}"
             logger.info(f"Processing {seg_info} (Speaker: {speaker}, TTS: {tts_system}): \"{text_snippet}\"")
 
-            tts_lock = tts_locks.get(tts_system)
-            if tts_lock is None:
-                tts_lock = threading.Lock()
-                tts_locks[tts_system] = tts_lock
-                setattr(tts_instance, "_synthesis_lock", tts_lock)
+            return metadata
 
-            try:
-                with tts_lock:
-                    tts_instance.synthesize(
-                        segments_data=[final_segment_data],
-                        language=target_language,
-                        previous_context=previous_texts
-                    )
-            except Exception as synth_exc:
-                logger.error(f"Failed to synthesize segment {segment_index+1} ({tts_system}): {synth_exc}")
-                segment_dict['synthesized_speech_len'] = 0
-                segment_dict['synthesized_speech_file'] = None
-                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "synthesis failed", best_text)
-                return metadata
+        def mark_segment_failure(metadata: Dict[str, Any], note: str) -> Dict[str, Any]:
+            segment_index = metadata["index"]
+            speaker = metadata["speaker"]
+            best_text = metadata["chosen_text"]
+            segment_dict = metadata["segment_dict"]
+            output_path = metadata["output_path"]
+            segment_dict['synthesized_speech_len'] = 0
+            segment_dict['synthesized_speech_file'] = None
+            AudioSegment.silent(duration=0).export(output_path, format="wav")
+            increment_progress(segment_index, speaker, note, best_text)
+            return metadata
+
+        def synthesize_segment_job(metadata: Dict[str, Any]) -> None:
+            tts_instance = metadata["tts_instance"]
+            tts_lock = metadata["tts_lock"]
+            final_segment_data = metadata["final_segment_data"]
+            previous_texts = metadata["previous_context"]
+            with tts_lock:
+                tts_instance.synthesize(
+                    segments_data=[final_segment_data],
+                    language=target_language,
+                    previous_context=previous_texts
+                )
+
+        def synthesize_segment_batch(jobs: List[Dict[str, Any]]) -> None:
+            first_job = jobs[0]
+            tts_instance = first_job["tts_instance"]
+            tts_lock = first_job["tts_lock"]
+            batch_segments = [job["final_segment_data"] for job in jobs]
+            with tts_lock:
+                tts_instance.synthesize(
+                    segments_data=batch_segments,
+                    language=target_language,
+                )
+
+        def finalize_segment_job(metadata: Dict[str, Any]) -> Dict[str, Any]:
+            segment_index = metadata["index"]
+            speaker = metadata["speaker"]
+            segment_dict = metadata["segment_dict"]
+            current_segment_output_path = metadata["output_path"]
+            best_text = metadata["chosen_text"]
+            best_track_type = metadata["selected_track_type"]
+            segment_cached_file_path = metadata["cache_path"]
+            tts_instance = metadata["tts_instance"]
+            tts_lock = metadata["tts_lock"]
 
             if not os.path.exists(current_segment_output_path):
-                logger.warning(f"Warning: No audio file created for segment {segment_index+1} ({tts_system})")
-                segment_dict['synthesized_speech_len'] = 0
-                segment_dict['synthesized_speech_file'] = None
-                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "missing output", best_text)
-                return metadata
+                logger.warning(f"Warning: No audio file created for segment {segment_index+1} ({metadata['tts_system']})")
+                return mark_segment_failure(metadata, "missing output")
 
             try:
                 audio_info = AudioSegment.from_file(current_segment_output_path)
             except Exception as audio_exc:
                 logger.error(f"Failed to load synthesized audio for segment {segment_index+1}: {audio_exc}")
-                segment_dict['synthesized_speech_len'] = 0
-                segment_dict['synthesized_speech_file'] = None
-                AudioSegment.silent(duration=0).export(current_segment_output_path, format="wav")
-                increment_progress(segment_index, speaker, "audio load failed", best_text)
-                return metadata
+                return mark_segment_failure(metadata, "audio load failed")
 
             segment_dict['synthesized_speech_len'] = len(audio_info) / 1000.0
             segment_dict['synthesized_speech_file'] = current_segment_output_path
@@ -1410,7 +1450,7 @@ class SmartDubbing:
                     f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
                     f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s."
                 )
-                
+
                 # Mode: audio - aggressive audio speed changes, allow going beyond comfort zone
                 logger.info("Mode 'audio': Resynthesizing with aggressive audio adjustments...")
                 with tts_lock:
@@ -1421,7 +1461,7 @@ class SmartDubbing:
                         COMFORT_MAX_ADJUSTMENT_RATIO,
                         current_ratio=ratio,
                         segments=segments,
-                    )                    
+                    )
             else:
                 # Estimation was accurate - within comfort zone
                 with metadata_lock:
@@ -1435,6 +1475,19 @@ class SmartDubbing:
             increment_progress(segment_index, speaker, "synthesized", best_text)
             return metadata
 
+        def handle_segment(segment_index: int) -> Optional[Dict[str, Any]]:
+            metadata = build_segment_job(segment_index)
+            if metadata is None:
+                return None
+
+            try:
+                synthesize_segment_job(metadata)
+            except Exception as synth_exc:
+                logger.error(f"Failed to synthesize segment {segment_index+1} ({metadata['tts_system']}): {synth_exc}")
+                return mark_segment_failure(metadata, "synthesis failed")
+
+            return finalize_segment_job(metadata)
+
         def process_speaker_segments(speaker_id: str) -> None:
             indices = speaker_to_indices.get(speaker_id, [])
             for segment_index in indices:
@@ -1446,18 +1499,89 @@ class SmartDubbing:
                         f"for speaker '{speaker_id}': {segment_exc}"
                     )
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(process_speaker_segments, speaker_id): speaker_id
-                for speaker_id in speaker_to_indices.keys()
-            }
+        if experimental_multi_speaker_enabled:
+            pending_job: Optional[Dict[str, Any]] = None
+            next_index = 0
 
-            for future in as_completed(futures):
-                speaker_id = futures[future]
+            def can_batch_job(job: Dict[str, Any]) -> bool:
+                tts_instance = job["tts_instance"]
+                return (
+                    job["tts_system"] == "gemini"
+                    and hasattr(tts_instance, "supports_experimental_multi_speaker")
+                    and tts_instance.supports_experimental_multi_speaker()
+                )
+
+            while next_index < total_segments or pending_job is not None:
+                if pending_job is not None:
+                    job = pending_job
+                    pending_job = None
+                else:
+                    job = build_segment_job(next_index)
+                    next_index += 1
+                    if job is None:
+                        continue
+
+                if not can_batch_job(job):
+                    try:
+                        synthesize_segment_job(job)
+                    except Exception as synth_exc:
+                        logger.error(f"Failed to synthesize segment {job['index'] + 1} ({job['tts_system']}): {synth_exc}")
+                        mark_segment_failure(job, "synthesis failed")
+                    else:
+                        finalize_segment_job(job)
+                    continue
+
+                batch_jobs = [job]
+                while next_index < total_segments:
+                    candidate_job = build_segment_job(next_index)
+                    next_index += 1
+                    if candidate_job is None:
+                        break
+                    if (
+                        candidate_job["tts_instance"] is not job["tts_instance"]
+                        or not can_batch_job(candidate_job)
+                    ):
+                        pending_job = candidate_job
+                        break
+                    batch_jobs.append(candidate_job)
+
                 try:
-                    future.result()
-                except Exception as speaker_exc:
-                    logger.error(f"Synthesis thread for speaker '{speaker_id}' failed: {speaker_exc}")
+                    if len(batch_jobs) > 1:
+                        synthesize_segment_batch(batch_jobs)
+                    else:
+                        synthesize_segment_job(batch_jobs[0])
+                except Exception as batch_exc:
+                    logger.warning(
+                        f"Gemini multi-speaker orchestration fallback for segments "
+                        f"{batch_jobs[0]['index'] + 1}-{batch_jobs[-1]['index'] + 1}: {batch_exc}"
+                    )
+                    for batch_job in batch_jobs:
+                        try:
+                            synthesize_segment_job(batch_job)
+                        except Exception as synth_exc:
+                            logger.error(
+                                f"Failed to synthesize segment {batch_job['index'] + 1} "
+                                f"({batch_job['tts_system']}): {synth_exc}"
+                            )
+                            mark_segment_failure(batch_job, "synthesis failed")
+                        else:
+                            finalize_segment_job(batch_job)
+                else:
+                    for batch_job in batch_jobs:
+                        finalize_segment_job(batch_job)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(process_speaker_segments, speaker_id): speaker_id
+                    for speaker_id in speaker_to_indices.keys()
+                }
+
+                for future in as_completed(futures):
+                    speaker_id = futures[future]
+                    try:
+                        future.result()
+                    except Exception as speaker_exc:
+                        logger.error(f"Synthesis thread for speaker '{speaker_id}' failed: {speaker_exc}")
 
         # Ensure metadata is ordered for downstream reporting
         segments_metadata.sort(key=lambda item: item["index"])

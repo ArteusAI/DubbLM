@@ -43,6 +43,12 @@ const INITIAL_CONFIG: AppConfig = {
   translationPromptPrefix: '',
   speakerTtsPrompts: {},
   speakerVoiceMappings: {},
+  geminiMultiSpeakerEnabled: false,
+  geminiMultiSpeakerMaxBatchTokens: 1200,
+  geminiMultiSpeakerMaxTurns: 8,
+  geminiMultiSpeakerPauseRepeats: 3,
+  geminiMultiSpeakerMinPauseMs: 1200,
+  geminiMultiSpeakerBoundaryRetryAttempts: 2,
 };
 
 const mapSegmentFromApi = (
@@ -118,6 +124,12 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       segmentStretch: cfg.segmentStretch,
       minPauseDuration: cfg.minPauseDuration,
       preservePauseDuration: cfg.preservePauseDuration,
+      geminiMultiSpeakerEnabled: cfg.geminiMultiSpeakerEnabled,
+      geminiMultiSpeakerMaxBatchTokens: cfg.geminiMultiSpeakerMaxBatchTokens,
+      geminiMultiSpeakerMaxTurns: cfg.geminiMultiSpeakerMaxTurns,
+      geminiMultiSpeakerPauseRepeats: cfg.geminiMultiSpeakerPauseRepeats,
+      geminiMultiSpeakerMinPauseMs: cfg.geminiMultiSpeakerMinPauseMs,
+      geminiMultiSpeakerBoundaryRetryAttempts: cfg.geminiMultiSpeakerBoundaryRetryAttempts,
     },
     segments: p.segments?.map(seg => mapSegmentFromApi(seg, {
       speakerVoiceMappings: cfg.speakerVoiceMappings || {},
@@ -510,6 +522,21 @@ const App: React.FC = () => {
           useTwoPassEncoding: cfg.useTwoPassEncoding,
           videoQualityPreset: cfg.videoQualityPreset,
           maxWorkers: cfg.maxWorkers,
+          postDiarizationMergeGap: cfg.postDiarizationMergeGap,
+          postTranslationMergeGap: cfg.postTranslationMergeGap,
+          maxSegmentDuration: cfg.maxSegmentDuration,
+          minSegmentDuration: cfg.minSegmentDuration,
+          comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
+          comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+          segmentStretch: cfg.segmentStretch,
+          minPauseDuration: cfg.minPauseDuration,
+          preservePauseDuration: cfg.preservePauseDuration,
+          geminiMultiSpeakerEnabled: cfg.geminiMultiSpeakerEnabled,
+          geminiMultiSpeakerMaxBatchTokens: cfg.geminiMultiSpeakerMaxBatchTokens,
+          geminiMultiSpeakerMaxTurns: cfg.geminiMultiSpeakerMaxTurns,
+          geminiMultiSpeakerPauseRepeats: cfg.geminiMultiSpeakerPauseRepeats,
+          geminiMultiSpeakerMinPauseMs: cfg.geminiMultiSpeakerMinPauseMs,
+          geminiMultiSpeakerBoundaryRetryAttempts: cfg.geminiMultiSpeakerBoundaryRetryAttempts,
           autoProcess: true,  // Backend will auto-start dubbing after transcription
         });
 
@@ -834,6 +861,12 @@ const App: React.FC = () => {
         segmentStretch: cfg.segmentStretch,
         minPauseDuration: cfg.minPauseDuration,
         preservePauseDuration: cfg.preservePauseDuration,
+        geminiMultiSpeakerEnabled: cfg.geminiMultiSpeakerEnabled,
+        geminiMultiSpeakerMaxBatchTokens: cfg.geminiMultiSpeakerMaxBatchTokens,
+        geminiMultiSpeakerMaxTurns: cfg.geminiMultiSpeakerMaxTurns,
+        geminiMultiSpeakerPauseRepeats: cfg.geminiMultiSpeakerPauseRepeats,
+        geminiMultiSpeakerMinPauseMs: cfg.geminiMultiSpeakerMinPauseMs,
+        geminiMultiSpeakerBoundaryRetryAttempts: cfg.geminiMultiSpeakerBoundaryRetryAttempts,
       }).catch(err => {
         console.error('Failed to save config:', err);
       });
@@ -912,6 +945,12 @@ const App: React.FC = () => {
         segmentStretch: cfg.segmentStretch,
         minPauseDuration: cfg.minPauseDuration,
         preservePauseDuration: cfg.preservePauseDuration,
+        geminiMultiSpeakerEnabled: cfg.geminiMultiSpeakerEnabled,
+        geminiMultiSpeakerMaxBatchTokens: cfg.geminiMultiSpeakerMaxBatchTokens,
+        geminiMultiSpeakerMaxTurns: cfg.geminiMultiSpeakerMaxTurns,
+        geminiMultiSpeakerPauseRepeats: cfg.geminiMultiSpeakerPauseRepeats,
+        geminiMultiSpeakerMinPauseMs: cfg.geminiMultiSpeakerMinPauseMs,
+        geminiMultiSpeakerBoundaryRetryAttempts: cfg.geminiMultiSpeakerBoundaryRetryAttempts,
         autoProcess: true,
       });
 
@@ -984,6 +1023,21 @@ const App: React.FC = () => {
         refinementLlmProvider: cfg.refinementLlmProvider,
         refinementModelName: cfg.refinementModelName,
         refinementTemperature: cfg.refinementTemperature,
+        postDiarizationMergeGap: cfg.postDiarizationMergeGap,
+        postTranslationMergeGap: cfg.postTranslationMergeGap,
+        maxSegmentDuration: cfg.maxSegmentDuration,
+        minSegmentDuration: cfg.minSegmentDuration,
+        comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
+        comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+        segmentStretch: cfg.segmentStretch,
+        minPauseDuration: cfg.minPauseDuration,
+        preservePauseDuration: cfg.preservePauseDuration,
+        geminiMultiSpeakerEnabled: cfg.geminiMultiSpeakerEnabled,
+        geminiMultiSpeakerMaxBatchTokens: cfg.geminiMultiSpeakerMaxBatchTokens,
+        geminiMultiSpeakerMaxTurns: cfg.geminiMultiSpeakerMaxTurns,
+        geminiMultiSpeakerPauseRepeats: cfg.geminiMultiSpeakerPauseRepeats,
+        geminiMultiSpeakerMinPauseMs: cfg.geminiMultiSpeakerMinPauseMs,
+        geminiMultiSpeakerBoundaryRetryAttempts: cfg.geminiMultiSpeakerBoundaryRetryAttempts,
       });
 
       await api.startDubbing(activeProject.id);

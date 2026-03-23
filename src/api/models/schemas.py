@@ -52,6 +52,12 @@ class ProjectConfig(BaseModel):
     minPauseDuration: Optional[float] = None
     preservePauseDuration: Optional[float] = None
     segmentStretch: Optional[Literal["audio", "audio_and_video", "video"]] = None
+    geminiMultiSpeakerEnabled: Optional[bool] = None
+    geminiMultiSpeakerMaxBatchTokens: Optional[int] = None
+    geminiMultiSpeakerMaxTurns: Optional[int] = None
+    geminiMultiSpeakerPauseRepeats: Optional[int] = None
+    geminiMultiSpeakerMinPauseMs: Optional[int] = None
+    geminiMultiSpeakerBoundaryRetryAttempts: Optional[int] = None
 
 
 class ProjectConfigUpdate(BaseModel):
@@ -99,6 +105,12 @@ class ProjectConfigUpdate(BaseModel):
     minPauseDuration: Optional[float] = None
     preservePauseDuration: Optional[float] = None
     segmentStretch: Optional[Literal["audio", "audio_and_video", "video"]] = None
+    geminiMultiSpeakerEnabled: Optional[bool] = None
+    geminiMultiSpeakerMaxBatchTokens: Optional[int] = None
+    geminiMultiSpeakerMaxTurns: Optional[int] = None
+    geminiMultiSpeakerPauseRepeats: Optional[int] = None
+    geminiMultiSpeakerMinPauseMs: Optional[int] = None
+    geminiMultiSpeakerBoundaryRetryAttempts: Optional[int] = None
 
 
 class ProjectCreate(BaseModel):

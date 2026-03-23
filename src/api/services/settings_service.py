@@ -60,6 +60,12 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "useTwoPassEncoding": True,
         "maxWorkers": 4,
         "segmentStretch": "audio_and_video",
+        "geminiMultiSpeakerEnabled": False,
+        "geminiMultiSpeakerMaxBatchTokens": 1200,
+        "geminiMultiSpeakerMaxTurns": 8,
+        "geminiMultiSpeakerPauseRepeats": 3,
+        "geminiMultiSpeakerMinPauseMs": 1200,
+        "geminiMultiSpeakerBoundaryRetryAttempts": 2,
     }
 
     if not DUBBING_CONFIG_FILE.exists():
@@ -118,6 +124,12 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
             "min_pause_duration": "minPauseDuration",
             "preserve_pause_duration": "preservePauseDuration",
             "video_minterpolate_threshold": "videoMinterpolateThreshold",
+            "gemini_multi_speaker_enabled": "geminiMultiSpeakerEnabled",
+            "gemini_multi_speaker_max_batch_tokens": "geminiMultiSpeakerMaxBatchTokens",
+            "gemini_multi_speaker_max_turns": "geminiMultiSpeakerMaxTurns",
+            "gemini_multi_speaker_pause_repeats": "geminiMultiSpeakerPauseRepeats",
+            "gemini_multi_speaker_min_pause_ms": "geminiMultiSpeakerMinPauseMs",
+            "gemini_multi_speaker_boundary_retry_attempts": "geminiMultiSpeakerBoundaryRetryAttempts",
         }
         for source_key, target_key in segment_mapping.items():
             value = segments_optimization.get(source_key)

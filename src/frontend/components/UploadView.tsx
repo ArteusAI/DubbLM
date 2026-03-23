@@ -1106,6 +1106,97 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           />
                         </div>
                       </div>
+
+                      <div className="pt-2 border-t border-zinc-800/70 space-y-2">
+                        <label className="text-[10px] text-zinc-500 flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={config.geminiMultiSpeakerEnabled ?? false}
+                            onChange={(e) => onConfigChange({ geminiMultiSpeakerEnabled: e.target.checked })}
+                            className="rounded border-zinc-700 bg-zinc-950 text-brand-500 focus:ring-brand-500/50"
+                          />
+                          Experimental Gemini multi-speaker batching
+                          <InfoTip text="Gemini-only. Batches adjacent dialogue turns and splits them back by strict long-pause detection. Falls back to per-segment synthesis if boundaries are ambiguous." />
+                        </label>
+                        <div className={`grid grid-cols-5 gap-2 ${config.geminiMultiSpeakerEnabled ? '' : 'opacity-50'}`}>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-zinc-500 flex items-center">
+                              Batch Tokens
+                              <InfoTip text="Soft token cap for one Gemini multi-speaker request" />
+                            </label>
+                            <input
+                              type="number"
+                              min="100"
+                              max="4000"
+                              disabled={!config.geminiMultiSpeakerEnabled}
+                              value={config.geminiMultiSpeakerMaxBatchTokens ?? 1200}
+                              onChange={(e) => onConfigChange({ geminiMultiSpeakerMaxBatchTokens: parseInt(e.target.value) })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-zinc-500 flex items-center">
+                              Max Turns
+                              <InfoTip text="Maximum dialogue turns to pack into one multi-speaker batch" />
+                            </label>
+                            <input
+                              type="number"
+                              min="2"
+                              max="32"
+                              disabled={!config.geminiMultiSpeakerEnabled}
+                              value={config.geminiMultiSpeakerMaxTurns ?? 8}
+                              onChange={(e) => onConfigChange({ geminiMultiSpeakerMaxTurns: parseInt(e.target.value) })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-zinc-500 flex items-center">
+                              Pause Repeats
+                              <InfoTip text="How many [long pause] markers to inject between turns as a service delimiter" />
+                            </label>
+                            <input
+                              type="number"
+                              min="2"
+                              max="8"
+                              disabled={!config.geminiMultiSpeakerEnabled}
+                              value={config.geminiMultiSpeakerPauseRepeats ?? 3}
+                              onChange={(e) => onConfigChange({ geminiMultiSpeakerPauseRepeats: parseInt(e.target.value) })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-zinc-500 flex items-center">
+                              Min Pause ms
+                              <InfoTip text="Minimum detected silence duration required to accept a delimiter boundary" />
+                            </label>
+                            <input
+                              type="number"
+                              min="500"
+                              max="5000"
+                              step="50"
+                              disabled={!config.geminiMultiSpeakerEnabled}
+                              value={config.geminiMultiSpeakerMinPauseMs ?? 1200}
+                              onChange={(e) => onConfigChange({ geminiMultiSpeakerMinPauseMs: parseInt(e.target.value) })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-zinc-500 flex items-center">
+                              Boundary Retries
+                              <InfoTip text="Whole-batch retries for strict boundary mismatches before falling back to per-segment synthesis" />
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              max="5"
+                              disabled={!config.geminiMultiSpeakerEnabled}
+                              value={config.geminiMultiSpeakerBoundaryRetryAttempts ?? 2}
+                              onChange={(e) => onConfigChange({ geminiMultiSpeakerBoundaryRetryAttempts: parseInt(e.target.value) })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            />
+                          </div>
+                        </div>
+                      </div>
                     </div>
 
                     {/* Audio/Video Sync */}

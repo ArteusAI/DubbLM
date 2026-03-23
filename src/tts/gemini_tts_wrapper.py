@@ -1,4 +1,5 @@
-from typing import Optional, Dict, Any, List, Union, Tuple
+from typing import Optional, Dict, Any, List, Union, Tuple, Set
+import audioop
 import os
 import wave
 import time
@@ -56,6 +57,13 @@ except ImportError:
     tiktoken = None
     TIKTOKEN_AVAILABLE = False
 
+try:
+    import webrtcvad
+    WEBRTCVAD_AVAILABLE = True
+except ImportError:
+    webrtcvad = None
+    WEBRTCVAD_AVAILABLE = False
+
 logger = get_logger(__name__)
 
 # Constants
@@ -92,6 +100,11 @@ DURATION_STATS_FILE = DEFAULT_SAMPLES_DIR / "gemini_voice_stats.json"
 DURATION_ADJUSTMENTS_FILE = DEFAULT_SAMPLES_DIR / "gemini_duration_adjustments.json"
 MAX_CHAR_LIMIT_PER_REQUEST = 1024*30
 SAMPLE_RATE = 24000
+MAX_MULTI_SPEAKER_PROMPT_BYTES = 7600
+MULTI_SPEAKER_MAX_SPEAKERS = 2
+MULTI_SPEAKER_VAD_FRAME_MS = 30
+MULTI_SPEAKER_VAD_AGGRESSIVENESS = 3
+MULTI_SPEAKER_EDGE_PADDING_MS = 90
 
 
 class GeminiTTSConfig(BaseModel):
@@ -136,6 +149,13 @@ class GeminiTTSConfig(BaseModel):
     voice_similarity_relaxed_threshold: float = 0.70
     # Skip voice consistency checks for very short clips (unstable embeddings).
     min_voice_validation_duration_seconds: float = 1.0
+    # Experimental multi-speaker batching.
+    enable_multi_speaker_experimental: bool = False
+    multi_speaker_max_batch_tokens: int = 1200
+    multi_speaker_max_turns: int = 8
+    multi_speaker_pause_repeats: int = 3
+    multi_speaker_min_pause_ms: int = 1200
+    multi_speaker_boundary_retry_attempts: int = 2
 
 
 
@@ -411,6 +431,31 @@ class SpeechConfigBuilder:
             )
         )
 
+    @staticmethod
+    def build_multi_speaker_config(speaker_voice_mapping: Dict[str, str]) -> Optional[genai_types.SpeechConfig]:
+        """Build speech config for multi-speaker synthesis when SDK support is available."""
+        multi_speaker_cls = getattr(genai_types, "MultiSpeakerVoiceConfig", None)
+        speaker_voice_cls = getattr(genai_types, "SpeakerVoiceConfig", None)
+        voice_config_cls = getattr(genai_types, "VoiceConfig", None)
+        prebuilt_voice_cls = getattr(genai_types, "PrebuiltVoiceConfig", None)
+        if not all((multi_speaker_cls, speaker_voice_cls, voice_config_cls, prebuilt_voice_cls)):
+            return None
+
+        speaker_voice_configs = [
+            speaker_voice_cls(
+                speaker=speaker_name,
+                voice_config=voice_config_cls(
+                    prebuilt_voice_config=prebuilt_voice_cls(voice_name=voice_name)
+                ),
+            )
+            for speaker_name, voice_name in speaker_voice_mapping.items()
+        ]
+        return genai_types.SpeechConfig(
+            multi_speaker_voice_config=multi_speaker_cls(
+                speaker_voice_configs=speaker_voice_configs
+            )
+        )
+
 
 
 class GeminiTTSWrapper(TTSInterface):
@@ -490,6 +535,18 @@ class GeminiTTSWrapper(TTSInterface):
             config_kwargs["voice_similarity_relaxed_threshold"] = kwargs["voice_similarity_relaxed_threshold"]
         if kwargs.get("min_voice_validation_duration_seconds") is not None:
             config_kwargs["min_voice_validation_duration_seconds"] = kwargs["min_voice_validation_duration_seconds"]
+        if kwargs.get("enable_multi_speaker_experimental") is not None:
+            config_kwargs["enable_multi_speaker_experimental"] = kwargs["enable_multi_speaker_experimental"]
+        if kwargs.get("multi_speaker_max_batch_tokens") is not None:
+            config_kwargs["multi_speaker_max_batch_tokens"] = kwargs["multi_speaker_max_batch_tokens"]
+        if kwargs.get("multi_speaker_max_turns") is not None:
+            config_kwargs["multi_speaker_max_turns"] = kwargs["multi_speaker_max_turns"]
+        if kwargs.get("multi_speaker_pause_repeats") is not None:
+            config_kwargs["multi_speaker_pause_repeats"] = kwargs["multi_speaker_pause_repeats"]
+        if kwargs.get("multi_speaker_min_pause_ms") is not None:
+            config_kwargs["multi_speaker_min_pause_ms"] = kwargs["multi_speaker_min_pause_ms"]
+        if kwargs.get("multi_speaker_boundary_retry_attempts") is not None:
+            config_kwargs["multi_speaker_boundary_retry_attempts"] = kwargs["multi_speaker_boundary_retry_attempts"]
 
         self.config = GeminiTTSConfig(**config_kwargs)
         # Save rejected/silent attempts when debugging is enabled
@@ -601,6 +658,520 @@ class GeminiTTSWrapper(TTSInterface):
             return len(encoding.encode(text))
         except Exception as exc:
             raise RuntimeError(f"Failed to tokenize text for model '{self.config.model}': {exc}")
+
+    def _is_segment_cached(self, segment_data: TTSSegmentData, language: str) -> bool:
+        """Return True when a valid cached file already exists for this segment."""
+        cache_key = self._get_cache_key(segment_data, language)
+        cached = self._audio_cache.get(cache_key)
+        if not cached:
+            return False
+        cached_path, _ = cached
+        return os.path.exists(cached_path)
+
+    def supports_experimental_multi_speaker(self) -> bool:
+        """Report whether the experimental Gemini multi-speaker path is usable."""
+        if not self.config.enable_multi_speaker_experimental:
+            return False
+        if not WEBRTCVAD_AVAILABLE:
+            return False
+        try:
+            test_config = SpeechConfigBuilder.build_multi_speaker_config(
+                {"Speaker1": self.config.default_voice, "Speaker2": self.config.default_voice}
+            )
+        except Exception:
+            return False
+        return test_config is not None
+
+    def _sanitize_long_pause_for_experimental_batching(self, text: Optional[str]) -> str:
+        """Reserve `[long pause]` for service delimiters only in experimental batch mode."""
+        raw_text = text or ""
+        if not self.config.enable_multi_speaker_experimental:
+            return raw_text
+        return re.sub(r"\[\s*long pause\s*\]", "[medium pause]", raw_text, flags=re.IGNORECASE)
+
+    def _normalize_multi_speaker_text(self, text: str) -> str:
+        """Normalize text for batched Gemini multi-speaker synthesis.
+
+        In experimental batch mode `[long pause]` is reserved for service delimiters,
+        so user/content pauses are downgraded to `[medium pause]`.
+        """
+        cleaned = re.sub(r"\[\s*long pause\s*\]", "[medium pause]", text or "", flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @staticmethod
+    def _prepare_pcm_for_vad(
+        pcm: bytes,
+        sample_width: int,
+        channels: int,
+        frame_rate: int,
+    ) -> Tuple[bytes, int]:
+        """Convert audio data to 16-bit mono 16k PCM for VAD."""
+        if sample_width != 2:
+            pcm = audioop.lin2lin(pcm, sample_width, 2)
+            sample_width = 2
+        if channels > 1:
+            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+            channels = 1
+
+        target_rate = 16000
+        if frame_rate != target_rate:
+            pcm, _ = audioop.ratecv(pcm, sample_width, channels, frame_rate, target_rate, None)
+            frame_rate = target_rate
+
+        return pcm, frame_rate
+
+    @staticmethod
+    def _collect_vad_speech_runs(pcm: bytes, frame_rate: int) -> List[Tuple[int, int]]:
+        """Return contiguous speech runs as VAD frame index ranges."""
+        frame_size = int(frame_rate * MULTI_SPEAKER_VAD_FRAME_MS / 1000.0) * 2
+        if frame_size <= 0 or len(pcm) < frame_size:
+            raise RuntimeError("Generated batch audio is too short for VAD-based splitting.")
+
+        frame_count = len(pcm) // frame_size
+        vad = webrtcvad.Vad(MULTI_SPEAKER_VAD_AGGRESSIVENESS)
+        voiced_frames: List[bool] = []
+        for idx in range(frame_count):
+            frame = pcm[idx * frame_size:(idx + 1) * frame_size]
+            voiced_frames.append(vad.is_speech(frame, frame_rate))
+
+        if not any(voiced_frames):
+            return []
+
+        bridged = list(voiced_frames)
+        idx = 0
+        max_gap_frames = max(1, int(90 / MULTI_SPEAKER_VAD_FRAME_MS))
+        while idx < len(bridged):
+            if bridged[idx]:
+                idx += 1
+                continue
+            gap_start = idx
+            while idx < len(bridged) and not bridged[idx]:
+                idx += 1
+            gap_end = idx
+            has_left_speech = gap_start > 0 and bridged[gap_start - 1]
+            has_right_speech = gap_end < len(bridged) and bridged[gap_end]
+            if has_left_speech and has_right_speech and (gap_end - gap_start) <= max_gap_frames:
+                for fill_idx in range(gap_start, gap_end):
+                    bridged[fill_idx] = True
+
+        speech_runs: List[Tuple[int, int]] = []
+        idx = 0
+        while idx < len(bridged):
+            if not bridged[idx]:
+                idx += 1
+                continue
+            run_start = idx
+            while idx < len(bridged) and bridged[idx]:
+                idx += 1
+            speech_runs.append((run_start, idx - 1))
+
+        return speech_runs
+
+    def _get_multi_speaker_delimiter(self) -> str:
+        """Build the service delimiter inserted between batch turns."""
+        repeats = max(2, int(self.config.multi_speaker_pause_repeats))
+        return " ".join(["[long pause]"] * repeats)
+
+    def _build_multi_speaker_prompt(
+        self,
+        segments_data: List[TTSSegmentData]
+    ) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+        """Build prompt and alias mappings for Gemini multi-speaker synthesis."""
+        ordered_speakers: List[str] = []
+        for segment in segments_data:
+            if segment.speaker not in ordered_speakers:
+                ordered_speakers.append(segment.speaker)
+
+        speaker_aliases = {
+            speaker_id: f"Speaker{idx + 1}"
+            for idx, speaker_id in enumerate(ordered_speakers)
+        }
+        speaker_voice_mapping: Dict[str, str] = {}
+        speaker_style_mapping: Dict[str, str] = {}
+        for segment in segments_data:
+            alias = speaker_aliases[segment.speaker]
+            if alias not in speaker_voice_mapping:
+                speaker_voice_mapping[alias] = self._resolve_voice_for_segment(segment)
+            if alias not in speaker_style_mapping:
+                style_hint = self._get_style_prompt_for_speaker(segment.speaker, segment)
+                if style_hint:
+                    speaker_style_mapping[alias] = style_hint.rstrip(":").strip()
+
+        prompt_lines: List[str] = []
+        if self.config.prompt_prefix:
+            prompt_lines.append(self.config.prompt_prefix.strip())
+        prompt_lines.append(
+            "TTS the following conversation exactly as written. Preserve speaker order and pause cues."
+        )
+        if speaker_style_mapping:
+            prompt_lines.append("Speaker style guidance:")
+            for alias, style_hint in speaker_style_mapping.items():
+                prompt_lines.append(f"- {alias}: {style_hint}")
+        prompt_lines.append("Conversation:")
+
+        delimiter = self._get_multi_speaker_delimiter()
+        dialogue_lines: List[str] = []
+        for idx, segment in enumerate(segments_data):
+            alias = speaker_aliases[segment.speaker]
+            text = self._normalize_multi_speaker_text(segment.text)
+            if idx < len(segments_data) - 1:
+                text = f"{text} {delimiter}".strip()
+            dialogue_lines.append(f"{alias}: {text}")
+
+        prompt_lines.extend(dialogue_lines)
+        prompt = "\n".join(line for line in prompt_lines if line)
+        return prompt, speaker_voice_mapping, speaker_aliases
+
+    def _detect_multi_speaker_pause_ranges(self, audio_path: str) -> List[Tuple[float, float]]:
+        """Detect long inter-turn pauses using WebRTC VAD."""
+        if not WEBRTCVAD_AVAILABLE or webrtcvad is None:
+            raise RuntimeError("webrtcvad is required for Gemini multi-speaker batch splitting.")
+
+        with wave.open(audio_path, "rb") as wf:
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            frame_rate = wf.getframerate()
+            pcm = wf.readframes(wf.getnframes())
+
+        pcm, frame_rate = self._prepare_pcm_for_vad(pcm, sample_width, channels, frame_rate)
+        speech_runs = self._collect_vad_speech_runs(pcm, frame_rate)
+        if not speech_runs:
+            raise RuntimeError("VAD detected no speech in Gemini multi-speaker output.")
+
+        if len(speech_runs) < 2:
+            return []
+
+        pause_ranges: List[Tuple[float, float]] = []
+        for (prev_start, prev_end), (next_start, next_end) in zip(speech_runs, speech_runs[1:]):
+            pause_start_frame = prev_end + 1
+            pause_end_frame = next_start - 1
+            if pause_end_frame < pause_start_frame:
+                continue
+            pause_duration_ms = (pause_end_frame - pause_start_frame + 1) * MULTI_SPEAKER_VAD_FRAME_MS
+            if pause_duration_ms < self.config.multi_speaker_min_pause_ms:
+                continue
+            start_sec = (pause_start_frame * MULTI_SPEAKER_VAD_FRAME_MS) / 1000.0
+            end_sec = ((pause_end_frame + 1) * MULTI_SPEAKER_VAD_FRAME_MS) / 1000.0
+            pause_ranges.append((start_sec, end_sec))
+
+        return pause_ranges
+
+    @staticmethod
+    def _build_multi_speaker_segment_ranges(
+        total_duration_ms: int,
+        pause_ranges: List[Tuple[float, float]],
+        expected_segments: int
+    ) -> List[Tuple[int, int]]:
+        """Convert detected pauses into audio slice boundaries."""
+        if len(pause_ranges) != max(0, expected_segments - 1):
+            raise RuntimeError(
+                f"Strict boundary match failed: expected {expected_segments - 1} pauses, got {len(pause_ranges)}."
+            )
+
+        cut_points_ms = [
+            int(round(((pause_start + pause_end) / 2.0) * 1000.0))
+            for pause_start, pause_end in pause_ranges
+        ]
+        ranges: List[Tuple[int, int]] = []
+        start_ms = 0
+        for cut_point_ms in cut_points_ms:
+            if cut_point_ms <= start_ms:
+                raise RuntimeError("Detected non-monotonic Gemini multi-speaker cut points.")
+            ranges.append((start_ms, cut_point_ms))
+            start_ms = cut_point_ms
+        if total_duration_ms <= start_ms:
+            raise RuntimeError("Final Gemini multi-speaker cut point exceeds batch duration.")
+        ranges.append((start_ms, total_duration_ms))
+
+        if len(ranges) != expected_segments:
+            raise RuntimeError(
+                f"Strict segment reconstruction failed: expected {expected_segments}, got {len(ranges)}."
+            )
+        if any(end_ms <= start_ms for start_ms, end_ms in ranges):
+            raise RuntimeError("Detected empty segment while slicing Gemini multi-speaker output.")
+        return ranges
+
+    @staticmethod
+    def _build_multi_speaker_trim_range(
+        clip_duration_ms: int,
+        speech_runs: List[Tuple[int, int]],
+    ) -> Tuple[int, int]:
+        """Convert speech runs to an edge-trimmed clip window."""
+        if not speech_runs:
+            raise RuntimeError("No speech detected in sliced Gemini multi-speaker segment.")
+
+        start_ms = max(
+            0,
+            speech_runs[0][0] * MULTI_SPEAKER_VAD_FRAME_MS - MULTI_SPEAKER_EDGE_PADDING_MS,
+        )
+        end_ms = min(
+            clip_duration_ms,
+            (speech_runs[-1][1] + 1) * MULTI_SPEAKER_VAD_FRAME_MS + MULTI_SPEAKER_EDGE_PADDING_MS,
+        )
+        if end_ms <= start_ms:
+            raise RuntimeError("Invalid trim range for sliced Gemini multi-speaker segment.")
+        return start_ms, end_ms
+
+    def _trim_multi_speaker_segment_edges(self, clip: Any, speaker_id: str) -> Any:
+        """Remove leading/trailing silence from a sliced batch turn."""
+        if not WEBRTCVAD_AVAILABLE or webrtcvad is None:
+            return clip
+
+        pcm, frame_rate = self._prepare_pcm_for_vad(
+            clip.raw_data,
+            clip.sample_width,
+            clip.channels,
+            clip.frame_rate,
+        )
+        speech_runs = self._collect_vad_speech_runs(pcm, frame_rate)
+        trim_start_ms, trim_end_ms = self._build_multi_speaker_trim_range(len(clip), speech_runs)
+        if trim_start_ms == 0 and trim_end_ms == len(clip):
+            return clip
+
+        trimmed_clip = clip[trim_start_ms:trim_end_ms]
+        logger.debug(
+            "Gemini multi-speaker: trimmed segment edges for %s by %sms head / %sms tail",
+            speaker_id,
+            trim_start_ms,
+            max(0, len(clip) - trim_end_ms),
+        )
+        return trimmed_clip
+
+    @staticmethod
+    def _is_retryable_multi_speaker_boundary_error(exc: Exception) -> bool:
+        """Retry only strict boundary reconstruction mismatches for batched TTS."""
+        if not isinstance(exc, RuntimeError):
+            return False
+        return "Strict boundary match failed" in str(exc)
+
+    def _collect_multi_speaker_batch(
+        self,
+        segments_data: List[TTSSegmentData],
+        start_index: int,
+        language: str
+    ) -> List[TTSSegmentData]:
+        """Collect the largest valid experimental multi-speaker batch from a segment list."""
+        if not self.supports_experimental_multi_speaker():
+            return []
+
+        batch: List[TTSSegmentData] = []
+        seen_speakers: Set[str] = set()
+        idx = start_index
+
+        while idx < len(segments_data):
+            segment = segments_data[idx]
+            if not segment.speaker or not segment.text:
+                break
+            if self._is_segment_cached(segment, language):
+                break
+
+            candidate_speakers = set(seen_speakers)
+            candidate_speakers.add(segment.speaker)
+            if len(candidate_speakers) > MULTI_SPEAKER_MAX_SPEAKERS:
+                break
+
+            candidate_batch = batch + [segment]
+            prompt, _, _ = self._build_multi_speaker_prompt(candidate_batch)
+            prompt_bytes = len(prompt.encode("utf-8"))
+            token_count = self._count_tokens(prompt)
+
+            if prompt_bytes > MAX_MULTI_SPEAKER_PROMPT_BYTES:
+                break
+            if token_count > self.config.multi_speaker_max_batch_tokens:
+                break
+            if len(candidate_batch) > self.config.multi_speaker_max_turns:
+                break
+
+            batch = candidate_batch
+            seen_speakers = candidate_speakers
+            idx += 1
+
+        if len(batch) < 2 or len(seen_speakers) < 2:
+            return []
+        return batch
+
+    def _process_multi_speaker_batch(
+        self,
+        segments_data: List[TTSSegmentData],
+        temp_dir: str,
+        language: str,
+        batch_start_index: int = 0,
+        total_segments: Optional[int] = None,
+        context_segments_by_batch_index: Optional[List[List[str]]] = None,
+        usage_tracker: Optional[Dict[str, Any]] = None
+    ) -> Tuple[List[SegmentAlignment], float]:
+        """Synthesize and strictly split one experimental Gemini multi-speaker batch."""
+        if len(segments_data) < 2:
+            raise RuntimeError("Gemini multi-speaker batch requires at least two turns.")
+        if not self.supports_experimental_multi_speaker():
+            raise RuntimeError("Gemini multi-speaker experimental path is not available in this environment.")
+
+        prompt, speaker_voice_mapping, _ = self._build_multi_speaker_prompt(segments_data)
+        if len(speaker_voice_mapping) < 2:
+            raise RuntimeError("Gemini multi-speaker batch requires at least two distinct speakers.")
+        if len(speaker_voice_mapping) > MULTI_SPEAKER_MAX_SPEAKERS:
+            raise RuntimeError(
+                f"Gemini multi-speaker batching supports up to {MULTI_SPEAKER_MAX_SPEAKERS} speakers per batch."
+            )
+
+        prompt_bytes = len(prompt.encode("utf-8"))
+        token_count = self._count_tokens(prompt)
+        if prompt_bytes > MAX_MULTI_SPEAKER_PROMPT_BYTES:
+            raise RuntimeError(
+                f"Gemini multi-speaker prompt exceeds byte budget ({prompt_bytes} > {MAX_MULTI_SPEAKER_PROMPT_BYTES})."
+            )
+        if token_count > self.config.multi_speaker_max_batch_tokens:
+            raise RuntimeError(
+                f"Gemini multi-speaker prompt exceeds token budget ({token_count} > {self.config.multi_speaker_max_batch_tokens})."
+            )
+
+        speech_config = SpeechConfigBuilder.build_multi_speaker_config(speaker_voice_mapping)
+        if speech_config is None:
+            raise RuntimeError("Installed Google GenAI SDK does not expose multi-speaker speech config types.")
+
+        batch_id = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+
+        try:
+            from pydub import AudioSegment as PydubAudioSegment
+        except ImportError as exc:
+            raise RuntimeError("pydub is required for Gemini multi-speaker batch slicing.") from exc
+
+        boundary_retry_attempts = max(0, int(self.config.multi_speaker_boundary_retry_attempts))
+        total_attempts = 1 + boundary_retry_attempts
+        last_exc: Optional[Exception] = None
+        total_segments = total_segments if total_segments is not None else len(segments_data)
+        if context_segments_by_batch_index is None:
+            context_segments_by_batch_index = [[] for _ in segments_data]
+
+        for attempt_idx in range(total_attempts):
+            self.api_client.reset_to_original_model()
+            audio_data = self.api_client.synthesize_chunk(prompt, speech_config)
+            model_used = self.api_client.current_model
+            self._register_usage(usage_tracker, model_used, input_tokens=token_count)
+            if not audio_data:
+                raise RuntimeError("Gemini multi-speaker synthesis returned no audio data.")
+
+            batch_output_path = os.path.join(temp_dir, f"multi_speaker_batch_{batch_id}_attempt{attempt_idx}.wav")
+            AudioFileUtils.save_wave_file(batch_output_path, audio_data, rate=SAMPLE_RATE)
+
+            try:
+                batch_audio = PydubAudioSegment.from_wav(batch_output_path)
+                pause_ranges = self._detect_multi_speaker_pause_ranges(batch_output_path)
+                segment_ranges = self._build_multi_speaker_segment_ranges(
+                    len(batch_audio),
+                    pause_ranges,
+                    len(segments_data),
+                )
+
+                alignments: List[SegmentAlignment] = []
+                total_audio_seconds = 0.0
+                used_fallback = model_used is not None and model_used != self.api_client.original_model
+                for batch_offset, (segment, (start_ms, end_ms)) in enumerate(zip(segments_data, segment_ranges)):
+                    clip = batch_audio[start_ms:end_ms]
+                    if len(clip) <= 0:
+                        raise RuntimeError("Gemini multi-speaker produced an empty segment after slicing.")
+                    clip = self._trim_multi_speaker_segment_edges(clip, segment.speaker)
+                    if len(clip) <= 0:
+                        raise RuntimeError("Gemini multi-speaker produced an empty segment after edge trimming.")
+
+                    output_path = segment.output_path or os.path.join(
+                        temp_dir,
+                        f"multi_segment_{len(alignments)}_{segment.speaker}.wav",
+                    )
+                    output_dir = os.path.dirname(output_path)
+                    if output_dir:
+                        os.makedirs(output_dir, exist_ok=True)
+                    clip.export(output_path, format="wav")
+
+                    voice_name = self._resolve_voice_for_segment(segment)
+                    voice_valid, voice_reason, voice_similarity = self._validate_voice_consistency(
+                        output_path,
+                        voice_name,
+                    )
+                    if not voice_valid:
+                        if os.path.exists(output_path):
+                            try:
+                                os.remove(output_path)
+                            except OSError:
+                                pass
+                        logger.warning(
+                            "Gemini multi-speaker sliced segment voice mismatch for speaker '%s' "
+                            "(batch segment %s, similarity=%s). Regenerating segment individually.",
+                            segment.speaker,
+                            batch_start_index + batch_offset + 1,
+                            "n/a" if voice_similarity is None else f"{voice_similarity:.3f}",
+                        )
+                        repaired_alignment = self._process_single_segment(
+                            segment=segment,
+                            segment_index=batch_start_index + batch_offset,
+                            total_segments=total_segments,
+                            temp_dir=temp_dir,
+                            language=language,
+                            context_segments=context_segments_by_batch_index[batch_offset],
+                            usage_tracker=usage_tracker,
+                        )
+                        if repaired_alignment is None:
+                            raise RuntimeError(
+                                f"Failed to regenerate voice-mismatched multi-speaker segment for speaker '{segment.speaker}'."
+                            )
+                        logger.debug(
+                            "Gemini multi-speaker repaired segment %s via single-segment regeneration after voice mismatch: %s",
+                            batch_start_index + batch_offset + 1,
+                            voice_reason,
+                        )
+                        alignments.append(repaired_alignment)
+                        continue
+
+                    duration_seconds = len(clip) / 1000.0
+                    total_audio_seconds += duration_seconds
+                    synthesized_text = self._normalize_multi_speaker_text(segment.text)
+                    self._record_duration_stats(segment, synthesized_text, duration_seconds, language)
+
+                    if self._cache_dir and not used_fallback:
+                        cache_key = self._get_cache_key(segment, language)
+                        cache_path = os.path.join(self._cache_dir, f"{cache_key}.wav")
+                        shutil.copy(output_path, cache_path)
+                        self._audio_cache[cache_key] = (cache_path, duration_seconds)
+                    elif used_fallback and segment.output_path:
+                        with self._fallback_paths_lock:
+                            self._fallback_output_paths.add(os.path.abspath(segment.output_path))
+
+                    diarized = DiarizationSegment(
+                        start_time=0.0,
+                        end_time=duration_seconds,
+                        speaker=segment.speaker,
+                        text=segment.text,
+                        confidence=1.0,
+                    )
+                    alignments.append(
+                        SegmentAlignment(
+                            original_segment=segment,
+                            diarized_segment=diarized,
+                            alignment_confidence=1.0,
+                        )
+                    )
+
+                if total_audio_seconds:
+                    self._register_usage(usage_tracker, model_used, audio_seconds=total_audio_seconds)
+                return alignments, total_audio_seconds
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    self._is_retryable_multi_speaker_boundary_error(exc)
+                    and attempt_idx + 1 < total_attempts
+                ):
+                    logger.warning(
+                        "Gemini multi-speaker boundary mismatch on batch attempt %s/%s: %s Retrying batch generation.",
+                        attempt_idx + 1,
+                        total_attempts,
+                        exc,
+                    )
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Gemini multi-speaker batch failed without producing a retryable result.")
 
     def set_voice_mapping(self, mapping: Dict[str, str]) -> None:
         """Set a mapping of speaker IDs to Gemini voice names."""
@@ -1248,6 +1819,13 @@ class GeminiTTSWrapper(TTSInterface):
             else:
                 logger.debug(f"Emotion enrichment: Disabled in config")
 
+        sanitized_text = self._sanitize_long_pause_for_experimental_batching(text_to_synthesize)
+        if sanitized_text != text_to_synthesize:
+            logger.debug(
+                f"Experimental multi-speaker mode: normalized [long pause] tags for speaker {speaker_id}"
+            )
+            text_to_synthesize = sanitized_text
+
         for attempt in range(max_retries):
             temp_attempt_path = f"{temp_output_path}_attempt_{self.api_client.current_model}_{attempt}.wav"
 
@@ -1580,6 +2158,11 @@ class GeminiTTSWrapper(TTSInterface):
         # Thread-safe context tracking for emotion enrichment
         context_lock = threading.Lock()
         usage_tracker: Dict[str, Any] = {"models": {}, "lock": threading.Lock()}
+        batching_metrics: Dict[str, float] = {
+            "attempted_batches": 0.0,
+            "successful_batches": 0.0,
+            "successful_audio_seconds": 0.0,
+        }
 
         # Use external context if provided (for resynthesis), otherwise build from segments
         external_context = kwargs.get('previous_context', None)
@@ -1628,31 +2211,131 @@ class GeminiTTSWrapper(TTSInterface):
                 if alignment and self.config.enable_emotion_enrichment:
                     update_context(seg.text)
 
-            # Use ThreadPoolExecutor for parallel processing
-            max_workers = min(self.config.max_workers, len(valid_segments))
-            logger.debug(f"Gemini: Starting parallel synthesis with {max_workers} workers for {len(valid_segments)} segments")
+            if self.supports_experimental_multi_speaker() and len(valid_segments) > 1:
+                logger.debug(
+                    f"Gemini: Starting experimental multi-speaker batching for {len(valid_segments)} segments"
+                )
+                idx = 0
+                while idx < len(valid_segments):
+                    batch = self._collect_multi_speaker_batch(valid_segments, idx, language)
+                    if batch:
+                        batching_metrics["attempted_batches"] += 1.0
+                        try:
+                            batch_alignments, batch_audio_seconds = self._process_multi_speaker_batch(
+                                batch,
+                                temp_dir=temp_dir,
+                                language=language,
+                                batch_start_index=idx,
+                                total_segments=len(valid_segments),
+                                context_segments_by_batch_index=[
+                                    (get_context_for_segment(idx + offset) + [seg.text for seg in batch[:offset]])[-5:]
+                                    if self.config.enable_emotion_enrichment else []
+                                    for offset in range(len(batch))
+                                ],
+                                usage_tracker=usage_tracker,
+                            )
+                            if len(batch_alignments) != len(batch):
+                                raise RuntimeError(
+                                    f"Gemini multi-speaker returned {len(batch_alignments)} alignments for {len(batch)} segments."
+                                )
+                            batching_metrics["successful_batches"] += 1.0
+                            batching_metrics["successful_audio_seconds"] += max(0.0, batch_audio_seconds)
+                            for offset, alignment in enumerate(batch_alignments):
+                                results[idx + offset] = alignment
+                            if self.config.enable_emotion_enrichment:
+                                for seg in batch:
+                                    update_context(seg.text)
+                            logger.debug(
+                                f"Gemini: Multi-speaker batch succeeded for segments {idx + 1}-{idx + len(batch)}"
+                            )
+                            idx += len(batch)
+                            continue
+                        except Exception as batch_exc:
+                            logger.warning(
+                                f"Gemini multi-speaker batch failed at segment {idx + 1}: {batch_exc}. "
+                                f"Falling back to per-segment synthesis for this batch."
+                            )
+                            for offset, seg in enumerate(batch):
+                                single_idx = idx + offset
+                                context = get_context_for_segment(single_idx) if self.config.enable_emotion_enrichment else []
+                                results[single_idx] = self._process_single_segment(
+                                    segment=seg,
+                                    segment_index=single_idx,
+                                    total_segments=len(valid_segments),
+                                    temp_dir=temp_dir,
+                                    language=language,
+                                    context_segments=context,
+                                    usage_tracker=usage_tracker,
+                                )
+                                if results[single_idx] and self.config.enable_emotion_enrichment:
+                                    update_context(seg.text)
+                            idx += len(batch)
+                            continue
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                futures = {
-                    executor.submit(process_segment_wrapper, i, segment): i
-                    for i, segment in enumerate(valid_segments)
-                }
+                    seg = valid_segments[idx]
+                    context = get_context_for_segment(idx) if self.config.enable_emotion_enrichment else []
+                    results[idx] = self._process_single_segment(
+                        segment=seg,
+                        segment_index=idx,
+                        total_segments=len(valid_segments),
+                        temp_dir=temp_dir,
+                        language=language,
+                        context_segments=context,
+                        usage_tracker=usage_tracker,
+                    )
+                    if results[idx] and self.config.enable_emotion_enrichment:
+                        update_context(seg.text)
+                    idx += 1
+            else:
+                # Use ThreadPoolExecutor for parallel processing
+                max_workers = min(self.config.max_workers, len(valid_segments))
+                logger.debug(f"Gemini: Starting parallel synthesis with {max_workers} workers for {len(valid_segments)} segments")
 
-                # Wait for all to complete and handle any exceptions
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        future.result()  # This will raise exception if task failed
-                    except Exception as e:
-                        logger.error(f"Unexpected error in parallel segment {idx}: {e}")
-                        with results_lock:
-                            results[idx] = None
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all tasks
+                    futures = {
+                        executor.submit(process_segment_wrapper, i, segment): i
+                        for i, segment in enumerate(valid_segments)
+                    }
+
+                    # Wait for all to complete and handle any exceptions
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            future.result()  # This will raise exception if task failed
+                        except Exception as e:
+                            logger.error(f"Unexpected error in parallel segment {idx}: {e}")
+                            with results_lock:
+                                results[idx] = None
 
             # Collect results in original order
             alignments = [results.get(i) for i in range(len(valid_segments)) if results.get(i) is not None]
 
             logger.debug(f"Gemini: Synthesized {len(alignments)}/{len(valid_segments)} segments successfully")
+            attempted_batches = int(batching_metrics["attempted_batches"])
+            if attempted_batches > 0:
+                total_alignment_audio_seconds = sum(
+                    max(
+                        0.0,
+                        (alignment.diarized_segment.end_time or 0.0) - (alignment.diarized_segment.start_time or 0.0),
+                    )
+                    for alignment in alignments
+                )
+                successful_audio_seconds = batching_metrics["successful_audio_seconds"]
+                coverage_percent = (
+                    (successful_audio_seconds / total_alignment_audio_seconds) * 100.0
+                    if total_alignment_audio_seconds > 0
+                    else 0.0
+                )
+                logger.info(
+                    "Gemini multi-speaker batching success by dubbed length: %.1f%% "
+                    "(%.2fs batched / %.2fs total, successful batches: %d/%d)",
+                    coverage_percent,
+                    successful_audio_seconds,
+                    total_alignment_audio_seconds,
+                    int(batching_metrics["successful_batches"]),
+                    attempted_batches,
+                )
             if self.cost_tracker and usage_tracker:
                 models_usage: Dict[str, Dict[str, float]] = {}
                 lock = usage_tracker.get("lock")

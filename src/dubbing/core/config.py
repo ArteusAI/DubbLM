@@ -105,6 +105,13 @@ class DubbingConfig:
                 'comfort_max_adjustment_ratio': 1.15,  # Audio speedup comfort limit
                 # TTS grouping
                 'group_overflow_tolerance': 1.0,
+                # Experimental Gemini multi-speaker batching
+                'gemini_multi_speaker_enabled': False,
+                'gemini_multi_speaker_max_batch_tokens': 1200,
+                'gemini_multi_speaker_max_turns': 8,
+                'gemini_multi_speaker_pause_repeats': 3,
+                'gemini_multi_speaker_min_pause_ms': 1200,
+                'gemini_multi_speaker_boundary_retry_attempts': 2,
             }
         }
         
