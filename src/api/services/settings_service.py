@@ -54,6 +54,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "llmModelName": "gemini-2.5-pro",
         "llmTemperature": 0.5,
         "voiceAutoSelection": True,
+        "enableSpeakerGenderInference": True,
         "enableEmotionEnrichment": False,
         "dubbedVolume": 1.0,
         "backgroundVolume": 0.562341,

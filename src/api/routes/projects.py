@@ -18,6 +18,7 @@ from ..models.schemas import (
     SegmentResponse,
 )
 from ..services.project_manager import ProjectManager
+from src.utils.speaker_gender import is_speaker_gender_translation_stale
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -47,6 +48,8 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             llmTemperature=config.get("llmTemperature"),
             speakerTtsPrompts=config.get("speakerTtsPrompts"),
             speakerVoiceMappings=config.get("speakerVoiceMappings"),
+            enableSpeakerGenderInference=config.get("enableSpeakerGenderInference", True),
+            speakerMetadata=config.get("speakerMetadata"),
             refinementLlmProvider=config.get("refinementLlmProvider"),
             refinementModelName=config.get("refinementModelName"),
             refinementTemperature=config.get("refinementTemperature"),
@@ -79,6 +82,10 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             minPauseDuration=config.get("minPauseDuration"),
             preservePauseDuration=config.get("preservePauseDuration"),
             segmentStretch=config.get("segmentStretch"),
+        ),
+        "speakerGenderTranslationStale": is_speaker_gender_translation_stale(
+            config,
+            project.segments,
         ),
         "sourceFile": project.source_file,
         "sourceFilename": project.source_filename,

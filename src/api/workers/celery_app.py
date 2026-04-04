@@ -37,6 +37,7 @@ def create_celery_app() -> Celery:
         # Task routes for different queues
         task_routes={
             "src.api.workers.tasks.transcribe_project": {"queue": "heavy"},
+            "src.api.workers.tasks.retranslate_project": {"queue": "heavy"},
             "src.api.workers.tasks.dub_project": {"queue": "heavy"},
             "src.api.workers.tasks.generate_preview": {"queue": "light"},
             "src.api.workers.tasks.rephrase_segment": {"queue": "light"},
@@ -50,4 +51,3 @@ def create_celery_app() -> Celery:
 
 
 celery_app = create_celery_app()
-

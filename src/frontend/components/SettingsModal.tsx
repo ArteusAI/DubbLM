@@ -227,6 +227,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50 h-24 resize-none"
                 />
               </div>
+
             </div>
           )}
 

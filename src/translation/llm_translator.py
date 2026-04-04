@@ -25,6 +25,10 @@ from src.translation.prompts import (
     JSON_OUTPUT_FORMAT_LONG_ONLY,
 )
 from src.dubbing.core.log_config import get_logger
+from src.utils.speaker_gender import (
+    build_effective_gender_prompt_section,
+    normalize_speaker_metadata_map,
+)
 
 if TYPE_CHECKING:
     from src.dubbing.core.cache_manager import CacheManager
@@ -147,9 +151,31 @@ class LLMTranslator(TranslationInterface):
         self.cost_tracker = cost_tracker
         # Stores the most recent context information computed during translate()
         self.last_context_info = None
+        self.last_speaker_metadata: Dict[str, Dict[str, Any]] = {}
+        self.last_speaker_metadata_cache_signature = ""
         self.enable_emotion_enrichment = enable_emotion_enrichment
         # Segment stretch mode: determines which alternative versions to generate
         self.segment_stretch = segment_stretch
+
+    def set_speaker_metadata(self, speaker_metadata: Optional[Dict[str, Dict[str, Any]]]) -> None:
+        """Persist speaker metadata for subsequent translation/refinement steps."""
+        normalized = normalize_speaker_metadata_map(speaker_metadata)
+        self.last_speaker_metadata = normalized
+        if normalized:
+            parts = [
+                f"{speaker}:{metadata.get('overrideGender') or metadata.get('inferredGender') or 'unknown'}"
+                for speaker, metadata in sorted(normalized.items())
+            ]
+            self.last_speaker_metadata_cache_signature = "|".join(parts)
+        else:
+            self.last_speaker_metadata_cache_signature = ""
+
+    def _build_speaker_grammar_section(self, speakers: Optional[List[str]] = None) -> str:
+        """Render speaker grammar metadata for prompt injection."""
+        return build_effective_gender_prompt_section(
+            self.last_speaker_metadata,
+            speakers=speakers,
+        )
 
     def _enrich_text_with_llm(
         self,
@@ -594,7 +620,11 @@ Rules:
         """
         # Combine the parameters that fully define a translation
         # Include prompt prefix in the key so cache varies when extra context changes
-        cache_data = f"{chunk_text}|{source_language}|{target_language}|{self.llm_provider}|{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}"
+        cache_data = (
+            f"{chunk_text}|{source_language}|{target_language}|{self.llm_provider}|"
+            f"{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}|"
+            f"{self.last_speaker_metadata_cache_signature}"
+        )
         # Create a hash of this data
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
     
@@ -779,6 +809,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             
         # Start timing for performance metrics
         start_time = time.perf_counter()
+        self.set_speaker_metadata(kwargs.get("speaker_metadata"))
+        preserve_segment_boundaries = bool(kwargs.get("preserve_segment_boundaries", False))
         
         # 1. Perform combined context analysis and initial summarization
         logger.info("Performing combined context analysis and initial summarization...")
@@ -799,9 +831,13 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         }
         
         # 2. First optimization pass - small chunks for better translation
-        max_chars = 180
-        logger.debug(f"First optimization pass - merging adjacent segments (max_chars={max_chars})...")
-        optimized_segments = self._optimize_segments(segments, max_gap_seconds=0.3, max_chars=max_chars)
+        if preserve_segment_boundaries:
+            logger.debug("Preserving segment boundaries for translation refresh.")
+            optimized_segments = [segment.copy() for segment in segments]
+        else:
+            max_chars = 180
+            logger.debug(f"First optimization pass - merging adjacent segments (max_chars={max_chars})...")
+            optimized_segments = self._optimize_segments(segments, max_gap_seconds=0.3, max_chars=max_chars)
         
         # 3. Chunk optimized segments for translation
         logger.debug("Chunking optimized segments for translation...")
@@ -845,9 +881,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         translated_segments = self._segment_translations(refined_chunks)
         
         # 8. Second optimization pass - larger chunks for final output
-        max_chars = 600
-        logger.debug(f"Second optimization pass - merging translated segments (max_chars={max_chars})...")
-        final_segments = self._optimize_segments(translated_segments, max_gap_seconds=0.3, max_chars=max_chars)
+        if preserve_segment_boundaries:
+            final_segments = translated_segments
+        else:
+            max_chars = 600
+            logger.debug(f"Second optimization pass - merging translated segments (max_chars={max_chars})...")
+            final_segments = self._optimize_segments(translated_segments, max_gap_seconds=0.3, max_chars=max_chars)
 
         # 9. Optional emotion enrichment (kept alongside originals)
         enrichment_enabled = kwargs.get("enable_emotion_enrichment", self.enable_emotion_enrichment)
@@ -1236,6 +1275,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             tone=context_info.get('tone', 'neutral'),
             themes=', '.join(context_info.get('themes', [])),
             terminology=', '.join(context_info.get('terminology', [])),
+            speaker_grammar_section=self._build_speaker_grammar_section(chunk.get("speakers")),
             context_before=context_before,
             text_to_translate=chunk_text,
             context_after=context_after,
@@ -1748,6 +1788,13 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 alternative_versions_section=alternative_versions_section,
                 json_output_format=json_output_format
             )
+            speaker_grammar_section = self._build_speaker_grammar_section()
+            if speaker_grammar_section:
+                refinement_prompt = (
+                    f"{speaker_grammar_section}\n"
+                    "Use speaker grammar metadata only for grammatical agreement and self-reference.\n\n"
+                    f"{refinement_prompt}"
+                )
 
             # Start timer for batch refinement
             batch_start_time = time.perf_counter()
@@ -2379,6 +2426,18 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
             context_after_section=context_after_section,
             original_text=original_text,
         )
+        current_speakers = []
+        if segments is not None and current_segment_index is not None and 0 <= current_segment_index < len(segments):
+            speaker_name = segments[current_segment_index].get("speaker")
+            if speaker_name:
+                current_speakers = [speaker_name]
+        speaker_grammar_section = self._build_speaker_grammar_section(current_speakers or None)
+        if speaker_grammar_section:
+            prompt = (
+                f"{speaker_grammar_section}\n"
+                "Use speaker grammar metadata only for grammatical agreement and self-reference.\n\n"
+                f"{prompt}"
+            )
         
         logger.debug(f"Built adjustment prompt (length: {len(prompt)} chars)")
         logger.debug(f"Starting LLM adjustment attempts (max: {max_attempts})")

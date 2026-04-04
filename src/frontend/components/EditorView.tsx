@@ -4,7 +4,7 @@ import {
   Play, Pause, Wand2, Volume2, VolumeX, 
   ChevronRight, RefreshCw, ArrowRight, Loader2, Speaker, Sparkles, X, Clock, Pencil, Check
 } from 'lucide-react';
-import { Segment, AppConfig } from '../types';
+import { Segment, AppConfig, Project, SpeakerGender, SpeakerMetadata } from '../types';
 import { VoiceResponse } from '../api';
 import api from '../api';
 
@@ -15,8 +15,10 @@ interface EditorViewProps {
   voices: VoiceResponse[];
   onUpdateSegments: (segments: Segment[]) => void;
   onUpdateConfig?: (cfg: Partial<AppConfig>) => void;
+  onUpdateProjectState?: (updates: Partial<Project>) => void;
+  onRetranslate?: () => void;
   onContinue: () => void;
-  activeProject?: any; // Add this to access config
+  activeProject?: Project;
 }
 
 export const EditorView: React.FC<EditorViewProps> = ({ 
@@ -26,6 +28,8 @@ export const EditorView: React.FC<EditorViewProps> = ({
   voices,
   onUpdateSegments, 
   onUpdateConfig,
+  onUpdateProjectState,
+  onRetranslate,
   onContinue,
   activeProject
 }) => {
@@ -58,6 +62,26 @@ export const EditorView: React.FC<EditorViewProps> = ({
   useEffect(() => {
     speakerPromptsRef.current = activeProject?.config.speakerTtsPrompts || {};
   }, [activeProject?.config.speakerTtsPrompts]);
+
+  const speakerMetadataMap = activeProject?.config.speakerMetadata || {};
+  const genderInferenceEnabled = activeProject?.config.enableSpeakerGenderInference ?? true;
+  const isGenderTranslationStale = activeProject?.speakerGenderTranslationStale ?? false;
+
+  const getSpeakerMetadata = (speakerName: string): SpeakerMetadata => {
+    const metadata = speakerMetadataMap[speakerName];
+    return {
+      inferredGender: metadata?.inferredGender || 'unknown',
+      inferredConfidence: metadata?.inferredConfidence ?? 0,
+      rawLabel: metadata?.rawLabel ?? null,
+      modelId: metadata?.modelId ?? null,
+      overrideGender: metadata?.overrideGender ?? null,
+    };
+  };
+
+  const getEffectiveSpeakerGender = (speakerName: string): SpeakerGender => {
+    const metadata = getSpeakerMetadata(speakerName);
+    return metadata.overrideGender || metadata.inferredGender || 'unknown';
+  };
 
   // Get unique speakers for the reassignment dropdown
   const uniqueSpeakers: { name: string; color: string }[] = Array.from(
@@ -327,6 +351,39 @@ export const EditorView: React.FC<EditorViewProps> = ({
     }
   };
 
+  const handleSpeakerGenderOverrideChange = async (
+    speakerName: string,
+    overrideGender: SpeakerGender | ''
+  ) => {
+    if (!activeProject?.config) return;
+
+    const nextOverride = overrideGender === '' ? null : overrideGender;
+    const currentConfig = activeProject.config;
+    const currentMetadata = currentConfig.speakerMetadata || {};
+    const existing = getSpeakerMetadata(speakerName);
+    const nextConfig: AppConfig = {
+      ...currentConfig,
+      speakerMetadata: {
+        ...currentMetadata,
+        [speakerName]: {
+          ...existing,
+          overrideGender: nextOverride,
+        },
+      },
+    };
+
+    onUpdateProjectState?.({
+      config: nextConfig,
+      speakerGenderTranslationStale: true,
+    });
+
+    try {
+      await api.updateSpeakerGender(projectId, speakerName, nextOverride);
+    } catch (err) {
+      console.error('Failed to update speaker gender override:', err);
+    }
+  };
+
   const handleSegmentClick = (segment: Segment) => {
     setSelectedSegmentId(segment.id);
     if (videoRef.current) {
@@ -460,6 +517,26 @@ export const EditorView: React.FC<EditorViewProps> = ({
             className="border-r border-zinc-800 overflow-y-auto bg-zinc-950/50 scroll-smooth flex flex-col"
         >
             <div className="p-4 space-y-4 pb-20">
+                {genderInferenceEnabled && (
+                  <div className={`rounded-xl border px-4 py-3 ${isGenderTranslationStale ? 'border-amber-500/30 bg-amber-500/10' : 'border-zinc-800 bg-zinc-900/80'}`}>
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-medium text-white">Speaker grammar metadata</div>
+                        <p className="mt-1 text-xs text-zinc-400">
+                          Translation uses per-speaker gender only for grammatical agreement. If you change an override, run translation refresh before dubbing.
+                        </p>
+                      </div>
+                      {isGenderTranslationStale && onRetranslate && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); onRetranslate(); }}
+                          className="shrink-0 rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/30"
+                        >
+                          Re-translate
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {segments.map((segment) => (
                 <div 
                     key={segment.id} 
@@ -544,6 +621,36 @@ export const EditorView: React.FC<EditorViewProps> = ({
                                                 />
                                                 <p className="text-[9px] text-zinc-500 mt-1">Applies to all segments of {segment.speaker}</p>
                                             </div>
+                                            {genderInferenceEnabled && (
+                                                <div className="px-3 py-2 border-b border-zinc-800">
+                                                    <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider mb-2">Grammar Gender</div>
+                                                    <div className="mb-2 rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-[11px] text-zinc-400">
+                                                        Auto: <span className="text-zinc-200">{getSpeakerMetadata(segment.speaker).inferredGender}</span>
+                                                        {' · '}
+                                                        Confidence: <span className="text-zinc-200">{Math.round((getSpeakerMetadata(segment.speaker).inferredConfidence || 0) * 100)}%</span>
+                                                        {getSpeakerMetadata(segment.speaker).rawLabel ? (
+                                                          <>
+                                                            {' · '}
+                                                            Raw: <span className="text-zinc-200">{getSpeakerMetadata(segment.speaker).rawLabel}</span>
+                                                          </>
+                                                        ) : null}
+                                                    </div>
+                                                    <select
+                                                        value={getSpeakerMetadata(segment.speaker).overrideGender ?? ''}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        onChange={(e) => handleSpeakerGenderOverrideChange(segment.speaker, e.target.value as SpeakerGender | '')}
+                                                        className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-xs text-white focus:outline-none focus:ring-1 focus:ring-brand-500"
+                                                    >
+                                                        <option value="">Use auto ({getEffectiveSpeakerGender(segment.speaker)})</option>
+                                                        <option value="male">Force male</option>
+                                                        <option value="female">Force female</option>
+                                                        <option value="unknown">Force unknown</option>
+                                                    </select>
+                                                    <p className="mt-1 text-[9px] text-zinc-500">
+                                                        Effective value for translation: {getEffectiveSpeakerGender(segment.speaker)}
+                                                    </p>
+                                                </div>
+                                            )}
                                             <div className="px-3 py-1.5 text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Switch Speaker</div>
                                             <div className="max-h-48 overflow-y-auto">
                                                 {uniqueSpeakers.map((spk) => (
@@ -817,9 +924,19 @@ export const EditorView: React.FC<EditorViewProps> = ({
         <div className="text-sm text-zinc-400 mr-auto">
             {segments.filter(s => s.audioUrl).length} / {segments.length} segments dubbed
         </div>
+        {genderInferenceEnabled && isGenderTranslationStale && onRetranslate && (
+          <button
+            onClick={onRetranslate}
+            className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-sm font-medium text-amber-200 hover:bg-amber-500/20"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Re-translate
+          </button>
+        )}
         <button 
           onClick={onContinue}
-          className="group flex items-center gap-2 px-6 py-2.5 bg-brand-600 hover:bg-brand-500 rounded-lg text-white font-semibold transition-all shadow-lg shadow-brand-500/20"
+          disabled={genderInferenceEnabled && isGenderTranslationStale}
+          className="group flex items-center gap-2 px-6 py-2.5 bg-brand-600 hover:bg-brand-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none disabled:cursor-not-allowed rounded-lg text-white font-semibold transition-all shadow-lg shadow-brand-500/20"
         >
           Start Final Dubbing
           <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />

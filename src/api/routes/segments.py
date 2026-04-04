@@ -15,6 +15,7 @@ from ..models.schemas import (
     SegmentUpdate,
     SpeakerRename,
     SpeakerVoiceUpdate,
+    SpeakerGenderUpdate,
     RephraseRequest,
     RephraseResponse,
     PreviewRequest,
@@ -24,6 +25,11 @@ from ..models.schemas import (
 )
 from ..workers.tasks import generate_preview, rephrase_segment
 from ..services.project_manager import ProjectManager
+from src.utils.speaker_gender import (
+    SPEAKER_METADATA_CONFIG_KEY,
+    apply_speaker_gender_override,
+    rename_speaker_keyed_map,
+)
 
 router = APIRouter(prefix="/projects", tags=["segments"])
 
@@ -105,6 +111,26 @@ async def rename_speaker(
         Segment.project_id == project_id,
         Segment.speaker == rename_data.oldName
     ).update({"speaker": rename_data.newName})
+
+    config = dict(project.config or {})
+    config["speakerVoiceMappings"] = rename_speaker_keyed_map(
+        config.get("speakerVoiceMappings"),
+        rename_data.oldName,
+        rename_data.newName,
+    )
+    config["speakerTtsPrompts"] = rename_speaker_keyed_map(
+        config.get("speakerTtsPrompts"),
+        rename_data.oldName,
+        rename_data.newName,
+    )
+    config[SPEAKER_METADATA_CONFIG_KEY] = rename_speaker_keyed_map(
+        config.get(SPEAKER_METADATA_CONFIG_KEY),
+        rename_data.oldName,
+        rename_data.newName,
+    )
+    project.config = config
+    flag_modified(project, "config")
+    project.updated_at = datetime.now(timezone.utc)
     
     db.commit()
     
@@ -149,6 +175,32 @@ async def update_speaker_voice(
     db.commit()
     
     return {"message": f"Updated voice for {updated} segments of speaker {voice_data.speakerName}"}
+
+
+@router.post("/{project_id}/speakers/gender")
+async def update_speaker_gender(
+    project_id: str,
+    gender_data: SpeakerGenderUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update or clear the translation gender override for a speaker."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    config = dict(project.config or {})
+    config[SPEAKER_METADATA_CONFIG_KEY] = apply_speaker_gender_override(
+        config.get(SPEAKER_METADATA_CONFIG_KEY),
+        gender_data.speakerName,
+        gender_data.overrideGender,
+    )
+    project.config = config
+    flag_modified(project, "config")
+    project.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+
+    return {"message": f"Updated translation gender override for {gender_data.speakerName}"}
 
 
 @router.post("/{project_id}/segments/{segment_id}/rephrase", response_model=RephraseResponse)

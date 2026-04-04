@@ -54,6 +54,16 @@ export type ProjectStatus =
   | 'dubbed'
   | 'error';
 
+export type SpeakerGender = 'male' | 'female' | 'unknown';
+
+export interface SpeakerMetadata {
+  inferredGender: SpeakerGender;
+  inferredConfidence: number;
+  rawLabel?: string | null;
+  modelId?: string | null;
+  overrideGender?: SpeakerGender | null;
+}
+
 export interface Voice {
   id: string;
   name: string;
@@ -123,6 +133,8 @@ export interface AppConfig {
   llmTemperature?: number;
   speakerTtsPrompts?: Record<string, string>;
   speakerVoiceMappings?: Record<string, string>;
+  enableSpeakerGenderInference?: boolean;
+  speakerMetadata?: Record<string, SpeakerMetadata>;
   
   // Refinement model settings (Extra)
   refinementLlmProvider?: LlmProvider;
@@ -195,6 +207,7 @@ export interface Project {
   processStage?: string;
   currentJobId?: string;
   error?: string;
+  speakerGenderTranslationStale?: boolean;
 }
 
 export interface Language {

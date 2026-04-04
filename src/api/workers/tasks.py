@@ -18,6 +18,15 @@ from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, J
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
 from ..services.preset_service import get_preset_config
+from src.dubbing.audio.speaker_gender_inferencer import SpeakerGenderInferencer
+from src.utils.speaker_gender import (
+    SPEAKER_GENDER_SIGNATURE_CONFIG_KEY,
+    SPEAKER_METADATA_CONFIG_KEY,
+    build_effective_gender_prompt_section,
+    build_translation_gender_signature,
+    normalize_bool,
+    normalize_speaker_metadata_map,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +73,169 @@ def _normalize_speaker_voice_mappings(value: Any) -> Dict[str, str]:
         if speaker and voice:
             normalized[speaker] = voice
     return normalized
+
+
+def _build_unknown_speaker_metadata(
+    speakers_rolls: Dict[Any, str],
+    existing_metadata: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Build a safe fallback metadata map with unknown genders for every discovered speaker."""
+    fallback = dict(existing_metadata)
+    for speaker in sorted({str(value).strip() for value in speakers_rolls.values() if str(value).strip()}):
+        entry = dict(fallback.get(speaker) or {})
+        if not entry:
+            entry = {
+                "inferredGender": "unknown",
+                "inferredConfidence": 0.0,
+                "rawLabel": "fallback_unknown",
+                "modelId": None,
+                "overrideGender": None,
+            }
+        entry.setdefault("inferredGender", "unknown")
+        entry.setdefault("inferredConfidence", 0.0)
+        entry.setdefault("rawLabel", "fallback_unknown")
+        entry.setdefault("modelId", None)
+        entry.setdefault("overrideGender", None)
+        fallback[speaker] = entry
+    return normalize_speaker_metadata_map(fallback)
+
+
+def _format_speaker_gender_log_message(speaker_metadata: Dict[str, Dict[str, Any]]) -> str:
+    """Format a short UI-friendly summary of inferred speaker genders."""
+    if not speaker_metadata:
+        return "Speaker genders: unavailable"
+
+    parts = []
+    for speaker, entry in sorted(speaker_metadata.items()):
+        gender = entry.get("overrideGender") or entry.get("inferredGender") or "unknown"
+        parts.append(f"{speaker}={gender}")
+    return "Speaker genders: " + ", ".join(parts)
+
+
+def _load_project_config(project_id: str, *, fresh: bool = False) -> Dict[str, Any]:
+    """Load current project config from the database."""
+    db = get_db_session(fresh=fresh)
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise ValueError(f"Project {project_id} not found")
+        return dict(project.config or {})
+    finally:
+        db.close()
+
+
+def _save_speaker_metadata(project_id: str, speaker_metadata: Dict[str, Dict[str, Any]]) -> None:
+    """Persist speaker metadata in project config."""
+    db = get_db_session()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        config = dict(project.config or {})
+        config.setdefault("enableSpeakerGenderInference", True)
+        config[SPEAKER_METADATA_CONFIG_KEY] = normalize_speaker_metadata_map(speaker_metadata)
+        project.config = config
+        flag_modified(project, "config")
+        project.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _save_translation_gender_signature(
+    project_id: str,
+    segments: list[dict],
+    speaker_metadata: Dict[str, Dict[str, Any]],
+) -> None:
+    """Store the effective-gender translation signature for stale detection."""
+    db = get_db_session()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        config = dict(project.config or {})
+        config[SPEAKER_GENDER_SIGNATURE_CONFIG_KEY] = build_translation_gender_signature(
+            segments,
+            speaker_metadata,
+        )
+        project.config = config
+        flag_modified(project, "config")
+        project.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _infer_speaker_metadata(
+    project_id: str,
+    job_id: str,
+    dubber: Any,
+    speakers_rolls: Dict[Any, str],
+    audio_file: str,
+    config_data: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Extract speaker audio and optionally infer gender-like metadata."""
+    existing_metadata = normalize_speaker_metadata_map(config_data.get(SPEAKER_METADATA_CONFIG_KEY))
+
+    if not normalize_bool(config_data.get("enableSpeakerGenderInference", True)):
+        return existing_metadata
+
+    try:
+        speaker_audio_paths = dubber.speaker_processor.extract_speaker_audio(audio_file, speakers_rolls)
+        inferencer = SpeakerGenderInferencer(
+            cache_manager=dubber.cache_manager,
+            device=dubber.torch_device,
+        )
+        inferred_metadata = inferencer.infer_speakers(speaker_audio_paths)
+
+        merged_metadata = dict(existing_metadata)
+        for speaker, inferred_entry in inferred_metadata.items():
+            existing_entry = dict(merged_metadata.get(speaker) or {})
+            if existing_entry.get("overrideGender") is not None:
+                inferred_entry["overrideGender"] = existing_entry["overrideGender"]
+            merged_metadata[speaker] = inferred_entry
+    except Exception:
+        logger.exception(
+            "Speaker gender inference stage failed for project %s. Continuing translation with unknown genders.",
+            project_id,
+        )
+        merged_metadata = _build_unknown_speaker_metadata(speakers_rolls, existing_metadata)
+        add_job_log(
+            job_id,
+            "Speaker gender inference failed, continuing with unknown genders",
+            "info",
+        )
+
+    logger.info(
+        "Speaker gender metadata ready for translation: %s",
+        {
+            speaker: {
+                "inferredGender": entry.get("inferredGender"),
+                "inferredConfidence": round(float(entry.get("inferredConfidence") or 0.0), 4),
+                "rawLabel": entry.get("rawLabel"),
+                "overrideGender": entry.get("overrideGender"),
+            }
+            for speaker, entry in sorted(merged_metadata.items())
+        },
+    )
+    add_job_log(job_id, _format_speaker_gender_log_message(merged_metadata), "info")
+    _save_speaker_metadata(project_id, merged_metadata)
+    return merged_metadata
+
+
+def _build_segment_translation_input(segments: list[Segment]) -> list[dict]:
+    """Convert DB segments to the minimal structure expected by the translator."""
+    return [
+        {
+            "speaker": segment.speaker,
+            "start": segment.start_time,
+            "end": segment.end_time,
+            "text": segment.original_text,
+        }
+        for segment in segments
+    ]
 
 
 def update_job_progress(job_id: str, progress: int, step: str, message: Optional[str] = None, text: Optional[str] = None) -> None:
@@ -251,6 +423,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
                 "refinement_persona": config_data.get("personaId", "normal"),
                 "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
+                "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
+                "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
@@ -317,10 +491,17 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             if not speakers_rolls or len(speakers_rolls) == 0:
                 raise ValueError("No speakers found in the video")
 
+            update_job_progress(job_id, 13, "speaker_analysis", "Analyzing speakers and inferring genders")
+            speaker_metadata = _infer_speaker_metadata(
+                project_id,
+                job_id,
+                dubber,
+                speakers_rolls,
+                audio_file,
+                config_data,
+            )
+
             update_job_progress(job_id, 15, "translation", "Translating segments")
-            
-            # Extract speaker audio
-            dubber.speaker_processor.extract_speaker_audio(audio_file, speakers_rolls)
             
             # Progress callback for translation and refinement
             # Before segments created: max 35%
@@ -338,13 +519,17 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Translate segments
             translated_segments = dubber.translate_segments(
-                transcription, audio_file, progress_callback=translation_progress
+                transcription,
+                audio_file,
+                progress_callback=translation_progress,
+                speaker_metadata=speaker_metadata,
             )
             
             update_job_progress(job_id, 35, "saving", "Saving segments to database")
             
             # Save segments to database
             _save_segments_to_db(project_id, translated_segments)
+            _save_translation_gender_signature(project_id, translated_segments, speaker_metadata)
 
             # If requested, continue straight into final dubbing in the same job.
             # This keeps the SSE stream alive and avoids a "pause" between stages.
@@ -366,6 +551,175 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         
         return {"status": "success", "segments_count": len(translated_segments)}
         
+    except SoftTimeLimitExceeded:
+        update_job_status(job_id, JobStatus.FAILED, "Task timed out")
+        update_project_status(project_id, ProjectStatus.ERROR)
+        raise
+    except Exception as e:
+        update_job_status(job_id, JobStatus.FAILED, str(e))
+        update_project_status(project_id, ProjectStatus.ERROR)
+        raise
+
+
+@celery_app.task(bind=True, name="src.api.workers.tasks.retranslate_project")
+def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
+    """Re-run translation for existing segments using the current project config."""
+    update_job_status(job_id, JobStatus.PROCESSING)
+    update_project_status(project_id, ProjectStatus.TRANSCRIBING)
+
+    try:
+        pm = ProjectManager(project_id)
+        pm.ensure_directories()
+
+        db = get_db_session(fresh=True)
+        try:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project:
+                raise ValueError(f"Project {project_id} not found")
+
+            config_data = project.config or {}
+            source_file = pm.get_source_video_path()
+            segments = db.query(Segment).filter(
+                Segment.project_id == project_id
+            ).order_by(Segment.sequence).all()
+
+            if not source_file or not source_file.exists():
+                raise ValueError("No source video uploaded")
+            if not segments:
+                raise ValueError("No existing segments found for re-translation")
+        finally:
+            db.close()
+
+        update_job_progress(job_id, 2, "initialization", "Starting translation refresh")
+
+        original_cwd = os.getcwd()
+        os.chdir(str(pm.base_dir))
+
+        try:
+            from src.dubbing.core.config import DubbingConfig
+            from src.dubbing.core.smart_dubbing import SmartDubbing
+            from src.dubbing.core.log_config import setup_logging
+
+            setup_logging(output_dir=str(pm.debug_dir), include_console=False)
+
+            preset = config_data.get("preset", "hq")
+            preset_config = get_preset_config(preset)
+            speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
+            video_quality_preset = get_video_quality_preset(config_data, preset_config)
+
+            dubbing_config = DubbingConfig()
+            dubbing_config.config.update({
+                "input": str(source_file),
+                "source_language": config_data.get("sourceLang", "en"),
+                "target_language": config_data.get("targetLang", "ru"),
+                "keep_background": config_data.get("keepBackground", preset_config.get("keep_background", False)),
+                "pause_removal": config_data.get("pauseRemoval", "disabled"),
+                "exit_before_synthesis": True,
+                "no_cache": False,
+                "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
+                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
+                "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
+                "tts_prompt_prefix": config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                "voice_name": speaker_voice_mappings,
+                "voice_prompt": config_data.get("speakerTtsPrompts", {}),
+                "voice_auto_selection": config_data.get("voiceAutoSelection", True),
+                "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
+                "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
+                "whisper_model": config_data.get("whisperModel", "large-v3"),
+                "translator_type": "llm",
+                "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
+                "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
+                "llm_temperature": config_data.get("llmTemperature") if config_data.get("llmTemperature") is not None else preset_config["llm_temperature"],
+                "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
+                "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
+                "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
+                "refinement_persona": config_data.get("personaId", "normal"),
+                "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
+                "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
+                "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
+                "dubbed_volume": config_data.get("dubbedVolume", 1.0),
+                "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
+                "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
+                "video_quality_preset": video_quality_preset,
+                "max_workers": config_data.get("maxWorkers", 4),
+                "video_minterpolate_threshold": config_data.get("videoMinterpolateThreshold") or preset_config.get("video_minterpolate_threshold"),
+                "start_time": config_data.get("startTime"),
+                "duration": config_data.get("duration"),
+            })
+
+            segments_opt = dubbing_config.config.get("segments_optimization", {})
+            if config_data.get("postDiarizationMergeGap") is not None:
+                segments_opt["post_diarization_merge_gap"] = config_data["postDiarizationMergeGap"]
+            if config_data.get("postTranslationMergeGap") is not None:
+                segments_opt["post_translation_merge_gap"] = config_data["postTranslationMergeGap"]
+            if config_data.get("maxSegmentDuration") is not None:
+                segments_opt["max_segment_duration"] = config_data["maxSegmentDuration"]
+            if config_data.get("minSegmentDuration") is not None:
+                segments_opt["min_segment_duration"] = config_data["minSegmentDuration"]
+            if config_data.get("minPauseDuration") is not None:
+                segments_opt["min_pause_duration"] = config_data["minPauseDuration"]
+            if config_data.get("preservePauseDuration") is not None:
+                segments_opt["preserve_pause_duration"] = config_data["preservePauseDuration"]
+            if config_data.get("comfortMinAdjustmentRatio") is not None:
+                segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
+            if config_data.get("comfortMaxAdjustmentRatio") is not None:
+                segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            dubbing_config.config["segments_optimization"] = segments_opt
+
+            if config_data.get("segmentStretch"):
+                dubbing_config.config["segment_stretch"] = config_data["segmentStretch"]
+
+            _apply_api_keys(config_data.get("apiKeys"))
+
+            dubbing_config.validate = lambda: None
+            dubbing_config.process_special_parameters()
+
+            update_job_progress(job_id, 5, "audio_extraction", "Extracting audio from video")
+            dubber = SmartDubbing(dubbing_config)
+            audio_file = dubber.audio_processor.extract_audio(
+                str(source_file),
+                dubbing_config.get("start_time"),
+                dubbing_config.get("duration")
+            )
+
+            update_job_progress(job_id, 15, "translation", "Re-translating segments")
+
+            def translation_progress(phase: str, current: int, total: int, text: str = None):
+                if phase == "translation":
+                    progress = 15 + int((current / total) * 10)
+                    step_name = "translation"
+                    message = f"Re-translating chunk {current}/{total}"
+                else:
+                    progress = 25 + int((current / total) * 10)
+                    step_name = "refinement"
+                    message = f"Refining chunk {current}/{total}"
+                update_job_progress(job_id, progress, step_name, message, text=text)
+
+            translation_input = _build_segment_translation_input(segments)
+            speaker_metadata = normalize_speaker_metadata_map(config_data.get(SPEAKER_METADATA_CONFIG_KEY))
+            translated_segments = dubber.translate_segments(
+                translation_input,
+                audio_file,
+                progress_callback=translation_progress,
+                speaker_metadata=speaker_metadata,
+                preserve_segment_boundaries=True,
+            )
+
+            update_job_progress(job_id, 35, "saving", "Saving refreshed translations")
+            _update_translated_segments_in_db(project_id, translated_segments)
+            _save_translation_gender_signature(project_id, translated_segments, speaker_metadata)
+
+            update_job_progress(job_id, 100, "complete", f"Translation refreshed: {len(translated_segments)} segments")
+
+        finally:
+            os.chdir(original_cwd)
+
+        update_job_status(job_id, JobStatus.COMPLETED)
+        update_project_status(project_id, ProjectStatus.TRANSCRIBED)
+        return {"status": "success", "segments_count": len(segments)}
+
     except SoftTimeLimitExceeded:
         update_job_status(job_id, JobStatus.FAILED, "Task timed out")
         update_project_status(project_id, ProjectStatus.ERROR)
@@ -496,6 +850,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
                 "refinement_persona": config_data.get("personaId", "normal"),
+                "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
             })
             
             # Apply segment optimization settings if provided
@@ -810,6 +1165,10 @@ def rephrase_segment(self, project_id: str, segment_id: str, prompt: Optional[st
             config_data = project.config or {}
             original_text = segment.translated_text or segment.original_text
             target_lang = config_data.get("targetLang", "ru")
+            speaker_gender_section = build_effective_gender_prompt_section(
+                config_data.get(SPEAKER_METADATA_CONFIG_KEY),
+                speakers=[segment.speaker],
+            )
         finally:
             db.close()
         
@@ -824,6 +1183,10 @@ def rephrase_segment(self, project_id: str, segment_id: str, prompt: Optional[st
         
         rephrase_prompt = f"""Rephrase the following text in {target_lang}.
 {f"Additional instructions: {prompt}" if prompt else "Make it more natural and conversational."}
+
+{speaker_gender_section}
+
+Use speaker grammar metadata only for grammatical agreement and self-reference. Do not invent biography or facts.
 
 Text to rephrase: {original_text}
 
@@ -880,6 +1243,28 @@ def _save_segments_to_db(project_id: str, segments: list) -> None:
             )
             db.add(segment)
         
+        db.commit()
+    finally:
+        db.close()
+
+
+def _update_translated_segments_in_db(project_id: str, translated_segments: list) -> None:
+    """Update only translated text for existing segments, preserving timing and IDs."""
+    db = get_db_session()
+    try:
+        existing_segments = db.query(Segment).filter(
+            Segment.project_id == project_id
+        ).order_by(Segment.sequence).all()
+
+        if len(existing_segments) != len(translated_segments):
+            raise ValueError(
+                f"Segment count mismatch during re-translation: {len(existing_segments)} existing vs {len(translated_segments)} translated"
+            )
+
+        for existing_segment, translated_segment in zip(existing_segments, translated_segments):
+            existing_segment.translated_text = translated_segment.get("translation", "")
+            existing_segment.audio_url = None
+
         db.commit()
     finally:
         db.close()

@@ -10,6 +10,7 @@ from .schemas import (
     SegmentUpdate,
     SpeakerRename,
     SpeakerVoiceUpdate,
+    SpeakerGenderUpdate,
     RephraseRequest,
     RephraseResponse,
     PreviewRequest,
@@ -33,6 +34,7 @@ __all__ = [
     "SegmentUpdate",
     "SpeakerRename",
     "SpeakerVoiceUpdate",
+    "SpeakerGenderUpdate",
     "RephraseRequest",
     "RephraseResponse",
     "PreviewRequest",
@@ -45,4 +47,3 @@ __all__ = [
     "LogEvent",
     "CompleteEvent",
 ]
-

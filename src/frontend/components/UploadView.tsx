@@ -553,6 +553,18 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           </select>
                         </div>
                       </div>
+                      <label className="flex items-start gap-2 cursor-pointer max-w-[420px] pt-1">
+                        <input
+                          type="checkbox"
+                          checked={config.enableSpeakerGenderInference ?? true}
+                          onChange={(e) => onConfigChange({ enableSpeakerGenderInference: e.target.checked })}
+                          className="mt-0.5 w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                        />
+                        <span className="text-[10px] leading-4 text-zinc-400">
+                          Infer speaker gender before translation
+                          <span className="text-zinc-600"> experimental, used only for grammatical agreement in gendered target languages</span>
+                        </span>
+                      </label>
                     </div>
 
                     {/* Translation Model Section */}

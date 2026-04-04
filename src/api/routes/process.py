@@ -14,8 +14,9 @@ from ..database.session import get_db
 from ..database.models import Project, Segment, Job, JobType, JobStatus, ProjectStatus, generate_job_id
 from ..models.schemas import JobResponse
 from ..services.project_manager import ProjectManager
-from ..workers.tasks import transcribe_project, dub_project
+from ..workers.tasks import transcribe_project, dub_project, retranslate_project
 from ..workers.celery_app import celery_app
+from src.utils.speaker_gender import is_speaker_gender_translation_stale
 
 router = APIRouter(prefix="/projects", tags=["process"])
 
@@ -99,6 +100,76 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
     return _enqueue_transcription_job(db, project, allow_existing=True)
 
 
+@router.post("/{project_id}/process/retranslate", response_model=JobResponse, status_code=202)
+async def start_retranslation(project_id: str, db: Session = Depends(get_db)):
+    """Re-run translation for existing segments using current speaker metadata."""
+    db.expire_all()
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status not in [ProjectStatus.TRANSCRIBED, ProjectStatus.DUBBED, ProjectStatus.ERROR]:
+        raise HTTPException(
+            status_code=400,
+            detail="Project must already have translated segments before re-translation",
+        )
+
+    source_video = ProjectManager(project_id).get_source_video_path()
+    if not source_video or not source_video.exists():
+        raise HTTPException(status_code=400, detail="No video uploaded for this project")
+
+    if not project.segments:
+        raise HTTPException(status_code=400, detail="No segments found for re-translation")
+
+    config = project.config or {}
+    if not config.get("sourceLang") or not config.get("targetLang"):
+        raise HTTPException(
+            status_code=400,
+            detail="Source and target languages must be configured before re-translation",
+        )
+
+    active_job = db.query(Job).filter(
+        Job.project_id == project.id,
+        Job.job_type == JobType.TRANSCRIBE,
+        Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+    ).first()
+    if active_job:
+        return JobResponse(
+            jobId=active_job.id,
+            status=active_job.status.value,
+            projectId=project.id,
+            type="transcribe",
+            progress=active_job.progress,
+            currentStep=active_job.current_step,
+        )
+
+    job = Job(
+        id=generate_job_id("retranslate"),
+        project_id=project.id,
+        job_type=JobType.TRANSCRIBE,
+        status=JobStatus.PENDING,
+        current_step="retranslation_pending",
+    )
+    db.add(job)
+    project.status = ProjectStatus.TRANSCRIBING
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    task = retranslate_project.delay(project.id, job.id)
+    job.celery_task_id = task.id
+    db.commit()
+
+    return JobResponse(
+        jobId=job.id,
+        status="processing",
+        projectId=project.id,
+        type="transcribe",
+        progress=0,
+        currentStep="retranslation_pending",
+    )
+
+
 @router.post("/{project_id}/process/restart", response_model=JobResponse, status_code=202)
 async def restart_processing(project_id: str, db: Session = Depends(get_db)):
     """Reset project cache/artifacts and restart end-to-end processing from scratch."""
@@ -168,6 +239,12 @@ async def start_dubbing(project_id: str, db: Session = Depends(get_db)):
     # Check if there are segments
     if not project.segments:
         raise HTTPException(status_code=400, detail="No segments found for dubbing")
+
+    if is_speaker_gender_translation_stale(project.config or {}, project.segments):
+        raise HTTPException(
+            status_code=400,
+            detail="Speaker gender overrides changed after translation. Re-run translation before dubbing.",
+        )
     
     # Check for active dubbing job
     active_job = db.query(Job).filter(

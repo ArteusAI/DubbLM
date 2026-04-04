@@ -6,10 +6,10 @@ import { EditorView } from './components/EditorView';
 import { ResultView } from './components/ResultView';
 import { ProjectListView } from './components/ProjectListView';
 import { SettingsModal } from './components/SettingsModal';
-import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider } from './types';
+import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider, SpeakerMetadata } from './types';
 import { DEFAULT_PERSONAS, PRESETS } from './constants';
 import { ChevronRight, LayoutDashboard, Settings, AlertTriangle, Loader2, X } from 'lucide-react';
-import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse } from './api';
+import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse, ProjectConfig as ApiProjectConfig } from './api';
 
 const DEFAULT_PRESET = PRESETS.find(p => p.id === 'hq')!;
 
@@ -43,7 +43,74 @@ const INITIAL_CONFIG: AppConfig = {
   translationPromptPrefix: '',
   speakerTtsPrompts: {},
   speakerVoiceMappings: {},
+  enableSpeakerGenderInference: true,
+  speakerMetadata: {},
 };
+
+const mapSpeakerMetadataForApi = (metadata?: Record<string, SpeakerMetadata>): Record<string, SpeakerMetadata> => {
+  if (!metadata) return {};
+  return Object.fromEntries(
+    Object.entries(metadata).map(([speaker, value]) => [
+      speaker,
+      {
+        inferredGender: value?.inferredGender || 'unknown',
+        inferredConfidence: value?.inferredConfidence ?? 0,
+        rawLabel: value?.rawLabel ?? null,
+        modelId: value?.modelId ?? null,
+        overrideGender: value?.overrideGender ?? null,
+      },
+    ])
+  );
+};
+
+const buildProjectConfigPayload = (
+  cfg: AppConfig,
+  extra: Partial<ApiProjectConfig> = {}
+): Partial<ApiProjectConfig> => ({
+  sourceLang: cfg.sourceLang,
+  targetLang: cfg.targetLang,
+  personaId: cfg.personaId,
+  speakerCount: cfg.speakerCount,
+  keepBackground: cfg.keepBackground,
+  pauseRemoval: cfg.pauseRemoval,
+  preset: cfg.preset,
+  startTime: cfg.startTime,
+  duration: cfg.duration,
+  transcriptionSystem: cfg.transcriptionSystem,
+  whisperModel: cfg.whisperModel,
+  llmProvider: cfg.llmProvider,
+  llmModelName: cfg.llmModelName,
+  llmTemperature: cfg.llmTemperature,
+  speakerTtsPrompts: cfg.speakerTtsPrompts || {},
+  speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+  enableSpeakerGenderInference: cfg.enableSpeakerGenderInference ?? true,
+  speakerMetadata: mapSpeakerMetadataForApi(cfg.speakerMetadata),
+  refinementLlmProvider: cfg.refinementLlmProvider,
+  refinementModelName: cfg.refinementModelName,
+  refinementTemperature: cfg.refinementTemperature,
+  translationPromptPrefix: cfg.translationPromptPrefix,
+  ttsSystem: cfg.ttsSystem,
+  ttsModel: cfg.ttsModel,
+  ttsPromptPrefix: cfg.ttsPromptPrefix,
+  voiceAutoSelection: cfg.voiceAutoSelection,
+  enableEmotionEnrichment: cfg.enableEmotionEnrichment,
+  dubbedVolume: cfg.dubbedVolume,
+  backgroundVolume: cfg.backgroundVolume,
+  keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
+  useTwoPassEncoding: cfg.useTwoPassEncoding,
+  videoQualityPreset: cfg.videoQualityPreset,
+  maxWorkers: cfg.maxWorkers,
+  postDiarizationMergeGap: cfg.postDiarizationMergeGap,
+  postTranslationMergeGap: cfg.postTranslationMergeGap,
+  maxSegmentDuration: cfg.maxSegmentDuration,
+  minSegmentDuration: cfg.minSegmentDuration,
+  comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
+  comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
+  segmentStretch: cfg.segmentStretch,
+  minPauseDuration: cfg.minPauseDuration,
+  preservePauseDuration: cfg.preservePauseDuration,
+  ...extra,
+});
 
 const mapSegmentFromApi = (
   seg: SegmentResponse,
@@ -97,6 +164,8 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       translationPromptPrefix: cfg.translationPromptPrefix,
       speakerTtsPrompts: cfg.speakerTtsPrompts || {},
       speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+      enableSpeakerGenderInference: cfg.enableSpeakerGenderInference ?? true,
+      speakerMetadata: cfg.speakerMetadata || {},
       ttsSystem: cfg.ttsSystem || preset.ttsSystem,
       ttsModel: cfg.ttsModel || preset.ttsModel,
       ttsPromptPrefix: cfg.ttsPromptPrefix ?? preset.ttsPromptPrefix,
@@ -127,6 +196,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
     sourceFilename: p.sourceFilename,
     sourceSize: p.sourceSize,
     processProgress: 0,
+    speakerGenderTranslationStale: p.speakerGenderTranslationStale || false,
   };
 };
 
@@ -410,15 +480,7 @@ const App: React.FC = () => {
         const project = mapProjectFromApi(created);
         
         // Sync default config to backend immediately
-        await api.updateProjectConfig(project.id, {
-          sourceLang: project.config.sourceLang,
-          targetLang: project.config.targetLang,
-          personaId: project.config.personaId,
-          preset: project.config.preset,
-          keepBackground: project.config.keepBackground,
-          pauseRemoval: project.config.pauseRemoval,
-          videoQualityPreset: project.config.videoQualityPreset,
-        });
+        await api.updateProjectConfig(project.id, buildProjectConfigPayload(project.config));
         
         project.videoFile = file;
         project.isUploading = true;
@@ -484,34 +546,7 @@ const App: React.FC = () => {
       try {
         // Update full config with autoProcess flag
         const cfg = project.config;
-        await api.updateProjectConfig(id, {
-          sourceLang: cfg.sourceLang,
-          targetLang: cfg.targetLang,
-          personaId: cfg.personaId,
-          keepBackground: cfg.keepBackground,
-          pauseRemoval: cfg.pauseRemoval,
-          preset: cfg.preset,
-          llmProvider: cfg.llmProvider,
-          llmModelName: cfg.llmModelName,
-          llmTemperature: cfg.llmTemperature,
-          speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-          speakerVoiceMappings: cfg.speakerVoiceMappings || {},
-          refinementLlmProvider: cfg.refinementLlmProvider,
-          refinementModelName: cfg.refinementModelName,
-          refinementTemperature: cfg.refinementTemperature,
-          ttsSystem: cfg.ttsSystem,
-          ttsModel: cfg.ttsModel,
-          ttsPromptPrefix: cfg.ttsPromptPrefix,
-          voiceAutoSelection: cfg.voiceAutoSelection,
-          enableEmotionEnrichment: cfg.enableEmotionEnrichment,
-          dubbedVolume: cfg.dubbedVolume,
-          backgroundVolume: cfg.backgroundVolume,
-          keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
-          useTwoPassEncoding: cfg.useTwoPassEncoding,
-          videoQualityPreset: cfg.videoQualityPreset,
-          maxWorkers: cfg.maxWorkers,
-          autoProcess: true,  // Backend will auto-start dubbing after transcription
-        });
+        await api.updateProjectConfig(id, buildProjectConfigPayload(cfg, { autoProcess: true }));
 
         // Start transcription
         await api.startTranscription(id);
@@ -590,6 +625,8 @@ const App: React.FC = () => {
 
     setIsResetting(true);
     try {
+      await api.updateProjectConfig(id, buildProjectConfigPayload(project.config, { autoProcess: true }));
+
       setProjects(prev => prev.map(p =>
         p.id === id
           ? {
@@ -792,52 +829,19 @@ const App: React.FC = () => {
     // Save config to API if it was updated
     if (updates.config) {
       const cfg = updates.config;
-      api.updateProjectConfig(activeProjectId, {
-        sourceLang: cfg.sourceLang,
-        targetLang: cfg.targetLang,
-        personaId: cfg.personaId,
-        speakerCount: cfg.speakerCount,
-        keepBackground: cfg.keepBackground,
-        pauseRemoval: cfg.pauseRemoval,
-        preset: cfg.preset,
-        // Extra settings
-        startTime: cfg.startTime,
-        duration: cfg.duration,
-        transcriptionSystem: cfg.transcriptionSystem,
-        whisperModel: cfg.whisperModel,
-        llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
-        refinementLlmProvider: cfg.refinementLlmProvider,
-        refinementModelName: cfg.refinementModelName,
-        refinementTemperature: cfg.refinementTemperature,
-        translationPromptPrefix: cfg.translationPromptPrefix,
-        ttsSystem: cfg.ttsSystem,
-        ttsModel: cfg.ttsModel,
-        ttsPromptPrefix: cfg.ttsPromptPrefix,
-        voiceAutoSelection: cfg.voiceAutoSelection,
-        enableEmotionEnrichment: cfg.enableEmotionEnrichment,
-        dubbedVolume: cfg.dubbedVolume,
-        backgroundVolume: cfg.backgroundVolume,
-        keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
-        useTwoPassEncoding: cfg.useTwoPassEncoding,
-        videoQualityPreset: cfg.videoQualityPreset,
-        maxWorkers: cfg.maxWorkers,
-        postDiarizationMergeGap: cfg.postDiarizationMergeGap,
-        postTranslationMergeGap: cfg.postTranslationMergeGap,
-        maxSegmentDuration: cfg.maxSegmentDuration,
-        minSegmentDuration: cfg.minSegmentDuration,
-        comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
-        comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
-        segmentStretch: cfg.segmentStretch,
-        minPauseDuration: cfg.minPauseDuration,
-        preservePauseDuration: cfg.preservePauseDuration,
-      }).catch(err => {
+      api.updateProjectConfig(activeProjectId, buildProjectConfigPayload(cfg)).catch(err => {
         console.error('Failed to save config:', err);
       });
     }
+  }, [activeProjectId]);
+
+  const updateActiveProjectState = useCallback((updates: Partial<Project>) => {
+    if (!activeProjectId) return;
+    setProjects(prev => prev.map(p =>
+      p.id === activeProjectId
+        ? { ...p, ...updates, updatedAt: new Date() }
+        : p
+    ));
   }, [activeProjectId]);
 
   const updateGlobalConfig = (updates: Partial<AppConfig>) => {
@@ -870,50 +874,7 @@ const App: React.FC = () => {
 
       // Save full config (and auto-process end-to-end).
       const cfg = activeProject.config;
-      await api.updateProjectConfig(activeProject.id, {
-        sourceLang: cfg.sourceLang,
-        targetLang: cfg.targetLang,
-        personaId: cfg.personaId,
-        speakerCount: cfg.speakerCount,
-        keepBackground: cfg.keepBackground,
-        pauseRemoval: cfg.pauseRemoval,
-        preset: cfg.preset,
-        // Extra settings
-        startTime: cfg.startTime,
-        duration: cfg.duration,
-        transcriptionSystem: cfg.transcriptionSystem,
-        whisperModel: cfg.whisperModel,
-        llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
-        refinementLlmProvider: cfg.refinementLlmProvider,
-        refinementModelName: cfg.refinementModelName,
-        refinementTemperature: cfg.refinementTemperature,
-        translationPromptPrefix: cfg.translationPromptPrefix,
-        ttsSystem: cfg.ttsSystem,
-        ttsModel: cfg.ttsModel,
-        ttsPromptPrefix: cfg.ttsPromptPrefix,
-        voiceAutoSelection: cfg.voiceAutoSelection,
-        enableEmotionEnrichment: cfg.enableEmotionEnrichment,
-        dubbedVolume: cfg.dubbedVolume,
-        backgroundVolume: cfg.backgroundVolume,
-        keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
-        useTwoPassEncoding: cfg.useTwoPassEncoding,
-        videoQualityPreset: cfg.videoQualityPreset,
-        maxWorkers: cfg.maxWorkers,
-        postDiarizationMergeGap: cfg.postDiarizationMergeGap,
-        postTranslationMergeGap: cfg.postTranslationMergeGap,
-        maxSegmentDuration: cfg.maxSegmentDuration,
-        minSegmentDuration: cfg.minSegmentDuration,
-        comfortMinAdjustmentRatio: cfg.comfortMinAdjustmentRatio,
-        comfortMaxAdjustmentRatio: cfg.comfortMaxAdjustmentRatio,
-        segmentStretch: cfg.segmentStretch,
-        minPauseDuration: cfg.minPauseDuration,
-        preservePauseDuration: cfg.preservePauseDuration,
-        autoProcess: true,
-      });
+      await api.updateProjectConfig(activeProject.id, buildProjectConfigPayload(cfg, { autoProcess: true }));
 
       // Start transcription
       await api.startTranscription(activeProject.id);
@@ -945,6 +906,10 @@ const App: React.FC = () => {
 
   const startDubbing = async () => {
     if (!activeProject) return;
+    if (activeProject.speakerGenderTranslationStale) {
+      setError('Speaker gender overrides changed after translation. Re-run translation before dubbing.');
+      return;
+    }
 
     try {
       setProcessingLogs([]);
@@ -953,38 +918,7 @@ const App: React.FC = () => {
 
       // Sync full config to backend before starting dubbing
       const cfg = activeProject.config;
-      await api.updateProjectConfig(activeProject.id, {
-        sourceLang: cfg.sourceLang,
-        targetLang: cfg.targetLang,
-        personaId: cfg.personaId,
-        speakerCount: cfg.speakerCount,
-        keepBackground: cfg.keepBackground,
-        pauseRemoval: cfg.pauseRemoval,
-        preset: cfg.preset,
-        // TTS settings
-        ttsSystem: cfg.ttsSystem,
-        ttsModel: cfg.ttsModel,
-        voiceAutoSelection: cfg.voiceAutoSelection,
-        enableEmotionEnrichment: cfg.enableEmotionEnrichment,
-        ttsPromptPrefix: cfg.ttsPromptPrefix,
-        // Audio settings
-        dubbedVolume: cfg.dubbedVolume,
-        backgroundVolume: cfg.backgroundVolume,
-        keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
-        useTwoPassEncoding: cfg.useTwoPassEncoding,
-        videoQualityPreset: cfg.videoQualityPreset,
-        // Processing settings
-        maxWorkers: cfg.maxWorkers,
-        // LLM settings (in case they matter for dubbing)
-        llmProvider: cfg.llmProvider,
-        llmModelName: cfg.llmModelName,
-        llmTemperature: cfg.llmTemperature,
-        speakerTtsPrompts: cfg.speakerTtsPrompts || {},
-        speakerVoiceMappings: cfg.speakerVoiceMappings || {},
-        refinementLlmProvider: cfg.refinementLlmProvider,
-        refinementModelName: cfg.refinementModelName,
-        refinementTemperature: cfg.refinementTemperature,
-      });
+      await api.updateProjectConfig(activeProject.id, buildProjectConfigPayload(cfg));
 
       await api.startDubbing(activeProject.id);
       
@@ -995,6 +929,29 @@ const App: React.FC = () => {
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start dubbing');
+      setStep(AppStep.EDITOR);
+    }
+  };
+
+  const startRetranslation = async () => {
+    if (!activeProject) return;
+
+    try {
+      setProcessingLogs([]);
+      setProcessingProgress(0);
+      setProcessingStep('Preparing translation refresh...');
+      setStep(AppStep.PROCESSING_TRANSCRIPTION);
+
+      await api.updateProjectConfig(activeProject.id, buildProjectConfigPayload(activeProject.config, { autoProcess: false }));
+      await api.retranslateProject(activeProject.id);
+
+      updateActiveProjectState({
+        status: 'transcribing',
+        processProgress: 0,
+        processStage: 'Refreshing translation...',
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to refresh translation');
       setStep(AppStep.EDITOR);
     }
   };
@@ -1426,6 +1383,8 @@ const App: React.FC = () => {
             voices={voices}
             onUpdateSegments={handleUpdateSegments}
             onUpdateConfig={handleSettingsUpdate}
+            onUpdateProjectState={updateActiveProjectState}
+            onRetranslate={startRetranslation}
             onContinue={startDubbing}
             activeProject={activeProject}
           />

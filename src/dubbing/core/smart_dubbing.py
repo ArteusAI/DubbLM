@@ -43,6 +43,7 @@ from ..debug.cost_tracker import CostTracker
 from ..utils.subtitle_utils import SubtitleManager
 from .log_config import get_logger
 from .cost_estimator import CostEstimator
+from src.utils.speaker_gender import normalize_speaker_metadata_map
 
 # Import existing factories and interfaces
 from src.tts.tts_factory import TTSFactory
@@ -205,6 +206,8 @@ class SmartDubbing:
                 enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
                 segment_stretch=self.config.get('segment_stretch', 'audio_and_video'),
             )
+            if hasattr(self.translator, "set_speaker_metadata"):
+                self.translator.set_speaker_metadata(self.config.get("speaker_metadata"))
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
             logger.warning(f"Failed to initialize translator: {e}")
@@ -810,10 +813,23 @@ class SmartDubbing:
         self, 
         transcription: List[Dict], 
         audio_file: str,
-        progress_callback: callable = None
+        progress_callback: callable = None,
+        speaker_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        preserve_segment_boundaries: bool = False,
     ) -> List[Dict]:
         """Translate segments using the translator."""
-        cache_key = f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}_{self.config.get('target_language')}"
+        normalized_speaker_metadata = normalize_speaker_metadata_map(
+            speaker_metadata if speaker_metadata is not None else self.config.get("speaker_metadata")
+        )
+        speaker_metadata_signature = "|".join(
+            f"{speaker}:{metadata.get('overrideGender') or metadata.get('inferredGender') or 'unknown'}"
+            for speaker, metadata in sorted(normalized_speaker_metadata.items())
+        )
+        speaker_metadata_hash = hashlib.md5(speaker_metadata_signature.encode("utf-8")).hexdigest()[:10] if speaker_metadata_signature else "none"
+        cache_key = (
+            f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
+            f"_{self.config.get('target_language')}_gender_{speaker_metadata_hash}_keep_{int(preserve_segment_boundaries)}"
+        )
         step_name = "translation"
         
         translated_segments = None
@@ -838,7 +854,9 @@ class SmartDubbing:
                     refinement_persona=self.config.get('refinement_persona', 'normal'),
                     debug=self.debug_data,
                     enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    speaker_metadata=normalized_speaker_metadata,
+                    preserve_segment_boundaries=preserve_segment_boundaries,
                 )
             else:
                 raise ValueError("No translator available")
@@ -853,7 +871,8 @@ class SmartDubbing:
         # Optimize segments after translation
         initial_count = len(transcription)
         pre_opt_count = len(translated_segments)
-        translated_segments = self.segment_optimizer.optimize_post_translation(translated_segments)
+        if not preserve_segment_boundaries:
+            translated_segments = self.segment_optimizer.optimize_post_translation(translated_segments)
 
         # Log final translation pipeline statistics
         logger.info(

@@ -49,6 +49,8 @@ class DubbingConfig:
             'refinement_max_tokens': None,
             'refinement_persona': 'normal',
             'translation_prompt_prefix': None,
+            'enable_speaker_gender_inference': True,
+            'speaker_metadata': None,
             'voice_name': None,
             'debug_info': False,
             'debug_tts': False,

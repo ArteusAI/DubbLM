@@ -7,6 +7,17 @@ from pydantic import BaseModel, Field
 
 # --- Project Schemas ---
 
+SpeakerGenderValue = Literal["male", "female", "unknown"]
+
+
+class SpeakerMetadata(BaseModel):
+    """Speaker-level metadata used for translation and voice selection."""
+    inferredGender: SpeakerGenderValue = "unknown"
+    inferredConfidence: float = 0.0
+    rawLabel: Optional[str] = None
+    modelId: Optional[str] = None
+    overrideGender: Optional[SpeakerGenderValue] = None
+
 class ProjectConfig(BaseModel):
     """Project configuration schema."""
     sourceLang: Optional[str] = None
@@ -28,6 +39,8 @@ class ProjectConfig(BaseModel):
     llmTemperature: Optional[float] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
+    enableSpeakerGenderInference: Optional[bool] = True
+    speakerMetadata: Optional[Dict[str, SpeakerMetadata]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None
@@ -75,6 +88,8 @@ class ProjectConfigUpdate(BaseModel):
     llmTemperature: Optional[float] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
+    enableSpeakerGenderInference: Optional[bool] = None
+    speakerMetadata: Optional[Dict[str, SpeakerMetadata]] = None
     refinementLlmProvider: Optional[str] = None
     refinementModelName: Optional[str] = None
     refinementTemperature: Optional[float] = None
@@ -114,6 +129,7 @@ class ProjectResponse(BaseModel):
     createdAt: datetime
     updatedAt: datetime
     config: ProjectConfig = Field(default_factory=ProjectConfig)
+    speakerGenderTranslationStale: bool = False
     sourceFile: Optional[str] = None
     sourceFilename: Optional[str] = None
     sourceSize: Optional[int] = None
@@ -128,6 +144,7 @@ class ProjectListResponse(BaseModel):
     createdAt: datetime
     updatedAt: datetime
     config: ProjectConfig = Field(default_factory=ProjectConfig)
+    speakerGenderTranslationStale: bool = False
 
 
 # --- Segment Schemas ---
@@ -171,6 +188,12 @@ class SpeakerVoiceUpdate(BaseModel):
     speakerName: str
     voiceId: str
     provider: str
+
+
+class SpeakerGenderUpdate(BaseModel):
+    """Schema for setting or clearing a speaker gender override."""
+    speakerName: str
+    overrideGender: Optional[SpeakerGenderValue] = None
 
 
 # --- Rephrase Schemas ---

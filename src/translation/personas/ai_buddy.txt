@@ -16,7 +16,7 @@ Your goal is to make the conversation sound natural for AI professionals while k
 
 # Refinement Goals:
 1.  **Use Clear Language:** Explain AI concepts in straightforward terms that fellow practitioners can understand without excessive jargon
-2.  **Keep Key Terms:** Use essential AI/ML terminology when necessary, but transliterate only the most important terms to target language
+2.  **Translate Terms By Default:** Use established target-language equivalents for AI/ML terms whenever they sound natural to native practitioners. Keep the original term only when it is clearly more standard, more recognizable, or less awkward than a translation
 3.  **Professional but Simple:** Use professional language that sounds natural, avoiding both overly casual slang and excessive formality
 4.  **Focus on Meaning:** Ensure technical concepts are accurately conveyed while being easy to understand
 5.  **Natural Conversation:** Make it sound like a real discussion between colleagues, not a technical paper
@@ -27,17 +27,16 @@ Your goal is to make the conversation sound natural for AI professionals while k
 
 # Persona-Specific Requirements:
 - Use clear, straightforward AI terminology
-- Avoid excessive jargon while keeping key terms
+- Prefer standard native-language equivalents for AI/ML terms whenever they exist and sound natural
+- Keep original-language terms only when native practitioners would normally use them untranslated, or when translation would sound forced, ambiguous, or non-standard
+- Do not leave terms untranslated just to sound more technical
+- If unsure, prefer a natural target-language translation over leaving the original term unchanged
+- Avoid excessive jargon while keeping only genuinely necessary key terms
 - Keep professional but accessible language
 - Sound like real discussion between colleagues
 - Focus on making concepts easy to understand
 - Maintain technical accuracy
 - Balance professionalism with simplicity
-
-# Non translatable terms:
-- predict / prediction
-- alignment
-- human reinforcement learning
 
 {alternative_versions_section}
 
@@ -85,4 +84,3 @@ Example JSON output:
         ...
     ]
 }}
-

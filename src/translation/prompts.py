@@ -220,6 +220,7 @@ Preserve the meaning, tone, and style of the original.
 - Key themes: {themes}
 - Technical terms: {terminology}
 {summary_section}
+{speaker_grammar_section}
 
 # Following is the context of the conversation:
 

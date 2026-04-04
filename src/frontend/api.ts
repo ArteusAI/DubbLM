@@ -126,6 +126,13 @@ class ApiClient {
     );
   }
 
+  async retranslateProject(projectId: string): Promise<JobResponse> {
+    return this.request<JobResponse>(
+      `/projects/${projectId}/process/retranslate`,
+      { method: 'POST' }
+    );
+  }
+
   async startDubbing(projectId: string): Promise<JobResponse> {
     return this.request<JobResponse>(`/projects/${projectId}/process/dub`, {
       method: 'POST',
@@ -201,6 +208,20 @@ class ApiClient {
       {
         method: 'POST',
         body: JSON.stringify({ speakerName, voiceId, provider }),
+      }
+    );
+  }
+
+  async updateSpeakerGender(
+    projectId: string,
+    speakerName: string,
+    overrideGender: SpeakerGender | null
+  ): Promise<{ message: string }> {
+    return this.request<{ message: string }>(
+      `/projects/${projectId}/speakers/gender`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ speakerName, overrideGender }),
       }
     );
   }
@@ -450,6 +471,8 @@ export interface ProjectConfig {
   llmTemperature?: number;
   speakerTtsPrompts?: Record<string, string>;
   speakerVoiceMappings?: Record<string, string>;
+  enableSpeakerGenderInference?: boolean;
+  speakerMetadata?: Record<string, SpeakerMetadata>;
   refinementLlmProvider?: string;
   refinementModelName?: string;
   refinementTemperature?: number;
@@ -483,6 +506,7 @@ export interface ProjectListResponse {
   createdAt: string;
   updatedAt: string;
   config: ProjectConfig;
+  speakerGenderTranslationStale?: boolean;
 }
 
 export interface ProjectResponse extends ProjectListResponse {
@@ -490,6 +514,16 @@ export interface ProjectResponse extends ProjectListResponse {
   sourceFilename?: string;
   sourceSize?: number;
   segments?: SegmentResponse[];
+}
+
+export type SpeakerGender = 'male' | 'female' | 'unknown';
+
+export interface SpeakerMetadata {
+  inferredGender: SpeakerGender;
+  inferredConfidence: number;
+  rawLabel?: string | null;
+  modelId?: string | null;
+  overrideGender?: SpeakerGender | null;
 }
 
 export interface SegmentResponse {
