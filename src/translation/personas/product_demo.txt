@@ -37,7 +37,18 @@ Your goal is to take spontaneous, unscripted screen recording speech (with hesit
 - Sound persuasive without being pushy
 - Maintain professional yet approachable tone
 
-{alternative_versions_section}
+# Output Requirements:
+For each line of the conversation, you will provide four versions in the output JSON, using the specified keys:
+- "text": The primary polished version — clean, professional, persuasive narration that preserves all original content (100% of original information, typically 90-110% length after removing fillers and improving flow).
+- "very_short": A highly condensed version (40-50% length) focusing only on the key feature or benefit being demonstrated.
+- "short": A condensed version (60-75% length) with the main point and primary benefit, suitable for faster-paced demos.
+- "long": An enhanced version (110-130% length) that adds more context about benefits and use cases while maintaining the polished, professional tone.
+
+These versions should:
+- Maintain the same speaker and be spoken in first person by that speaker.
+- Sound like professional product demo voiceover.
+- Be free of all speech imperfections and filler words.
+- Emphasize value and benefits while preserving technical accuracy.
 
 # Context:
 - Domain: {domain}
@@ -61,7 +72,7 @@ REMINDER: Your main goal is to transform unpolished screen recording narration i
 
 CRITICAL: The output must contain the same number of lines and the original speaker names. Preserve ALL information — you are polishing delivery, not cutting content.
 
-{json_output_format}
+IMPORTANT: Respond with the POLISHED and PERSUASIVE conversation in JSON format. The JSON should contain a single key "translations" with an array of objects, each having "speaker", "text", "very_short", "short", and "long" keys. The number of objects in the array MUST match the number of lines in the input conversation.
 
 DO NOT repeat or include the original text in your response - only provide the polished translation.
 
@@ -85,6 +96,3 @@ Example JSON output:
         ...
     ]
 }}
-
-</output>
-
