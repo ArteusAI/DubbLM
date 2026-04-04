@@ -129,9 +129,11 @@ class LLMTranslator(TranslationInterface):
     def initialize(self) -> None:
         """Initialize the LLM translation system."""
         import os
-        
+
         if not JSON_REPAIR_AVAILABLE:
-            raise ImportError("json_repair is not installed. Please install it.")
+            logger.warning(
+                "json_repair is not installed; falling back to strict JSON parsing for translator responses."
+            )
         
         # Initialize translation LLM
         self.llm = self._create_llm(
@@ -160,6 +162,15 @@ class LLMTranslator(TranslationInterface):
                 # Fallback to legacy cache directory structure
                 os.makedirs(self.cache_dir, exist_ok=True)
                 self._load_cache()
+
+    def _load_response_json(self, response_text: str) -> Any:
+        """Parse a model response as JSON, using json_repair only as a fallback."""
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            if JSON_REPAIR_AVAILABLE and json_repair is not None:
+                return json_repair.loads(response_text)
+            raise
             
     def _create_llm(
         self, 
@@ -192,14 +203,17 @@ class LLMTranslator(TranslationInterface):
             if not GEMINI_AVAILABLE:
                 raise ImportError("Gemini dependencies are not installed. Please install llama-index.")
             
-            # Get API key from environment
-            api_key = os.environ.get("GOOGLE_API_KEY")
+            # Support both the current Google env var and the legacy Gemini alias.
+            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
             if not api_key:
-                raise ValueError("Gemini API key not found in environment. Set GOOGLE_API_KEY environment variable.")
+                raise ValueError(
+                    "Gemini API key not found in environment. "
+                    "Set GOOGLE_API_KEY or GEMINI_API_KEY."
+                )
             
             try:
                 # Initialize Gemini LLM
-                llm = Gemini(model=model_name, temperature=temperature)
+                llm = Gemini(api_key=api_key, model=model_name, temperature=temperature)
                 logger.debug(f"Initialized Gemini {purpose} LLM with model: {model_name}, temperature={temperature}")
                 return llm
             except Exception as e:
@@ -424,7 +438,7 @@ Example JSON output:
             
             # Extract JSON from the response
             try:
-                combined_info = json_repair.loads(response_text)
+                combined_info = self._load_response_json(response_text)
             except (json.JSONDecodeError, AttributeError) as e:
                 logger.error(f"Error parsing combined analysis JSON: {e}")
                 combined_info = {
@@ -758,7 +772,7 @@ Example JSON output:
         """
         # Enable debug mode if specified in kwargs, overriding instance setting
         debug = kwargs.get("debug", self.debug)
-        debug_dir = kwargs.get("debug_dir", "artifacts/debug/translation")
+        debug_dir = kwargs.get("translation_debug_dir", kwargs.get("debug_dir", "artifacts/debug/translation"))
         
         # Get cache settings from kwargs, falling back to instance settings
         enable_cache = kwargs.get("enable_cache", self.enable_cache)
@@ -1068,7 +1082,7 @@ IMPORTANT: Respond in JSON format with an array of objects containing speaker an
                 
                 try:
                     # Try to parse JSON from LLM response
-                    repaired_json = json_repair.loads(translation_text)
+                    repaired_json = self._load_response_json(translation_text)
                             
                     translated_pairs = repaired_json.get("translations", [])
                         
@@ -1373,7 +1387,7 @@ IMPORTANT: Respond in JSON format with an array of objects containing speaker an
         """
         # Enable debug mode if specified in kwargs, overriding instance setting
         debug = kwargs.get("debug", self.debug)
-        debug_dir = kwargs.get("debug_dir", "artifacts/debug/translation_refinement")
+        debug_dir = kwargs.get("refinement_debug_dir", kwargs.get("debug_dir", "artifacts/debug/translation_refinement"))
         session_dir = None # Initialize session_dir
         
         # Determine which persona to use
@@ -1544,7 +1558,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     
                     try:
                         # Parse JSON from LLM response
-                        repaired_json = json_repair.loads(llm_response_text)
+                        repaired_json = self._load_response_json(llm_response_text)
                         refined_pairs = repaired_json.get("translations", [])
 
                         # Basic validation
@@ -2002,7 +2016,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     continue
 
                 try:
-                    repaired = json_repair.loads(response_text)
+                    repaired = self._load_response_json(response_text)
                     adjusted = repaired.get("text") if isinstance(repaired, dict) else None
                     if adjusted and isinstance(adjusted, str) and adjusted.strip():
                         return adjusted.strip()

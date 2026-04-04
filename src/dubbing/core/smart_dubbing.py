@@ -39,7 +39,6 @@ from .log_config import get_logger
 from tts.tts_factory import TTSFactory
 from translation.translator_factory import TranslatorFactory
 from transcription.transcription_factory import TranscriptionFactory
-from speechbrain.inference.interfaces import foreign_class
 
 # Disable warnings
 warnings.filterwarnings("ignore")
@@ -64,8 +63,16 @@ class SmartDubbing:
             config: Configuration object containing all settings
         """
         self.config = config
+        self.project_dir = Path(self.config.get("project_dir"))
+        self.artifacts_root = Path(self.config.get("artifacts_dir"))
+        self.audio_dir = Path(self.config.get("audio_artifacts_dir"))
+        self.speakers_audio_dir = Path(self.config.get("speakers_audio_dir"))
+        self.audio_chunks_dir = Path(self.config.get("audio_chunks_dir"))
+        self.su_audio_chunks_dir = Path(self.config.get("su_audio_chunks_dir"))
         self.tts_system_mapping = self.config.get('tts_system_mapping') or {}
         self.voice_prompt = self.config.get('voice_prompt') or {}
+        self.reference_audio_mapping = self.config.get('reference_audio_mapping') or {}
+        self.reference_text_mapping = self.config.get('reference_text_mapping') or {}
         
         # Speakers to mute (remove entirely from output)
         self.muted_speakers = set()
@@ -85,14 +92,14 @@ class SmartDubbing:
         self.performance_tracker = PerformanceTracker()
         
         # Initialize processors
-        self.audio_processor = AudioProcessor(self.cache_manager, self.performance_tracker)
-        self.speaker_processor = SpeakerProcessor(self.cache_manager, self.performance_tracker)
-        self.video_processor = VideoProcessor(self.performance_tracker)
+        self.audio_processor = AudioProcessor(self.cache_manager, self.performance_tracker, artifacts_root=str(self.artifacts_root))
+        self.speaker_processor = SpeakerProcessor(self.cache_manager, self.performance_tracker, artifacts_root=str(self.artifacts_root))
+        self.video_processor = VideoProcessor(self.performance_tracker, artifacts_root=str(self.artifacts_root))
         
         # Initialize utilities
         self.subtitle_manager = SubtitleManager()
-        self.debug_generator = DebugGenerator()
-        self.speaker_reporter = SpeakerReporter(self.performance_tracker)
+        self.debug_generator = DebugGenerator(artifacts_root=str(self.artifacts_root))
+        self.speaker_reporter = SpeakerReporter(self.performance_tracker, artifacts_root=str(self.artifacts_root))
         
         # Set device
         device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
@@ -108,6 +115,9 @@ class SmartDubbing:
             "voices": {},
             "speaker_groups": {}
         }
+        self.translator_init_error = None
+        self.transcriber_init_error = None
+        self.tts_init_error = None
         
         # Initialize real segment positions for pause removal
         self.real_segment_positions = []
@@ -126,7 +136,8 @@ class SmartDubbing:
         
         logger.info(f"Initialized SmartDubbing with {self.device} device")
         logger.debug(f"Using {config.get('tts_system', 'coqui')} TTS system")
-        logger.debug(f"Using {config.get('transcription_system', 'whisper')} transcription system")
+        if self.transcriber is not None:
+            logger.debug(f"Using {self.transcriber.name} transcriber")
         
         if config.get('start_time') is not None or config.get('duration') is not None:
             start_str = f"from {config.get('start_time')}s" if config.get('start_time') is not None else "from beginning"
@@ -161,6 +172,7 @@ class SmartDubbing:
     def _initialize_translator(self) -> None:
         """Initialize translator based on configuration."""
         self.translator = None
+        self.translator_init_error = None
         try:
             self.translator = TranslatorFactory.create_translator(
                 translator_type=self.config.get('translator_type', 'llm'),
@@ -178,12 +190,14 @@ class SmartDubbing:
             )
             logger.debug(f"Using {self.config.get('translator_type', 'llm')} translator")
         except Exception as e:
+            self.translator_init_error = e
             logger.warning(f"Failed to initialize translator: {e}")
     
     def _initialize_tts_systems(self) -> None:
         """Initialize TTS systems based on configuration."""
         self.tts_systems = {}
         self.default_tts = None
+        self.tts_init_error = None
         
         try:
             tts_instance = TTSFactory.create_tts(
@@ -195,28 +209,131 @@ class SmartDubbing:
                 enable_voice_matching=self.config.get('voice_auto_selection', True),
                 debug_tts=self.config.get('debug_tts', False),
                 model=self.config.get('tts_model'),
-                fallback_model=self.config.get('tts_fallback_model')
+                fallback_model=self.config.get('tts_fallback_model'),
+                default_reference_audio=self.config.get('reference_audio'),
+                space_id=self.config.get('omnivoice_space_id'),
+                api_name=self.config.get('omnivoice_api_name'),
+                lang=self.config.get('omnivoice_lang'),
+                num_steps=self.config.get('omnivoice_num_steps'),
+                guidance_scale=self.config.get('omnivoice_guidance_scale'),
+                denoise=self.config.get('omnivoice_denoise'),
+                speed=self.config.get('omnivoice_speed'),
+                duration=self.config.get('omnivoice_duration'),
+                preprocess_prompt=self.config.get('omnivoice_preprocess_prompt'),
+                postprocess_output=self.config.get('omnivoice_postprocess_output'),
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance
             logger.debug(f"Initialized {self.config.get('tts_system', 'coqui')} TTS system")
         except Exception as e:
+            self.tts_init_error = e
             logger.warning(f"Failed to initialize TTS: {e}")
     
     def _initialize_transcriber(self) -> None:
         """Initialize transcriber based on configuration."""
         self.transcriber = None
+        self.transcriber_init_error = None
         try:
             self.transcriber = TranscriptionFactory.create_transcriber(
                 transcription_system=self.config.get('transcription_system', 'whisper'),
                 source_language=self.config.get('source_language'),
                 device=self.device,
                 whisper_model=self.config.get('whisper_model', 'large-v3'),
-                cache_manager=self.cache_manager
+                cache_manager=self.cache_manager,
+                artifacts_root=self.config.get("artifacts_dir"),
             )
             logger.debug(f"Initialized {self.transcriber.name} transcriber")
         except Exception as e:
+            self.transcriber_init_error = e
             logger.warning(f"Failed to initialize transcriber: {e}")
+
+    def _format_component_init_error(
+        self,
+        component_name: str,
+        configured_backend: str,
+        init_error: Optional[Exception]
+    ) -> str:
+        """Build a clear runtime error when a required backend failed to initialize."""
+        message = f"{component_name} '{configured_backend}' is not available"
+        if init_error is not None:
+            message = f"{message}: {init_error}"
+
+        error_text = str(init_error or "")
+        if "ASSEMBLYAI_API_KEY" in error_text:
+            message += " Set ASSEMBLYAI_API_KEY or choose another transcription_system."
+        elif "HF_TOKEN" in error_text:
+            message += " Set HF_TOKEN or choose a backend that does not require Hugging Face authentication."
+        elif "json_repair" in error_text:
+            message += " Install json_repair in the active Python environment."
+
+        return message
+
+    def _require_transcriber(self):
+        """Return the initialized transcriber or raise an actionable error."""
+        if self.transcriber is not None:
+            return self.transcriber
+
+        raise RuntimeError(
+            self._format_component_init_error(
+                "Transcriber",
+                self.config.get('transcription_system', 'whisper'),
+                getattr(self, "transcriber_init_error", None),
+            )
+        )
+
+    def _require_translator(self):
+        """Return the initialized translator or raise an actionable error."""
+        if self.translator is not None:
+            return self.translator
+
+        raise RuntimeError(
+            self._format_component_init_error(
+                "Translator",
+                self.config.get('translator_type', 'llm'),
+                getattr(self, "translator_init_error", None),
+            )
+        )
+
+    def _attach_segment_reference(
+        self,
+        *,
+        tts_segment_data_args: Dict[str, Any],
+        segment_dict: Dict[str, Any],
+        speaker: str,
+        segment_index: int,
+        original_audio_segment: Optional[AudioSegment],
+        segment_reference_min_duration: float,
+        segment_reference_min_duration_ms: int,
+    ) -> tuple[Dict[str, Any], Optional[AudioSegment]]:
+        """Attach a segment-specific reference clip and its transcription when possible."""
+        segment_duration = segment_dict["end"] - segment_dict["start"]
+        if (
+            original_audio_segment is None
+            or (
+                segment_reference_min_duration > 0.0
+                and segment_duration < segment_reference_min_duration
+            )
+        ):
+            return tts_segment_data_args, original_audio_segment
+
+        start_ms = max(int(segment_dict["start"] * 1000), 0)
+        end_ms = min(int(segment_dict["end"] * 1000), len(original_audio_segment))
+
+        if end_ms <= start_ms:
+            return tts_segment_data_args, original_audio_segment
+
+        segment_audio = original_audio_segment[start_ms:end_ms]
+        if segment_reference_min_duration_ms != 0 and len(segment_audio) < segment_reference_min_duration_ms:
+            return tts_segment_data_args, original_audio_segment
+
+        segment_ref_dir = self.speakers_audio_dir / "segments"
+        segment_ref_dir.mkdir(parents=True, exist_ok=True)
+        segment_ref_path = segment_ref_dir / f"{speaker}_{segment_index}.wav"
+        segment_audio.export(segment_ref_path, format="wav")
+        tts_segment_data_args["reference_audio_path"] = str(segment_ref_path)
+        tts_segment_data_args["reference_text"] = segment_dict.get("text")
+
+        return tts_segment_data_args, original_audio_segment
     
     def run_pipeline(self, save_original_subtitles: bool = False, save_translated_subtitles: bool = False) -> str:
         """Run the full dubbing pipeline."""
@@ -233,6 +350,15 @@ class SmartDubbing:
                 self.config.get('start_time'),
                 self.config.get('duration')
             )
+            background_audio_path = None
+            segment_reference_audio_file = audio_file
+            if self.config.get('keep_background', False):
+                (
+                    background_audio_path,
+                    separated_vocals_path,
+                ) = self.audio_processor.separate_background_and_vocals(audio_file)
+                if separated_vocals_path:
+                    segment_reference_audio_file = separated_vocals_path
             
             # Perform speaker diarization and transcription
             speakers_rolls, transcription = self.diarize_and_transcribe(audio_file)
@@ -253,7 +379,7 @@ class SmartDubbing:
             segments_for_output = self._apply_speaker_filter(translated_segments)
             
             # Save debug TSV
-            self.subtitle_manager.save_debug_tsv(segments_for_output)
+            self.subtitle_manager.save_debug_tsv(segments_for_output, output_dir=self.config.get("debug_dir"))
             
             # Save subtitles if requested (only if pause removal is disabled)
             remove_pauses_enabled = self.config.get('remove_pauses', True)
@@ -274,29 +400,29 @@ class SmartDubbing:
             
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
-                translated_audio_path = self.synthesize_speech(segments_for_output, speakers_rolls, audio_file)
+                translated_audio_path = self.synthesize_speech(
+                    segments_for_output,
+                    speakers_rolls,
+                    segment_reference_audio_file,
+                )
             else:
                 logger.info("All segments filtered by mute_speakers; generating silent audio track...")
                 total_duration_sec = self.audio_processor.get_total_duration() or 0
                 silent_ms = int(max(0, total_duration_sec) * 1000)
                 silent_audio = AudioSegment.silent(duration=silent_ms)
-                os.makedirs("artifacts/audio", exist_ok=True)
-                translated_audio_path = "artifacts/audio/output.wav"
+                self.audio_dir.mkdir(parents=True, exist_ok=True)
+                translated_audio_path = self.config.get("translated_audio_path")
                 silent_audio.export(translated_audio_path, format="wav")
             
             # Save translated samples
             self.speaker_processor.save_translated_samples(segments_for_output, audio_file)
-            
-            # Process background audio if needed
-            background_audio_path = None
-            if self.config.get('keep_background', False):
-                background_audio_path = self.audio_processor.process_background_audio(audio_file)
             
             # Generate final debug video if needed
             if self.config.get('debug_info', False):
                 self.debug_generator.generate_debug_video(
                     self.config.get('input'),
                     self.debug_data,
+                    self.config.get("debug_dir"),
                     self.config.get('start_time'),
                     self.config.get('duration'),
                     self.audio_processor.get_total_duration()
@@ -408,19 +534,20 @@ class SmartDubbing:
         self.debug_generator.generate_debug_video(
             self.config.get('input'),
             self.debug_data,
+            self.config.get("debug_dir"),
             self.config.get('start_time'),
             self.config.get('duration'),
             self.audio_processor.get_total_duration()
         )
         
         # Create debug TSV of original transcription
-        self.subtitle_manager.save_debug_tsv(self.debug_data["transcription"])
+        self.subtitle_manager.save_debug_tsv(self.debug_data["transcription"], output_dir=self.config.get("debug_dir"))
         
         # Reset debug_info to original value
         self.config.set('debug_info', original_debug_info)
         
         # Return path to debug video
-        debug_video_path = "artifacts/debug/dubbing_debug.mp4"
+        debug_video_path = self.config.get("debug_video_path")
         logger.info(f"Debug video generated: {debug_video_path}")
         
         # Write partial performance summary
@@ -465,8 +592,7 @@ class SmartDubbing:
     
     def diarize_and_transcribe(self, audio_file: str) -> Tuple[Dict[Tuple[float, float], str], List[Dict]]:
         """Perform speaker diarization and transcription."""
-        if not self.transcriber:
-            raise ValueError("Transcriber not initialized")
+        transcriber = self._require_transcriber()
             
         # Generate cache key
         cache_key = self.cache_manager.generate_cache_key(
@@ -479,7 +605,7 @@ class SmartDubbing:
         )
         
         # Perform diarization and transcription
-        speakers_rolls, transcription = self.transcriber.diarize_and_transcribe(
+        speakers_rolls, transcription = transcriber.diarize_and_transcribe(
             audio_file=audio_file,
             cache_key=cache_key,
             use_cache=self.cache_manager.use_cache
@@ -512,17 +638,21 @@ class SmartDubbing:
         if translated_segments is None:
             # Start timing
             self.performance_tracker.start_timing("translation")
+            translator = self._require_translator()
             
-            if self.translator and self.translator.is_available():
-                translated_segments = self.translator.translate(
-                    segments=transcription,
-                    source_language=self.config.get('source_language'),
-                    target_language=self.config.get('target_language'),
-                    refinement_persona=self.config.get('refinement_persona', 'normal'),
-                    debug=self.debug_data
-                )
-            else:
+            if not translator.is_available():
                 raise ValueError("No translator available")
+
+            translated_segments = translator.translate(
+                segments=transcription,
+                source_language=self.config.get('source_language'),
+                target_language=self.config.get('target_language'),
+                refinement_persona=self.config.get('refinement_persona', 'normal'),
+                debug=self.debug_data,
+                debug_dir=self.config.get("translation_debug_dir"),
+                refinement_debug_dir=self.config.get("translation_refinement_debug_dir"),
+                timecodes_report_path=self.config.get("timecodes_report_path"),
+            )
             
             # Save results to cache
             self.cache_manager.save_to_cache(step_name, cache_key, translated_segments)
@@ -556,6 +686,22 @@ class SmartDubbing:
         
         logger.info("Analyzing speech emotions...")
         self.performance_tracker.start_timing("emotion_analysis")
+
+        try:
+            from speechbrain.inference.interfaces import foreign_class
+        except ModuleNotFoundError as exc:
+            if exc.name != "speechbrain":
+                raise
+
+            logger.warning(
+                "Skipping emotion analysis because optional dependency "
+                "'speechbrain' is unavailable. Install project requirements "
+                "or disable enable_emotion_analysis."
+            )
+            for segment in segments:
+                segment["emotion"] = "Neutral"
+            self.performance_tracker.end_timing("emotion_analysis")
+            return segments
         
         # Initialize the emotion classifier
         classifier = foreign_class(
@@ -583,12 +729,13 @@ class SmartDubbing:
                 end = int(segment["end"] * 1000)
                 
                 segment_audio = audio[start:end]
-                segment_audio.export("artifacts/audio/temp_segment.wav", format="wav")
+                temp_segment_path = self.config.get("temp_segment_audio_path")
+                segment_audio.export(temp_segment_path, format="wav")
                 
-                out_prob, score, index, text_lab = classifier.classify_file("artifacts/audio/temp_segment.wav")
+                out_prob, score, index, text_lab = classifier.classify_file(temp_segment_path)
                 segment["emotion"] = emotion_dict[text_lab[0]]
                 
-                os.remove("artifacts/audio/temp_segment.wav")
+                os.remove(temp_segment_path)
             except Exception as e:
                 logger.warning(f"Error analyzing emotion: {e}")
                 segment["emotion"] = "Neutral"
@@ -628,7 +775,7 @@ class SmartDubbing:
             # Copy the cached output audio
             cached_audio_path = self.cache_manager.get_cache_path(step_name) / f"{cache_key}.wav"
             if cached_audio_path.exists():
-                output_path = "artifacts/audio/output.wav"
+                output_path = self.config.get("translated_audio_path")
                 shutil.copy(cached_audio_path, output_path)
                 self.performance_tracker.end_timing("speech_synthesis")
                 return output_path
@@ -732,7 +879,7 @@ class SmartDubbing:
                 translation_hash = hashlib.md5(segment_dict["translation"].encode()).hexdigest()[:8]
                 voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
                 segment_cache_key = f"{base_cache_prefix}_{tts_system}_{i}_{speaker}_{translation_hash}_{voice_prompt_hash}"
-                current_segment_output_path = f"artifacts/audio_chunks/{i}.wav"
+                current_segment_output_path = str(self.audio_chunks_dir / f"{i}.wav")
                 os.makedirs(os.path.dirname(current_segment_output_path), exist_ok=True)
                 
                 segment_cached_file_path = segment_cache_path / f"{segment_cache_key}.wav"
@@ -764,33 +911,32 @@ class SmartDubbing:
                     "reference_audio_path": None,
                     "reference_text": None,
                     "voice": voice_name,
-                    "speed": 1.0
+                    "speed": 1.0,
+                    "target_duration": max(segment_dict["end"] - segment_dict["start"], 0.0),
                 }
+
+                tts_segment_data_args = self._apply_configured_reference_mapping(tts_segment_data_args, speaker)
                 
                 # Generic reference audio path for systems that might use it
-                potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"
-                if os.path.exists(potential_ref_audio_for_speaker):
+                potential_ref_audio_for_speaker = str(self.speakers_audio_dir / f"{speaker}.wav")
+                if not tts_segment_data_args["reference_audio_path"] and os.path.exists(potential_ref_audio_for_speaker):
                     tts_segment_data_args["reference_audio_path"] = potential_ref_audio_for_speaker
 
                 # Attempt to create a segment-specific reference audio clip when possible
-                segment_duration = segment_dict["end"] - segment_dict["start"]
-                if segment_reference_min_duration <= 0.0 or segment_duration >= segment_reference_min_duration:
+                if not tts_segment_data_args["reference_audio_path"]:
                     try:
                         if original_audio_segment is None:
                             original_audio_segment = AudioSegment.from_file(audio_file)
 
-                        start_ms = max(int(segment_dict["start"] * 1000), 0)
-                        end_ms = min(int(segment_dict["end"] * 1000), len(original_audio_segment))
-
-                        if end_ms > start_ms:
-                            segment_audio = original_audio_segment[start_ms:end_ms]
-
-                            if segment_reference_min_duration_ms == 0 or len(segment_audio) >= segment_reference_min_duration_ms:
-                                segment_ref_dir = Path("artifacts/speakers_audio/segments")
-                                segment_ref_dir.mkdir(parents=True, exist_ok=True)
-                                segment_ref_path = segment_ref_dir / f"{speaker}_{i}.wav"
-                                segment_audio.export(segment_ref_path, format="wav")
-                                tts_segment_data_args["reference_audio_path"] = str(segment_ref_path)
+                        tts_segment_data_args, original_audio_segment = self._attach_segment_reference(
+                            tts_segment_data_args=tts_segment_data_args,
+                            segment_dict=segment_dict,
+                            speaker=speaker,
+                            segment_index=i,
+                            original_audio_segment=original_audio_segment,
+                            segment_reference_min_duration=segment_reference_min_duration,
+                            segment_reference_min_duration_ms=segment_reference_min_duration_ms,
+                        )
                     except Exception as exc:
                         logger.warning(
                             f"Failed to create segment reference audio for segment {i+1} ({speaker}): {exc}"
@@ -1033,7 +1179,7 @@ class SmartDubbing:
         
         # Adjust timing and combine audio segments
         combined_audio, real_segment_positions = self._adjust_and_combine_audio_grouped(segments)
-        output_path = "artifacts/audio/output.wav"
+        output_path = self.config.get("translated_audio_path")
         combined_audio.export(output_path, format="wav")
         
         # Store real segment positions for later use in pause removal
@@ -1077,7 +1223,7 @@ class SmartDubbing:
         """Save transcription to a readable text file."""
         from src.utils.time_utils import format_seconds_to_hms
         
-        transcription_output_path = "artifacts/transcription.txt"
+        transcription_output_path = self.config.get("transcription_path")
         os.makedirs(os.path.dirname(transcription_output_path), exist_ok=True)
         
         try:
@@ -1107,8 +1253,8 @@ class SmartDubbing:
                         logger.warning(f"Warning: Error cleaning up {tts_system} TTS: {cleanup_e}")
             
             # Clean up temporary directories
-            for temp_dir in ["artifacts/audio_chunks", "artifacts/su_audio_chunks"]:
-                if os.path.exists(temp_dir):
+            for temp_dir in [self.audio_chunks_dir, self.su_audio_chunks_dir]:
+                if temp_dir.exists():
                     for temp_file in os.listdir(temp_dir):
                         if temp_file.startswith("temp_") or temp_file.startswith("group_"):
                             try:
@@ -1140,6 +1286,26 @@ class SmartDubbing:
         
         # Fall back to default TTS system
         return self.config.get('tts_system', 'coqui')
+
+    def _apply_configured_reference_mapping(self, tts_segment_data_args: Dict[str, Any], speaker: str) -> Dict[str, Any]:
+        """Apply manual per-speaker reference settings with priority over auto-generated references."""
+        audio_mapping = getattr(self, "reference_audio_mapping", None)
+        if audio_mapping is None:
+            audio_mapping = self.config.get("reference_audio_mapping") or {}
+
+        text_mapping = getattr(self, "reference_text_mapping", None)
+        if text_mapping is None:
+            text_mapping = self.config.get("reference_text_mapping") or {}
+
+        reference_audio_path = audio_mapping.get(speaker)
+        if reference_audio_path:
+            tts_segment_data_args["reference_audio_path"] = reference_audio_path
+
+        reference_text = text_mapping.get(speaker)
+        if reference_text:
+            tts_segment_data_args["reference_text"] = reference_text
+
+        return tts_segment_data_args
     
     def _calculate_percentage_deviation(self, ratio: float, min_ratio_comfort: float, max_ratio_comfort: float) -> float:
         """
@@ -1508,7 +1674,7 @@ class SmartDubbing:
                             segment_start_in_group_ms = len(combined_group_audio)
                     
                     # Load segment audio
-                    segment_file = segment.get('synthesized_speech_file', f"artifacts/audio_chunks/{segments.index(segment)}.wav")
+                    segment_file = segment.get('synthesized_speech_file', str(self.audio_chunks_dir / f"{segments.index(segment)}.wav"))
                     if os.path.exists(segment_file):
                         segment_audio = AudioSegment.from_file(segment_file)
                     else:
@@ -1539,8 +1705,8 @@ class SmartDubbing:
                 if abs(ratio_clamped - 1.0) > 0.01:
                     try:
                         # Save the combined group audio to a temporary file
-                        tmp_in = f"artifacts/audio_chunks/group_{speaker}_{group_idx}.wav"
-                        tmp_out = f"artifacts/su_audio_chunks/group_{speaker}_{group_idx}.wav"
+                        tmp_in = str(self.audio_chunks_dir / f"group_{speaker}_{group_idx}.wav")
+                        tmp_out = str(self.su_audio_chunks_dir / f"group_{speaker}_{group_idx}.wav")
                         os.makedirs(os.path.dirname(tmp_out), exist_ok=True)
                         combined_group_audio.export(tmp_in, format="wav")
                         
@@ -1658,6 +1824,7 @@ class SmartDubbing:
             Path for the subtitle file in current working directory
         """
         input_file = Path(input_path)
+        project_dir = Path(self.config.get("project_dir"))
         # Base filenames for source and target
         source_lang = self.config.get('source_language')
         target_lang = self.config.get('target_language')
@@ -1667,12 +1834,12 @@ class SmartDubbing:
         # If names coincide, disambiguate with explicit prefixes
         if source_name == target_name:
             if subtitle_type == "original":
-                return f"source_{source_name}"
+                return str(project_dir / f"source_{source_name}")
             else:
-                return f"target_{target_name}"
+                return str(project_dir / f"target_{target_name}")
 
         # Default: use requested language-specific filename
-        return f"{input_file.stem}_{language}.srt"
+        return str(project_dir / f"{input_file.stem}_{language}.srt")
 
     def adjust_subtitle_timestamps(self, segments: List[Dict], pause_adjustments: List[Dict[str, float]]) -> List[Dict]:
         """Adjust subtitle timestamps based on pause adjustments from video processing.

@@ -1,97 +1,51 @@
-# Smart Dubbing Tool Configuration
+source_language: en
+target_language: be
+debug_info: false
+debug_diarize_only: false
+debug_tts: true
+whisper_model: large-v3
+keep_background: true
+no_cache: false
+remove_pauses: true
+normalize_audio: true
+dubbed_volume: 2
+use_two_pass_encoding: true
+tts_system: omnivoice
+segment_reference_min_duration: 2
+transcription_system: assemblyai
+translator_type: llm
+llm_provider: gemini
+llm_model_name: gemini-2.5-flash
+llm_temperature: 1
+refinement_llm_provider: gemini
+refinement_model_name: gemini-2.5-flash
+refinement_temperature: 1.8
+refinement_persona: normal
+save_original_subtitles: true
+save_translated_subtitles: true
+voice_auto_selection: true
+include_original_audio: true
+start_time: 0
+refinement_max_tokens: 0
+enable_emotion_analysis: false
+min_pause_duration: 3
+keyframe_buffer: 0.2
+background_volume: 0.762341
+group_overflow_tolerance: 1
+reference_audio_mapping:
+  SPEAKER_01: D:\CodexPRJ\DubbLM\speaker_reference_library\SPEAKER_01\reference.mp3
+  SPEAKER_02: D:\CodexPRJ\DubbLM\speaker_reference_library\SPEAKER_02\reference.mp3
+reference_text_mapping:
+  SPEAKER_01: Гаўніна нейкае... Савецкая ўлада моцна спрычынілася да знішчэння гэтага
+    горада і збудавала на яго месцы такі, як ёй. Увага..
+  SPEAKER_02: 'Такога спеву-сугалосся, што тут над рэчкаю панёсся, ніхто не зложыць,
+    не зайграе.
 
-#watermark_path: logo.png
+    Дарога праз масток ішла раз''езджаная, бітая і за млынам цяжка рвалася на ўзгорак,
+    адразу ж за самотнымі спарышамі ўзбярэжных алешын.
 
-# Required parameters (input must be provided via CLI --input)
-source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
-target_language: "be"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
+    Работа ў іх – з дошкі ў сшыткі перапісваць, не задаючы пытанняў і мазгі не ўключаючы.
 
-# Debug options
-debug_info: false  # Generate debug video with speaker labels and timing info
-debug_diarize_only: false  # Stop after diarization/transcription and generate debug video
-debug_tts: true  # Save rejected/silent attempts for TTS
+    Без гэтай з''явы пыл і дым пераносіліся б на вялікія адлегласці.
 
-# Audio/Video processing
-whisper_model: "large-v3"  # Whisper model size: tiny, base, small, medium, large, large-v3
-keep_background: true  # Preserve background music/sounds in output
-no_cache: false  # Disable caching (slower but fresh processing)
-remove_pauses: true  # Automatically shorten long silence periods
-normalize_audio: true  # Normalize audio volume for consistent output
-dubbed_volume: 2.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
-use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
-
-# Text-to-Speech settings
-tts_system: "bextts"  # TTS engine: coqui, openai, gemini, f5_tts, bextts
-tts_prompt_prefix: ""  # Global voice instruction prefix for all speakers
-segment_reference_min_duration: 2.0  # Minimum segment length (seconds) to export a dedicated reference clip
-
-# Transcription settings
-transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
-
-# Translation engine configuration
-translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
-llm_provider: "gemini"  # AI provider: gemini, openrouter
-llm_model_name: "gemini-2.5-pro"  # Specific model for translation
-llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
-
-# Translation refinement settings
-refinement_llm_provider: "gemini"  # AI provider for style refinement
-refinement_model_name: "gemini-2.5-pro"  # Model for translation polishing
-refinement_temperature: 1.8  # Refinement creativity level
-refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
-
-# Subtitle generation
-save_original_subtitles: true  # Generate .srt file with original language
-save_translated_subtitles: true  # Generate .srt file with translated text
-
-# Voice configuration
-# voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
-voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
-
-# Advanced audio processing
-# Optional: Preserve original audio for specific time ranges
-# keep_original_audio_ranges:
-#     - "00:00:00-00:00:40"  # Format: HH:MM:SS-HH:MM:SS or MM:SS-MM:SS or SS-SS
-#     - "00:01:18-00:01:30.500"
-#     - "00:01:38-00:01:48"
-#     - "00:03:49-00:04:35"
-#    - "0:10:00-0:10:20"  # Keep original from 10min to 10min 20s
-#    - "1:05-1:15"        # Keep original from 1min 5s to 1min 15s
-#    - "30-45"            # Keep original from 30s to 45s
-
-# Per-speaker voice mapping
-#voice_name:
-#  SPEAKER_A: "puck"
-#  SPEAKER_B: "iapetus"      # Assign specific voice to speaker A
-
-# Per-speaker voice style instructions
-#voice_prompt:
-#  SPEAKER_A: ""     # Voice characteristics for speaker 1
-#  SPEAKER_B: "Read aloud with the energy of a coach and the vision of a leader:"
-#  SPEAKER_C: "Read aloud in a warm and friendly tone:" # Voice characteristics for speaker 3
-
-# Per-speaker TTS engine assignment
-#tts_system_mapping:
-#  SPEAKER_00: "openai"   # Use OpenAI TTS for speaker 00
-#  SPEAKER_01: "gemini"   # Use Gemini TTS for speaker 01
-#  SPEAKER_02: "gemini"   # Use Gemini TTS for speaker 02
-
-# Wildcard TTS mapping (alternative approach)
-#tts_system_mapping:
-#  SPEAKER_00: "gemini"   # Specific assignment for speaker 00
-#  "*": "openai"          # Default TTS for all other speakers
-
-# Translation consistency dictionary
-#glossary:
-#  "AI": "ИИ"
-#  "Lex Fridman": "Алексей Федотов"
-#  "Linus Torvalds": "Линус Торвальдсов"
-#  "embedding": "эмбеддинг"
-#  "AGI": "ЭйДжиАй"
-# "ASI": "ЭйСиАй"
-#  "GPU": "GPU"
-#  "mixture of experts": "группа экспертов"
-#  "dense model": "монолитная модель"
-#  "sparse model": "разряженная модель"
-#  "mental model": "понимание"
-#  "Andrej Karpathy": "Андрей Капаты"
+    Іх ужо не было на праспекце, але горы смецця нікуды не падзеліся.'

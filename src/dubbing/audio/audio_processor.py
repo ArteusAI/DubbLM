@@ -5,9 +5,9 @@ import subprocess
 import shutil
 import json
 import re
+from pathlib import Path
 from typing import Optional
 from pydub import AudioSegment
-from audio_separator.separator import Separator
 
 from ..core.cache_manager import CacheManager
 from ..debug.performance_tracker import PerformanceTracker
@@ -19,7 +19,12 @@ logger = get_logger(__name__)
 class AudioProcessor:
     """Handles audio extraction and processing for the Smart Dubbing system."""
     
-    def __init__(self, cache_manager: CacheManager, performance_tracker: PerformanceTracker):
+    def __init__(
+        self,
+        cache_manager: Optional[CacheManager],
+        performance_tracker: PerformanceTracker,
+        artifacts_root: str = "artifacts",
+    ):
         """Initialize the audio processor.
         
         Args:
@@ -29,16 +34,25 @@ class AudioProcessor:
         self.cache_manager = cache_manager
         self.performance_tracker = performance_tracker
         self.total_duration = None
+        self.artifacts_root = Path(artifacts_root)
+        self.audio_dir = self.artifacts_root / "audio"
+        self.speakers_audio_dir = self.artifacts_root / "speakers_audio"
+        self.audio_chunks_dir = self.artifacts_root / "audio_chunks"
+        self.su_audio_chunks_dir = self.artifacts_root / "su_audio_chunks"
         
         # Create necessary directories
         self._setup_directories()
     
     def _setup_directories(self) -> None:
         """Setup required directories for audio processing."""
-        directories = ["artifacts/audio", "artifacts/speakers_audio", "artifacts/audio_chunks", "artifacts/su_audio_chunks"]
+        directories = [
+            self.audio_dir,
+            self.speakers_audio_dir,
+            self.audio_chunks_dir,
+            self.su_audio_chunks_dir,
+        ]
         for directory in directories:
-            if not os.path.exists(directory):
-                os.makedirs(directory, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
     
     def extract_audio(self, video_path: str, start_time: Optional[float] = None, 
                      duration: Optional[float] = None) -> str:
@@ -52,10 +66,14 @@ class AudioProcessor:
         Returns:
             Path to the extracted audio file
         """
+        if duration is not None and duration <= 0:
+            logger.warning("Ignoring non-positive extraction duration; extracting until the end of the input.")
+            duration = None
+
         # Start timing
         self.performance_tracker.start_timing("extract_audio")
         
-        audio_file = "artifacts/audio/source.wav"
+        audio_file = str(self.audio_dir / "source.wav")
         
         # Set the total duration first
         self._determine_video_duration(video_path, start_time, duration)
@@ -99,7 +117,9 @@ class AudioProcessor:
         # Otherwise, get the duration from ffmpeg
         try:
             duration_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-            full_duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+            full_duration = float(
+                subprocess.check_output(duration_cmd, shell=True).decode("utf-8", errors="replace").strip()
+            )
             
             # If we're processing a segment, calculate accordingly
             if start_time is not None:
@@ -125,48 +145,137 @@ class AudioProcessor:
         Returns:
             Path to the background audio file or None
         """
-        # Start timing
-        self.performance_tracker.start_timing("background_audio")
-        
-        if not voice_denoising:
-            # No processing needed
-            self.performance_tracker.end_timing("background_audio")
-            return None
-        
-        # Generate cache key
-        cache_key = self.cache_manager.generate_cache_key(
-            audio_file, "", "", ""  # Empty values for non-transcription cache
+        background_audio_path, _ = self.separate_background_and_vocals(
+            audio_file,
+            voice_denoising=voice_denoising,
         )
-        
-        step_name = "background_audio"
-        
-        # Check if results are cached (check for WAV file directly)
-        output_path = "artifacts/audio/background.wav"
-        if self.cache_manager.load_file_from_cache(step_name, cache_key, f"{cache_key}.wav", output_path):
-            logger.debug("Loading background audio from cache...")
-            self.performance_tracker.end_timing("background_audio")
-            return output_path
-        
-        logger.info("Extracting background audio...")
-        
-        # Initialize audio separator
-        separator = Separator()
-        separator.load_model(model_filename='2_HP-UVR.pth')
-        
-        # Separate vocals and background
-        output_file_paths = separator.separate(audio_file)[0]
-        
-        # Move the background audio to our audio directory
-        background_audio_path = "artifacts/audio/background.wav"
-        shutil.move(output_file_paths, background_audio_path)
-        
-        # Save to cache
-        self.cache_manager.save_file_to_cache(step_name, cache_key, background_audio_path, f"{cache_key}.wav")
-        
-        # End timing
-        self.performance_tracker.end_timing("background_audio")
-        
         return background_audio_path
+
+    def separate_background_and_vocals(
+        self,
+        audio_file: str,
+        voice_denoising: bool = True,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Split the source into background and vocal stems."""
+        self.performance_tracker.start_timing("background_audio")
+
+        if not voice_denoising:
+            self.performance_tracker.end_timing("background_audio")
+            return None, None
+
+        cache_key = self.cache_manager.generate_cache_key(
+            audio_file, "", "", ""
+        )
+        step_name = "background_audio"
+        background_audio_path = str(self.audio_dir / "background.wav")
+        vocals_audio_path = str(self.audio_dir / "vocals.wav")
+
+        if self.cache_manager:
+            cached_background = self.cache_manager.load_file_from_cache(
+                step_name,
+                cache_key,
+                f"{cache_key}_background.wav",
+                background_audio_path,
+            )
+            cached_vocals = self.cache_manager.load_file_from_cache(
+                step_name,
+                cache_key,
+                f"{cache_key}_vocals.wav",
+                vocals_audio_path,
+            )
+            if cached_background and cached_vocals:
+                logger.debug("Loading separated background/vocals from cache...")
+                self.performance_tracker.end_timing("background_audio")
+                return background_audio_path, vocals_audio_path
+
+        logger.info("Extracting background audio...")
+
+        try:
+            from audio_separator.separator import Separator
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"audio_separator", "audio_separator.separator"}:
+                raise
+
+            logger.warning(
+                "Skipping background audio extraction because optional dependency "
+                "'audio_separator' is unavailable. Install project requirements "
+                "or run the tool from the configured virtual environment to enable "
+                "keep_background."
+            )
+            self.performance_tracker.end_timing("background_audio")
+            return None, None
+
+        separator = Separator()
+        separator.load_model(model_filename="2_HP-UVR.pth")
+        separated_paths = self._flatten_separated_output(separator.separate(audio_file))
+        separated_background, separated_vocals = self._select_stem_paths(separated_paths)
+
+        if separated_background is None:
+            logger.warning("Background stem was not produced by the separator.")
+            self.performance_tracker.end_timing("background_audio")
+            return None, None
+
+        shutil.move(separated_background, background_audio_path)
+
+        if separated_vocals and os.path.abspath(separated_vocals) != os.path.abspath(vocals_audio_path):
+            shutil.move(separated_vocals, vocals_audio_path)
+        elif separated_vocals:
+            vocals_audio_path = separated_vocals
+        else:
+            vocals_audio_path = None
+
+        if self.cache_manager:
+            self.cache_manager.save_file_to_cache(
+                step_name, cache_key, background_audio_path, f"{cache_key}_background.wav"
+            )
+            if vocals_audio_path and os.path.exists(vocals_audio_path):
+                self.cache_manager.save_file_to_cache(
+                    step_name, cache_key, vocals_audio_path, f"{cache_key}_vocals.wav"
+                )
+
+        self.performance_tracker.end_timing("background_audio")
+        return background_audio_path, vocals_audio_path
+
+    def _flatten_separated_output(self, separated_output) -> list[str]:
+        """Flatten separator output into a plain list of file paths."""
+        flattened_paths: list[str] = []
+
+        def _collect(value) -> None:
+            if isinstance(value, str):
+                flattened_paths.append(value)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect(item)
+
+        _collect(separated_output)
+        return flattened_paths
+
+    def _select_stem_paths(self, separated_paths: list[str]) -> tuple[Optional[str], Optional[str]]:
+        """Pick background and vocal stems from separator outputs."""
+        background_path = None
+        vocals_path = None
+
+        for path in separated_paths:
+            stem_name = os.path.basename(path).lower()
+            if vocals_path is None and "vocal" in stem_name:
+                vocals_path = path
+            elif background_path is None and any(
+                marker in stem_name
+                for marker in ("instrument", "karaoke", "background", "no_vocals")
+            ):
+                background_path = path
+
+        if background_path is None and separated_paths:
+            background_path = separated_paths[0]
+
+        if vocals_path is None:
+            for path in separated_paths:
+                if path != background_path:
+                    vocals_path = path
+                    break
+
+        return background_path, vocals_path
     
     def normalize_audio(self, audio_path: str, mode: str = "gentle") -> str:
         """Apply audio normalization with configurable gentleness.
@@ -297,6 +406,8 @@ class AudioProcessor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
 
             # Parse JSON data enclosed in braces { ... }
@@ -364,7 +475,9 @@ class AudioProcessor:
                 check=True, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             
             # Only print stderr if it contains error messages that aren't just informational

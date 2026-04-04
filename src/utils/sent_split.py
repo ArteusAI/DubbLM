@@ -1,10 +1,31 @@
 import re
 from typing import List
 
-import nltk
-nltk.download("punkt_tab", quiet=True)
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize as _nltk_sent_tokenize
+except ModuleNotFoundError:
+    nltk = None
+    _nltk_sent_tokenize = None
 
-from nltk.tokenize import sent_tokenize
+
+def split_sentences(text: str) -> List[str]:
+    """Split text into sentences, preferring NLTK when available."""
+    text = text.strip()
+    if not text:
+        return []
+
+    if _nltk_sent_tokenize is not None:
+        try:
+            return _nltk_sent_tokenize(text)
+        except LookupError:
+            try:
+                nltk.download("punkt_tab", quiet=True)
+                return _nltk_sent_tokenize(text)
+            except Exception:
+                pass
+
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
 
 def greedy_sent_split(text: str, max_chunk_size: int) -> List[str]:
     """Greedily split *text* into chunks no longer than *max_chunk_size* characters.
@@ -51,7 +72,7 @@ def greedy_sent_split(text: str, max_chunk_size: int) -> List[str]:
         return chunks
 
     # Pass 1 – sentences
-    chunks = _greedy_pack(sent_tokenize(text))
+    chunks = _greedy_pack(split_sentences(text))
 
     # Pass 2 – commas / semicolons
     refined: List[str] = []

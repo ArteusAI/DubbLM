@@ -1,22 +1,25 @@
-import os
+from importlib import import_module
 from typing import Dict, Any, Union, Callable, Optional, Type
 
 from .tts_interface import TTSInterface
-from .f5_tts_wrapper import F5TTSWrapper
-from .openai_tts_wrapper import OpenAITTSWrapper
-from .gemini_tts_wrapper import GeminiTTSWrapper
-from .bextts_wrapper import BexTTSWrapper
-from .xtts_local_wrapper import XTTSLocalWrapper
 
-# Define available TTS providers
-TTS_PROVIDERS: Dict[str, Type[TTSInterface]] = {
-    "coqui": XTTSLocalWrapper,
-    "xtts": XTTSLocalWrapper,
-    "f5": F5TTSWrapper,
-    "openai": OpenAITTSWrapper,
-    "gemini": GeminiTTSWrapper,
-    "bextts": BexTTSWrapper,
+# Define available TTS providers.
+# Keep imports lazy so optional backends are only loaded when requested.
+TTS_PROVIDERS: Dict[str, tuple[str, str]] = {
+    "coqui": ("tts.xtts_local_wrapper", "XTTSLocalWrapper"),
+    "xtts": ("tts.xtts_local_wrapper", "XTTSLocalWrapper"),
+    "f5": ("tts.f5_tts_wrapper", "F5TTSWrapper"),
+    "openai": ("tts.openai_tts_wrapper", "OpenAITTSWrapper"),
+    "gemini": ("tts.gemini_tts_wrapper", "GeminiTTSWrapper"),
+    "bextts": ("tts.bextts_wrapper", "BexTTSWrapper"),
+    "omnivoice": ("tts.omnivoice_wrapper", "OmniVoiceWrapper"),
 }
+
+
+def _load_provider_class(provider_name: str) -> Type[TTSInterface]:
+    module_name, class_name = TTS_PROVIDERS[provider_name]
+    module = import_module(module_name)
+    return getattr(module, class_name)
 
 class TTSConfig:
     """Configuration for TTS factory."""
@@ -115,15 +118,17 @@ class TTSFactory:
             RuntimeError: If client creation or initialization fails.
         """
         provider_name_lower = config.provider.lower()
-        provider_class = TTS_PROVIDERS.get(provider_name_lower)
+        provider_spec = TTS_PROVIDERS.get(provider_name_lower)
         
         # This check is technically redundant if create_tts already validates,
         # but good for direct create_tts_client calls.
-        if not provider_class: 
+        if not provider_spec: 
             supported_providers = list(TTS_PROVIDERS.keys())
             raise ValueError(
                 f"Unsupported TTS provider: '{config.provider}'. Supported: {supported_providers}"
             )
+
+        provider_class = _load_provider_class(provider_name_lower)
 
         init_args = {}
         if config.model is not None:

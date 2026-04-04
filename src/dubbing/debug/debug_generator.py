@@ -16,19 +16,21 @@ logger = get_logger(__name__)
 class DebugGenerator:
     """Generates debug videos with comprehensive annotations for the Smart Dubbing system."""
     
-    def __init__(self):
+    def __init__(self, artifacts_root: str = "artifacts"):
         """Initialize the debug generator."""
         self.subtitle_manager = SubtitleManager()
+        self.debug_dir = Path(artifacts_root) / "debug"
     
     def generate_debug_video(self, 
                            video_path: str,
                            debug_data: Dict[str, Any],
+                           debug_dir: Optional[str] = None,
                            start_time: Optional[float] = None,
                            duration: Optional[float] = None,
                            total_duration: Optional[float] = None) -> None:
         """Generate a debug video with comprehensive annotations."""
         logger.debug("Generating comprehensive debug video...")
-        debug_dir = "artifacts/debug"
+        debug_dir = debug_dir or str(self.debug_dir)
         os.makedirs(debug_dir, exist_ok=True)
         
         # Choose debug video method based on video duration
@@ -112,7 +114,9 @@ class DebugGenerator:
                 check=True, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except subprocess.CalledProcessError as e:
             error_output = e.stderr if e.stderr else "No error details available"

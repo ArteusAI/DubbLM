@@ -38,6 +38,16 @@ class DubbingConfig:
             'tts_system': 'coqui',
             'tts_model': None,
             'tts_fallback_model': None,
+            'omnivoice_space_id': 'archivartaunik/OmniVoice',
+            'omnivoice_api_name': '/_clone_fn',
+            'omnivoice_lang': 'Belarusian',
+            'omnivoice_num_steps': 32,
+            'omnivoice_guidance_scale': 2.0,
+            'omnivoice_denoise': True,
+            'omnivoice_speed': 1.0,
+            'omnivoice_duration': 3.0,
+            'omnivoice_preprocess_prompt': True,
+            'omnivoice_postprocess_output': True,
             'transcription_system': 'whisper',
             'translator_type': 'llm',
             'llm_provider': 'gemini',
@@ -57,6 +67,8 @@ class DubbingConfig:
             'save_translated_subtitles': False,
             'reference_audio': None,
             'reference_text': None,
+            'reference_audio_mapping': None,
+            'reference_text_mapping': None,
             'watermark_path': None,
             'watermark_text': None,
             'glossary': None,
@@ -87,7 +99,7 @@ class DubbingConfig:
     def load_from_yaml(self, config_path: str) -> None:
         """Load configuration from YAML file."""
         if config_path and os.path.exists(config_path):
-            with open(config_path, 'r') as config_file:
+            with open(config_path, 'r', encoding='utf-8') as config_file:
                 yaml_config = yaml.safe_load(config_file)
                 if yaml_config:
                     # Remove input from YAML config if present - it must come from CLI
@@ -136,17 +148,84 @@ class DubbingConfig:
                     for f in similar_files[:5]:  # Show first 5 files
                         logger.error(f"  - {f}")
             sys.exit(1)
+
+        input_path = Path(input_file)
+        project_dir = input_path.parent / input_path.stem
+        artifacts_dir = project_dir / "artifacts"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        self.config["project_dir"] = str(project_dir)
+        self.config["artifacts_dir"] = str(artifacts_dir)
+        self.config["audio_artifacts_dir"] = str(artifacts_dir / "audio")
+        self.config["speakers_audio_dir"] = str(artifacts_dir / "speakers_audio")
+        self.config["audio_chunks_dir"] = str(artifacts_dir / "audio_chunks")
+        self.config["su_audio_chunks_dir"] = str(artifacts_dir / "su_audio_chunks")
+        self.config["debug_dir"] = str(artifacts_dir / "debug")
+        self.config["translation_debug_dir"] = str(artifacts_dir / "debug" / "translation")
+        self.config["translation_refinement_debug_dir"] = str(artifacts_dir / "debug" / "translation_refinement")
+        self.config["speaker_report_dir"] = str(artifacts_dir / "speaker_report")
+        self.config["translated_samples_dir"] = str(artifacts_dir / "translated_samples")
+        self.config["transcription_path"] = str(artifacts_dir / "transcription.txt")
+        self.config["timecodes_report_path"] = str(artifacts_dir / "timecodes.txt")
+        self.config["translated_audio_path"] = str(artifacts_dir / "audio" / "output.wav")
+        self.config["background_audio_path"] = str(artifacts_dir / "audio" / "background.wav")
+        self.config["debug_video_path"] = str(artifacts_dir / "debug" / "dubbing_debug.mp4")
+        self.config["temp_segment_audio_path"] = str(artifacts_dir / "audio" / "temp_segment.wav")
+        self.config["temp_final_audio_path"] = str(artifacts_dir / "audio" / "temp_final_for_pause_analysis.wav")
+        self.config["temp_video_with_cuts_path"] = str(artifacts_dir / "temp_video_with_cuts.mp4")
         
         # Generate output filename if not provided
         if not self.config.get('output'):
-            input_path = Path(self.config['input'])
             target_lang = self.config['target_language']
             output_filename = f"{input_path.stem}_{target_lang}{input_path.suffix}"
-            self.config['output'] = output_filename  # Save in current working directory
+            self.config['output'] = str(project_dir / output_filename)
             logger.info(f"Auto-generated output filename: {self.config['output']}")
+        else:
+            output_path = Path(self.config['output'])
+            if not output_path.suffix:
+                normalized_output_path = output_path.with_suffix(input_path.suffix)
+                self.config['output'] = str(normalized_output_path)
+                logger.info(
+                    "Added missing output extension '%s': %s",
+                    input_path.suffix,
+                    self.config['output'],
+                )
     
     def process_special_parameters(self) -> None:
         """Process special parameters that need parsing."""
+        def _parse_mapping_parameter(name: str) -> None:
+            value = self.config.get(name)
+            if isinstance(value, str):
+                try:
+                    parsed_value = json.loads(value)
+                    if isinstance(parsed_value, dict):
+                        self.config[name] = parsed_value
+                        logger.info(f"Parsed {name} from JSON: {parsed_value}")
+                    else:
+                        logger.warning(f"Warning: {name} must decode to a JSON object. Ignoring.")
+                        self.config[name] = None
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Warning: Could not parse {name} JSON '{value}': {e}. Ignoring.")
+                    self.config[name] = None
+            elif isinstance(value, dict):
+                logger.info(f"Using {name} from config: {value}")
+            else:
+                self.config[name] = None
+
+        duration = self.config.get('duration')
+        if duration is not None:
+            try:
+                duration_value = float(duration)
+                if duration_value <= 0:
+                    logger.info("Ignoring non-positive duration value; processing until the end of the file.")
+                    self.config['duration'] = None
+                else:
+                    self.config['duration'] = duration_value
+            except (TypeError, ValueError):
+                logger.warning("Warning: Invalid duration value. Ignoring it.")
+                self.config['duration'] = None
+
         # Process voice_name parameter
         voice_name = self.config['voice_name']
         if isinstance(voice_name, str) and ',' in voice_name and ':' in voice_name:
@@ -192,6 +271,9 @@ class DubbingConfig:
             logger.info(f"Using TTS system mapping from config: {tts_system_mapping}")
         else:
             self.config['tts_system_mapping'] = None
+
+        _parse_mapping_parameter('reference_audio_mapping')
+        _parse_mapping_parameter('reference_text_mapping')
 
         # Clamp group_overflow_tolerance to [0.0, 1.0]
         tol = self.config.get('group_overflow_tolerance')
@@ -246,10 +328,20 @@ class DubbingConfig:
         parser.add_argument('--start_time', type=float, help='Start time in seconds to begin processing')
         parser.add_argument('--duration', type=float, help='Duration in seconds to process')
         parser.add_argument('--no_cache', action='store_true', default=argparse.SUPPRESS, help='Disable caching of pipeline steps')
-        parser.add_argument('--tts_system', type=str, choices=['coqui', 'xtts', 'openai', 'f5_tts', 'gemini', 'bextts'], help='Text-to-speech system to use')
+        parser.add_argument('--tts_system', type=str, choices=['coqui', 'xtts', 'openai', 'f5_tts', 'gemini', 'bextts', 'omnivoice'], help='Text-to-speech system to use')
         parser.add_argument('--tts_model', type=str, help='Model name for the selected TTS provider')
         parser.add_argument('--tts_fallback_model', type=str, help='Fallback model name for the TTS provider (used by Gemini)')
-        parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx'], help='Transcription system to use')
+        parser.add_argument('--omnivoice_space_id', type=str, help='Hugging Face Space ID for OmniVoice')
+        parser.add_argument('--omnivoice_api_name', type=str, help='Gradio API endpoint for OmniVoice synthesis')
+        parser.add_argument('--omnivoice_lang', type=str, help='Language setting for OmniVoice (default: Belarusian)')
+        parser.add_argument('--omnivoice_num_steps', type=int, help='Number of OmniVoice generation steps')
+        parser.add_argument('--omnivoice_guidance_scale', type=float, help='Guidance scale for OmniVoice synthesis')
+        parser.add_argument('--omnivoice_denoise', type=lambda x: (str(x).lower() == 'true'), help='Enable OmniVoice denoising (True/False)')
+        parser.add_argument('--omnivoice_speed', type=float, help='Default speaking speed for OmniVoice synthesis')
+        parser.add_argument('--omnivoice_duration', type=float, help='Default OmniVoice duration control value')
+        parser.add_argument('--omnivoice_preprocess_prompt', type=lambda x: (str(x).lower() == 'true'), help='Enable OmniVoice prompt preprocessing (True/False)')
+        parser.add_argument('--omnivoice_postprocess_output', type=lambda x: (str(x).lower() == 'true'), help='Enable OmniVoice audio postprocessing (True/False)')
+        parser.add_argument('--transcription_system', type=str, choices=['whisper', 'openai', 'pyannote_openai', 'whisperx', 'assemblyai'], help='Transcription system to use')
         parser.add_argument('--translator_type', type=str, choices=['llm'], help='Translator type to use')
         parser.add_argument('--llm_provider', type=str, choices=['gemini', 'openrouter'], help='LLM provider to use')
         parser.add_argument('--llm_model_name', type=str, help='Model name for the LLM')
@@ -267,6 +359,8 @@ class DubbingConfig:
         parser.add_argument('--save_translated_subtitles', action='store_true', default=argparse.SUPPRESS, help='Save translated language subtitles')
         parser.add_argument('--reference_audio', type=str, help='Path to a reference audio file for f5_tts system')
         parser.add_argument('--reference_text', type=str, help='Text corresponding to the reference audio for f5_tts system')
+        parser.add_argument('--reference_audio_mapping', type=str, help='JSON string mapping speakers to reference audio file paths')
+        parser.add_argument('--reference_text_mapping', type=str, help='JSON string mapping speakers to reference transcript text')
         parser.add_argument('--watermark_path', type=str, help='Path to the watermark PNG image')
         parser.add_argument('--watermark_text', type=str, help='Text to display under the watermark')
         parser.add_argument('--voice_auto_selection', type=lambda x: (str(x).lower() == 'true'), help='Enable automatic voice selection for TTS (True/False)')

@@ -15,13 +15,14 @@ logger = get_logger(__name__)
 class SpeakerReporter:
     """Generates speaker analysis reports for the Smart Dubbing system."""
     
-    def __init__(self, performance_tracker: PerformanceTracker):
+    def __init__(self, performance_tracker: PerformanceTracker, artifacts_root: str = "artifacts"):
         """Initialize the speaker reporter.
         
         Args:
             performance_tracker: Performance tracker instance
         """
         self.performance_tracker = performance_tracker
+        self.report_dir = Path(artifacts_root) / "speaker_report"
     
     def create_speaker_report(self, 
                             speaker_audio_paths: Dict[str, str], 
@@ -37,7 +38,7 @@ class SpeakerReporter:
         Returns:
             Tuple[str, str]: Path to the speaker report text file and path to the voice samples directory
         """
-        report_dir = Path("artifacts/speaker_report")
+        report_dir = self.report_dir
         samples_dir = report_dir / "voice_samples"
         
         report_dir.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,7 @@ import subprocess
 import json
 import tempfile
 import shutil
+from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
 from ..debug.performance_tracker import PerformanceTracker
@@ -17,13 +18,16 @@ logger = get_logger(__name__)
 class VideoProcessor:
     """Handles video processing for the Smart Dubbing system."""
     
-    def __init__(self, performance_tracker: PerformanceTracker):
+    def __init__(self, performance_tracker: PerformanceTracker, artifacts_root: str = "artifacts"):
         """Initialize the video processor.
         
         Args:
             performance_tracker: Performance tracker instance
         """
         self.performance_tracker = performance_tracker
+        self.artifacts_root = Path(artifacts_root)
+        self.audio_dir = self.artifacts_root / "audio"
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
     
     def _get_video_info(self, video_path: str) -> Dict[str, any]:
         """Get detailed video information including codec, bitrate, and other parameters.
@@ -39,7 +43,14 @@ class VideoProcessor:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_format', '-show_streams', video_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             info = json.loads(result.stdout)
             
             video_stream = None
@@ -139,7 +150,14 @@ class VideoProcessor:
                 'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1', video_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             return float(result.stdout.strip())
         except (subprocess.CalledProcessError, ValueError) as e:
             logger.error(f"Failed to get video duration for {video_path}: {e}")
@@ -155,7 +173,14 @@ class VideoProcessor:
                 '-af', f"silencedetect=noise=-30dB:duration={min_silence_duration}",
                 '-f', 'null', '-'
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
             
             stderr_output = result.stderr
             
@@ -200,7 +225,14 @@ class VideoProcessor:
                 '-of', 'csv=print_section=0', video_path
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             
             keyframes = []
             for line in result.stdout.strip().split('\n'):
@@ -334,7 +366,14 @@ class VideoProcessor:
                 cmd.append(batch_output_path)
                 
                 logger.debug(f"Executing FFmpeg concat: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=True,
+                )
             else:
                 # Check if we should use two-pass encoding
                 original_bitrate = video_info.get('video_bitrate')
@@ -386,7 +425,14 @@ class VideoProcessor:
                     cmd.append(batch_output_path)
 
                     logger.debug(f"Executing FFmpeg concat: {' '.join(cmd)}")
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=True,
+                    )
 
             if result.stderr and ('error' in result.stderr.lower() or 'fatal' in result.stderr.lower()):
                 logger.warning(f"FFmpeg warnings during concat operation: {result.stderr}")
@@ -511,7 +557,14 @@ class VideoProcessor:
                     final_cmd.append(output_path)
                     
                     logger.debug(f"Running final concat command: {' '.join(final_cmd)}")
-                    result = subprocess.run(final_cmd, capture_output=True, text=True, check=True)
+                    result = subprocess.run(
+                        final_cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=True,
+                    )
                 
                 if result.stderr and ('error' in result.stderr.lower() or 'fatal' in result.stderr.lower()):
                     logger.warning(f"FFmpeg warnings during final concatenation: {result.stderr}")
@@ -585,7 +638,7 @@ class VideoProcessor:
         logger.info("• Conservative re-encoding only when necessary")
         logger.info("• Original bitrate preservation when possible")
         
-        output_video_path = output_file if output_file else "artifacts/output_video.mp4"
+        output_video_path = output_file if output_file else str(self.artifacts_root / "output_video.mp4")
         # Ensure output directory exists
         output_dir = os.path.dirname(output_video_path)
         if output_dir:
@@ -593,7 +646,7 @@ class VideoProcessor:
 
         # Normalize audio volume if enabled
         if normalize_audio:
-            audio_processor = AudioProcessor(None, self.performance_tracker)  # Create temporary instance
+            audio_processor = AudioProcessor(None, self.performance_tracker, artifacts_root=str(self.artifacts_root))  # Create temporary instance
             normalized_translated_audio_path = audio_processor.normalize_audio(translated_audio_path)
         else:
             normalized_translated_audio_path = translated_audio_path
@@ -645,7 +698,7 @@ class VideoProcessor:
             # Get the watermark image dimensions
             try:
                 probe_cmd = f'ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "{watermark_path}"'
-                dimensions = subprocess.check_output(probe_cmd, shell=True).decode().strip()
+                dimensions = subprocess.check_output(probe_cmd, shell=True).decode("utf-8", errors="replace").strip()
                 if dimensions and 'x' in dimensions:
                     logo_width, logo_height = map(int, dimensions.split('x'))
                     logger.debug(f"Logo dimensions: {logo_width}x{logo_height}")
@@ -658,10 +711,11 @@ class VideoProcessor:
 
         # --- Start Filter Complex and Mapping Logic ---
         all_filter_complex_parts = []
-        video_map_option = "0:v"  # Default to original video stream (Input 0)
+        primary_video_stream = "0:v:0"
+        video_map_option = primary_video_stream  # Default to the primary video stream only
 
         # Optional upscaling and quality enhancement (applied before overlays/text)
-        current_video_label = "0:v"
+        current_video_label = primary_video_stream
         try:
             if upscale_factor and float(upscale_factor) > 1.0:
                 # Clamp factor to a reasonable range
@@ -686,12 +740,14 @@ class VideoProcessor:
                 video_map_option = current_video_label
         except Exception as _:
             # Fail-safe: ignore invalid upscale params
-            current_video_label = "0:v"
+            current_video_label = primary_video_stream
 
         # Watermark and text overlay filters (applied to video stream)
         if watermark_path and os.path.exists(watermark_path) or watermark_text:
             margin = 10
-            temp_video_input_label = current_video_label if current_video_label != "0:v" else "0:v"
+            temp_video_input_label = (
+                current_video_label if current_video_label != primary_video_stream else primary_video_stream
+            )
 
             if watermark_text:
                 logger.debug(f"Adding text caption: '{watermark_text}'")
@@ -775,7 +831,7 @@ class VideoProcessor:
             command.extend(["-map", "0:a:0"])
 
         # Determine if video needs re-encoding (filters/watermarks applied)
-        need_video_reencode = video_map_option != "0:v" or any(
+        need_video_reencode = video_map_option != primary_video_stream or any(
             part for part in all_filter_complex_parts if (
                 '[outv]' in part or 'drawtext' in part or 'overlay' in part or 'scale=' in part or 'zscale=' in part or 'unsharp' in part
             )
@@ -1016,7 +1072,9 @@ class VideoProcessor:
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
 
             # Only print stderr if it contains error messages that aren't just informational
@@ -1171,7 +1229,9 @@ class VideoProcessor:
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 
                 # Check if pass log file was created successfully
@@ -1194,7 +1254,9 @@ class VideoProcessor:
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 
                 logger.info("Two-pass encoding completed successfully")
@@ -1236,7 +1298,7 @@ class VideoProcessor:
         Returns:
             Path to temporary final audio file
         """
-        temp_audio_path = "artifacts/audio/temp_final_for_pause_analysis.wav"
+        temp_audio_path = str(self.audio_dir / "temp_final_for_pause_analysis.wav")
         
         try:
             # Build ffmpeg command to create final audio mix
@@ -1302,7 +1364,14 @@ class VideoProcessor:
             
             # Execute command
             logger.debug(f"Creating final audio for pause analysis: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             
             return temp_audio_path
             
@@ -1437,7 +1506,7 @@ class VideoProcessor:
         logger.info("Applying pause removal to both video and audio")
         
         # Create temporary video with cuts (without audio)
-        temp_video_path = "artifacts/temp_video_with_cuts.mp4"
+        temp_video_path = str(self.artifacts_root / "temp_video_with_cuts.mp4")
         
         # Create cuts command for video only
         cuts_cmd = ["ffmpeg", "-y"]
@@ -1465,7 +1534,14 @@ class VideoProcessor:
         # Execute video cuts command
         try:
             logger.debug(f"Creating video with cuts: {' '.join(cuts_cmd)}")
-            subprocess.run(cuts_cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cuts_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to create video cuts: {e.stderr}")
             return original_command, []
@@ -1486,7 +1562,14 @@ class VideoProcessor:
                             'ffprobe', '-v', 'quiet', '-select_streams', 'a:0',
                             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_file
                         ]
-                        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                        result = subprocess.run(
+                            probe_cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            check=True,
+                        )
                         if 'audio' in result.stdout:
                             # This is an audio file, create cut version
                             cut_audio_path = self._create_cut_audio_file(input_file, cuts_to_keep)
@@ -1578,7 +1661,14 @@ class VideoProcessor:
                 'ffprobe', '-v', 'quiet', '-print_format', 'json',
                 '-show_streams', '-select_streams', 'a:0', audio_path
             ]
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            probe_result = subprocess.run(
+                probe_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             audio_info = json.loads(probe_result.stdout)
             
             # Get audio stream properties
@@ -1613,7 +1703,14 @@ class VideoProcessor:
             cmd.append(cut_audio_path)
             
             logger.debug(f"Creating cut audio: {' '.join(cmd)}")
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             
             # Verify the created file is valid
             if os.path.exists(cut_audio_path) and os.path.getsize(cut_audio_path) > 0:

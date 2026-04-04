@@ -18,13 +18,17 @@ classifiers = [
     "License :: Other/Proprietary License",
     "Operating System :: OS Independent"
 ]
-dependencies = []
+dependencies = [
+    "json-repair==0.41.0",
+    "llama-index-llms-gemini==0.4.14",
+]
 
 [project.urls]
 Homepage = "https://github.com/ArteusAI/DubbLM"
 
 [project.scripts]
 dubblm = "dubbing.cli.main:main"
+dubblm-gradio = "dubbing.ui.gradio_app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

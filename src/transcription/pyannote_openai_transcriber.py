@@ -46,6 +46,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         whisper_model: str = "large-v3",
         transcription_system: str = "openai",
         cache_manager: Optional['CacheManager'] = None,
+        artifacts_root: str = "artifacts",
         **kwargs
     ):
         """
@@ -63,6 +64,13 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         self.whisper_model = whisper_model
         self.transcription_system = transcription_system
         self.cache_manager = cache_manager
+        self.artifacts_root = Path(artifacts_root)
+        self.segment_temp_dir = self.artifacts_root / "audio" / "segment_temp"
+        self.audio_chunks_dir = self.artifacts_root / "audio" / "chunks"
+        self.audio_temp_dir = self.artifacts_root / "audio" / "temp"
+        self.segment_temp_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_chunks_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_temp_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize OpenAI client if using OpenAI transcription
         if self.transcription_system == "openai":
@@ -224,7 +232,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         all_transcriptions = []
         
         # Create temp directory for segment audio files
-        temp_dir = Path("artifacts/audio/segment_temp")
+        temp_dir = self.segment_temp_dir
         temp_dir.mkdir(parents=True, exist_ok=True)
         
         # Process each speaker segment
@@ -299,7 +307,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             List of tuples containing (chunk_path, start_offset)
         """
         # Create output directory
-        os.makedirs("artifacts/audio/chunks", exist_ok=True)
+        os.makedirs(self.audio_chunks_dir, exist_ok=True)
         
         # Load audio file with pydub
         logger.debug(f"Loading audio file: {audio_file}")
@@ -311,7 +319,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         
         # If audio is shorter than target length, return it as is
         if len(audio) <= target_length_ms:
-            chunk_path = "artifacts/audio/chunks/chunk_0.wav"
+            chunk_path = str(self.audio_chunks_dir / "chunk_0.wav")
             audio.export(chunk_path, format="wav")
             return [(chunk_path, 0)]
             
@@ -333,7 +341,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         # If split_on_silence didn't find enough silence and returned just one block
         if len(blocks) <= 1:
             logger.info("Few silence points detected. Returning whole audio without chunking.")
-            chunk_path = "artifacts/audio/chunks/chunk_0.wav"
+            chunk_path = str(self.audio_chunks_dir / "chunk_0.wav")
             audio.export(chunk_path, format="wav")
             return [(chunk_path, 0)]
         
@@ -350,7 +358,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             # If adding this block would exceed the target length and we already have content
             if current_chunk_ms > 0 and current_chunk_ms + block_length_ms > target_length_ms:
                 # Export current chunk
-                chunk_path = f"artifacts/audio/chunks/chunk_{chunk_index}.wav"
+                chunk_path = str(self.audio_chunks_dir / f"chunk_{chunk_index}.wav")
                 current_chunk.export(chunk_path, format="wav")
                 # Store path, offset (using the offset calculated *before* this chunk) and duration
                 chunks.append((chunk_path, next_chunk_start_offset_ms / 1000.0, current_chunk_ms))
@@ -373,7 +381,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         
         # Add the last chunk if there's anything left
         if current_chunk_ms > 0:
-            last_chunk_path = f"artifacts/audio/chunks/chunk_{chunk_index}.wav"
+            last_chunk_path = str(self.audio_chunks_dir / f"chunk_{chunk_index}.wav")
             current_chunk.export(last_chunk_path, format="wav")
             chunks.append((last_chunk_path, next_chunk_start_offset_ms / 1000.0, current_chunk_ms))
         
@@ -410,7 +418,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
         # If we only have one chunk after processing, see if we can just use the original audio
         if len(chunks) == 1:
             logger.info("Only produced one chunk after processing, returning original audio")
-            chunk_path = "artifacts/audio/chunks/chunk_0.wav" 
+            chunk_path = str(self.audio_chunks_dir / "chunk_0.wav")
             audio.export(chunk_path, format="wav")
             return [(chunk_path, 0)]
         
@@ -694,7 +702,7 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             
             # Convert audio to 16kHz 64kbit MP3 before sending to API
             logger.debug("Converting audio to 16kHz 64kbit MP3 format...")
-            temp_dir = Path("artifacts/audio/temp")
+            temp_dir = self.audio_temp_dir
             temp_dir.mkdir(parents=True, exist_ok=True)
             
             # Create a temporary filename for the converted audio

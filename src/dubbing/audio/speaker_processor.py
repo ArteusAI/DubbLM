@@ -2,6 +2,7 @@
 
 import os
 import shutil
+from pathlib import Path
 from typing import Dict, List, Tuple
 from pydub import AudioSegment
 
@@ -15,7 +16,12 @@ logger = get_logger(__name__)
 class SpeakerProcessor:
     """Handles speaker audio extraction and processing for the Smart Dubbing system."""
     
-    def __init__(self, cache_manager: CacheManager, performance_tracker: PerformanceTracker):
+    def __init__(
+        self,
+        cache_manager: CacheManager,
+        performance_tracker: PerformanceTracker,
+        artifacts_root: str = "artifacts",
+    ):
         """Initialize the speaker processor.
         
         Args:
@@ -24,6 +30,12 @@ class SpeakerProcessor:
         """
         self.cache_manager = cache_manager
         self.performance_tracker = performance_tracker
+        self.artifacts_root = Path(artifacts_root)
+        self.speakers_audio_dir = self.artifacts_root / "speakers_audio"
+        self.translated_samples_dir = self.artifacts_root / "translated_samples"
+        self.audio_chunks_dir = self.artifacts_root / "audio_chunks"
+        self.speakers_audio_dir.mkdir(parents=True, exist_ok=True)
+        self.translated_samples_dir.mkdir(parents=True, exist_ok=True)
     
     def extract_speaker_audio(self, audio_file: str, speakers_rolls: Dict[Tuple[float, float], str]) -> Dict[str, str]:
         """Extract full audio tracks for each speaker, including all their segments.
@@ -45,7 +57,7 @@ class SpeakerProcessor:
         if self.cache_manager.cache_exists(step_name, cache_key):
             logger.debug("Loading speaker audio from cache...")
             # Copy cached speaker audio files to working directory
-            self.cache_manager.copy_cached_files(step_name, cache_key, "*.wav", "artifacts/speakers_audio")
+            self.cache_manager.copy_cached_files(step_name, cache_key, "*.wav", str(self.speakers_audio_dir))
             
             # Load the speaker audio paths dictionary
             speaker_audio_paths = self.cache_manager.load_from_cache(step_name, cache_key)
@@ -85,7 +97,7 @@ class SpeakerProcessor:
             if len(speaker_audio) > 60000:
                 speaker_audio = speaker_audio[:60000]
             
-            speaker_audio_path = f"artifacts/speakers_audio/{speaker}.wav"
+            speaker_audio_path = str(self.speakers_audio_dir / f"{speaker}.wav")
             speaker_audio.export(speaker_audio_path, format="wav")
             speaker_audio_paths[speaker] = speaker_audio_path
             
@@ -104,7 +116,12 @@ class SpeakerProcessor:
         
         return speaker_audio_paths
     
-    def save_translated_samples(self, segments: List[Dict], audio_file: str, synthesized_audio_dir: str = "artifacts/audio_chunks") -> None:
+    def save_translated_samples(
+        self,
+        segments: List[Dict],
+        audio_file: str,
+        synthesized_audio_dir: str | None = None,
+    ) -> None:
         """Save translated audio samples for each speaker with both original and translated text.
         
         Args:
@@ -115,8 +132,10 @@ class SpeakerProcessor:
         logger.debug("Saving translated samples for each speaker...")
         
         # Create a samples directory
-        samples_dir = "artifacts/translated_samples"
+        samples_dir = str(self.translated_samples_dir)
         os.makedirs(samples_dir, exist_ok=True)
+        if synthesized_audio_dir is None:
+            synthesized_audio_dir = str(self.audio_chunks_dir)
         
         # Group segments by speaker
         segments_by_speaker = {}

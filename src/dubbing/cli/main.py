@@ -63,11 +63,11 @@ def main():
         elif config.get('run_step') == 'combine_video':
             logger.info("Running only the 'combine_audio_with_video' step...")
             
-            expected_translated_audio = "artifacts/audio/output.wav"
+            expected_translated_audio = config.get('translated_audio_path')
             expected_background_audio = None
             
             if config.get('keep_background'):
-                expected_background_audio = "artifacts/audio/background.wav"
+                expected_background_audio = config.get('background_audio_path')
                 if not os.path.exists(expected_background_audio):
                     logger.warning(f"Expected background audio {expected_background_audio} not found. Proceeding without it.")
                     expected_background_audio = None

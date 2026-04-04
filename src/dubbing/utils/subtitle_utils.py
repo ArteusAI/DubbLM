@@ -2,10 +2,9 @@
 
 import os
 from typing import List, Dict
-from nltk.tokenize import sent_tokenize
 
 from src.utils.time_utils import format_seconds_to_srt, format_seconds_to_hms
-from src.utils.sent_split import greedy_sent_split
+from src.utils.sent_split import greedy_sent_split, split_sentences
 from src.dubbing.core.log_config import get_logger
 
 logger = get_logger(__name__)
@@ -41,7 +40,7 @@ class SubtitleManager:
             duration = end_time - start_time
             
             # Split text into sentences
-            sentences = sent_tokenize(text)
+            sentences = split_sentences(text)
             # Add a period at the end of each sentence if it doesn't already have ending punctuation
             for i in range(len(sentences)):
                 sentence = sentences[i].strip()
