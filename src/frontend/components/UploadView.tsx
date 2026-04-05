@@ -17,6 +17,18 @@ const VIDEO_QUALITY_OPTIONS: Array<{ value: VideoQualityPreset; label: string }>
   { value: 'original', label: 'Ultra - Original quality' },
 ];
 
+const EDITOR_REASONING_OPTIONS: Array<{
+  value: NonNullable<AppConfig['editorReasoningEffort']>;
+  label: string;
+}> = [
+  { value: 'none', label: 'None' },
+  { value: 'minimal', label: 'Minimal' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'XHigh' },
+];
+
 interface TimeRangeRow {
   id: string;
   start: string;
@@ -154,6 +166,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
     PRESETS.find(p => p.id === (config.preset || 'hq')) || PRESETS[1],
     [config.preset]
   );
+  const isEditorEnabled = config.enableLlmEditor ?? currentPreset.enableLlmEditor ?? false;
 
   const selectedTtsProvider = config.ttsSystem || currentPreset.ttsSystem;
   const providerVoices = useMemo(
@@ -365,6 +378,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                       llmProvider: (presetFromApi?.llmProvider as LlmProvider) ?? preset.llmProvider,
                       llmModelName: presetFromApi?.llmModelName ?? preset.llmModelName,
                       llmTemperature: presetFromApi?.llmTemperature ?? preset.llmTemperature,
+                      enableLlmEditor: presetFromApi?.enableLlmEditor ?? preset.enableLlmEditor,
+                      editorLlmProvider: (presetFromApi?.editorLlmProvider as LlmProvider | undefined) ?? preset.editorLlmProvider,
+                      editorModelName: presetFromApi?.editorModelName ?? preset.editorModelName,
+                      editorTemperature: presetFromApi?.editorTemperature ?? preset.editorTemperature,
+                      editorReasoningEffort: presetFromApi?.editorReasoningEffort ?? preset.editorReasoningEffort,
                       refinementLlmProvider: (presetFromApi?.refinementLlmProvider as LlmProvider | undefined) ?? preset.refinementLlmProvider,
                       refinementModelName: presetFromApi?.refinementModelName ?? preset.refinementModelName,
                       refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
@@ -666,6 +684,82 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           />
                         </div>
                       </div>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={isEditorEnabled}
+                          onChange={(e) => onConfigChange({ enableLlmEditor: e.target.checked })}
+                          className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                        />
+                        <span className="text-[10px] text-zinc-400">LLM Editor</span>
+                        <InfoTip text="Optional post-refinement editor pass. Ultra enables it by default and uses GPT-5.4 xhigh via OpenRouter when available." />
+                      </label>
+                      {isEditorEnabled && (
+                        <div className="space-y-2 rounded border border-zinc-800/60 bg-zinc-950/40 p-2">
+                          <h5 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Editor Settings</h5>
+                          <div className="grid grid-cols-4 gap-2">
+                            <div className="space-y-1">
+                              <label className="text-[10px] text-zinc-500 flex items-center">
+                                Provider
+                                <InfoTip text="AI provider for the optional editor pass" />
+                              </label>
+                              <select
+                                value={config.editorLlmProvider || currentPreset.editorLlmProvider || ''}
+                                onChange={(e) => onConfigChange({ editorLlmProvider: e.target.value as LlmProvider || undefined })}
+                                className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                              >
+                                <option value="">None</option>
+                                {LLM_PROVIDERS.map(p => (
+                                  <option key={p.id} value={p.id}>{p.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[10px] text-zinc-500 flex items-center">
+                                Model
+                                <InfoTip text="Model for the editor pass after refinement" />
+                              </label>
+                              <input
+                                type="text"
+                                value={config.editorModelName || currentPreset.editorModelName || ''}
+                                onChange={(e) => onConfigChange({ editorModelName: e.target.value || undefined })}
+                                className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                placeholder="openai/gpt-5.4"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[10px] text-zinc-500 flex items-center">
+                                Temp
+                                <InfoTip text="Editor creativity level 0.0-2.0" />
+                              </label>
+                              <input
+                                type="number"
+                                step="0.1"
+                                min="0"
+                                max="2"
+                                value={config.editorTemperature ?? currentPreset.editorTemperature ?? 1.0}
+                                onChange={(e) => onConfigChange({ editorTemperature: e.target.value === '' ? undefined : parseFloat(e.target.value) })}
+                                className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[10px] text-zinc-500 flex items-center">
+                                Reasoning
+                                <InfoTip text="Reasoning effort for editor-capable models" />
+                              </label>
+                              <select
+                                value={config.editorReasoningEffort ?? currentPreset.editorReasoningEffort ?? 'none'}
+                                onChange={(e) => onConfigChange({ editorReasoningEffort: e.target.value as AppConfig['editorReasoningEffort'] })}
+                                className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                              >
+                                {EDITOR_REASONING_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                       <div className="space-y-1">
                         <label className="text-[10px] text-zinc-500 flex items-center">
                           Translation Prompt Prefix

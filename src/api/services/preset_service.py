@@ -22,6 +22,11 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "llm_provider": "gemini",
         "llm_model_name": "gemini-flash-lite-latest",
         "llm_temperature": 0.5,
+        "enable_llm_editor": False,
+        "editor_llm_provider": "openrouter",
+        "editor_model_name": "openai/gpt-5.4",
+        "editor_temperature": 1.0,
+        "editor_reasoning_effort": "xhigh",
         "tts_system": "openai",
         "tts_model": "gpt-4o-mini-tts",
         "tts_fallback_model": "gpt-4o-mini-tts",
@@ -43,6 +48,11 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "refinement_llm_provider": "gemini",
         "refinement_model_name": "gemini-2.5-pro",
         "refinement_temperature": 1.0,
+        "enable_llm_editor": False,
+        "editor_llm_provider": "openrouter",
+        "editor_model_name": "openai/gpt-5.4",
+        "editor_temperature": 1.0,
+        "editor_reasoning_effort": "xhigh",
         "tts_system": "gemini",
         "tts_model": "gemini-2.5-flash-preview-tts",
         "tts_fallback_model": "gemini-2.5-flash-preview-tts",
@@ -64,6 +74,11 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "refinement_llm_provider": "gemini",
         "refinement_model_name": "gemini-2.5-pro",
         "refinement_temperature": 1.0,
+        "enable_llm_editor": True,
+        "editor_llm_provider": "openrouter",
+        "editor_model_name": "openai/gpt-5.4",
+        "editor_temperature": 1.0,
+        "editor_reasoning_effort": "xhigh",
         "tts_system": "gemini",
         "tts_model": "gemini-2.5-pro-preview-tts",
         "tts_fallback_model": "gemini-2.5-pro-preview-tts",
@@ -89,6 +104,11 @@ CAMEL_TO_SNAKE_KEYS: Dict[str, str] = {
     "refinementLlmProvider": "refinement_llm_provider",
     "refinementModelName": "refinement_model_name",
     "refinementTemperature": "refinement_temperature",
+    "enableLlmEditor": "enable_llm_editor",
+    "editorLlmProvider": "editor_llm_provider",
+    "editorModelName": "editor_model_name",
+    "editorTemperature": "editor_temperature",
+    "editorReasoningEffort": "editor_reasoning_effort",
     "ttsSystem": "tts_system",
     "ttsModel": "tts_model",
     "ttsFallbackModel": "tts_fallback_model",
@@ -171,6 +191,21 @@ def _apply_ultra_openrouter_gate(preset: PresetType, config: Dict[str, Any]) -> 
     return gated
 
 
+def _apply_editor_openrouter_gate(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback editor OpenRouter settings when OPENROUTER_API_KEY is unavailable."""
+    if config.get("editor_llm_provider") != "openrouter":
+        return config
+
+    if get_api_key("openrouter"):
+        return config
+
+    gated = deepcopy(config)
+    gated["editor_llm_provider"] = gated.get("refinement_llm_provider") or gated.get("llm_provider")
+    gated["editor_model_name"] = gated.get("refinement_model_name") or gated.get("llm_model_name")
+    gated["editor_reasoning_effort"] = "none"
+    return gated
+
+
 def get_all_preset_configs() -> Dict[PresetType, Dict[str, Any]]:
     """Get all preset configs merged with optional YAML overrides."""
     merged = deepcopy(DEFAULT_PRESET_CONFIGS)
@@ -180,6 +215,7 @@ def get_all_preset_configs() -> Dict[PresetType, Dict[str, Any]]:
 
     for preset_name in list(merged.keys()):
         merged[preset_name] = _apply_ultra_openrouter_gate(preset_name, merged[preset_name])
+        merged[preset_name] = _apply_editor_openrouter_gate(merged[preset_name])
 
     return merged
 

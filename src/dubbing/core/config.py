@@ -48,6 +48,11 @@ class DubbingConfig:
             'refinement_temperature': 1.0,
             'refinement_max_tokens': None,
             'refinement_persona': 'normal',
+            'enable_llm_editor': False,
+            'editor_llm_provider': None,
+            'editor_model_name': None,
+            'editor_temperature': 1.0,
+            'editor_reasoning_effort': 'none',
             'translation_prompt_prefix': None,
             'enable_speaker_gender_inference': True,
             'speaker_metadata': None,
@@ -292,6 +297,11 @@ class DubbingConfig:
         parser.add_argument('--refinement_temperature', type=float, help='Temperature for refinement')
         parser.add_argument('--refinement_max_tokens', type=int, help='Maximum tokens for OpenRouter refinement')
         parser.add_argument('--refinement_persona', type=str, choices=['normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
+        parser.add_argument('--enable_llm_editor', type=lambda x: (str(x).lower() == 'true'), help='Enable an additional LLM editor pass after refinement (True/False)')
+        parser.add_argument('--editor_llm_provider', type=str, choices=['gemini', 'openrouter'], help='LLM provider to use for the optional editor pass')
+        parser.add_argument('--editor_model_name', type=str, help='Model name for the optional editor pass')
+        parser.add_argument('--editor_temperature', type=float, help='Temperature for the optional editor pass')
+        parser.add_argument('--editor_reasoning_effort', type=str, choices=['minimal', 'low', 'medium', 'high', 'xhigh', 'none'], help='Reasoning effort for the optional editor pass')
         parser.add_argument('--translation_prompt_prefix', type=str, help='Additional context to prepend to LLM translation prompts')
         parser.add_argument('--voice_name', type=str, help='Voice to use for TTS')
         parser.add_argument('--debug_info', action='store_true', default=argparse.SUPPRESS, help='Generate a debug video with speaker labels')

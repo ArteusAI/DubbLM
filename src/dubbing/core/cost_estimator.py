@@ -13,6 +13,9 @@ from src.translation.prompts import (
     REFINEMENT_PROMPTS,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
     TRANSLATION_PROMPT_TEMPLATE,
+    ALTERNATIVE_VERSIONS_FULL,
+    JSON_OUTPUT_FORMAT_FULL,
+    EDITOR_PASS_GUIDANCE_TEMPLATE,
 )
 
 
@@ -168,6 +171,35 @@ class CostEstimator:
             logger.warning(
                 "Skipping refinement translation cost estimation: %s", exc
             )
+
+        if self._config.get("enable_llm_editor"):
+            editor_provider = (
+                self._config.get("editor_llm_provider")
+                or refinement_provider
+            )
+            editor_model = (
+                self._config.get("editor_model_name")
+                or refinement_model
+            )
+            editor_encoding_model = (
+                editor_model or self._default_model_for_provider(editor_provider)
+            )
+            editor_prompt_tokens = (
+                chunk_count * self._get_editor_prompt_tokens(editor_encoding_model)
+            )
+            editor_input_tokens = estimated_tokens + editor_prompt_tokens
+            try:
+                self._tracker.estimate_translation_cost(
+                    editor_provider,
+                    editor_model,
+                    editor_input_tokens,
+                    estimated_tokens,
+                    expected_reasoning_tokens=estimated_tokens,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping editor translation cost estimation: %s", exc
+                )
 
     def _estimate_tts(self, duration_seconds: float, estimated_tokens: float) -> None:
         tts_system = (self._config.get("tts_system") or "").lower()
@@ -384,9 +416,46 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             "original_conversation_text": "",
             "next_chunk_context": "",
             "translated_conversation_text": "",
+            "alternative_versions_section": ALTERNATIVE_VERSIONS_FULL,
+            "json_output_format": JSON_OUTPUT_FORMAT_FULL,
         }
 
         prompt = template.format(**placeholder_values)
+        tokens = self._count_tokens(prompt, model_name)
+        self._prompt_token_cache[cache_key] = tokens
+        return tokens
+
+    def _get_editor_prompt_tokens(self, model_name: Optional[str]) -> int:
+        cache_key = f"editor::{self._config.get('refinement_persona', 'normal')}::{model_name}"
+        if cache_key in self._prompt_token_cache:
+            return self._prompt_token_cache[cache_key]
+
+        prompt = EDITOR_PASS_GUIDANCE_TEMPLATE.format(
+            target_language=self._config.get("target_language") or "target",
+            explained_terms_section="- none",
+            terms_to_explain_section="- API",
+            slot_payload="[]",
+        )
+        prompt += "\n\n" + REFINEMENT_PROMPTS.get(
+            self._config.get("refinement_persona", "normal"),
+            REFINEMENT_PROMPTS["normal"],
+        ).format(
+            domain="general",
+            tone="neutral",
+            themes="",
+            terminology="",
+            source_language=self._config.get("source_language") or "source",
+            target_language=self._config.get("target_language") or "target",
+            dialogue_summary="",
+            glossary_section="",
+            previous_chunk_context="",
+            original_conversation_text="",
+            next_chunk_context="",
+            translated_conversation_text="",
+            alternative_versions_section=ALTERNATIVE_VERSIONS_FULL,
+            json_output_format=JSON_OUTPUT_FORMAT_FULL,
+        )
+
         tokens = self._count_tokens(prompt, model_name)
         self._prompt_token_cache[cache_key] = tokens
         return tokens

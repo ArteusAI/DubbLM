@@ -37,6 +37,11 @@ class ProjectConfig(BaseModel):
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
+    enableLlmEditor: Optional[bool] = None
+    editorLlmProvider: Optional[str] = None
+    editorModelName: Optional[str] = None
+    editorTemperature: Optional[float] = None
+    editorReasoningEffort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "none"]] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
     enableSpeakerGenderInference: Optional[bool] = True
@@ -86,6 +91,11 @@ class ProjectConfigUpdate(BaseModel):
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
+    enableLlmEditor: Optional[bool] = None
+    editorLlmProvider: Optional[str] = None
+    editorModelName: Optional[str] = None
+    editorTemperature: Optional[float] = None
+    editorReasoningEffort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "none"]] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
     enableSpeakerGenderInference: Optional[bool] = None

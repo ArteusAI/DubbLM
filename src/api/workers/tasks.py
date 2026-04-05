@@ -49,6 +49,28 @@ def get_video_quality_preset(config_data: Dict[str, Any], preset_config: Dict[st
     return "original"
 
 
+def _resolve_editor_runtime_config(config_data: Dict[str, Any], preset_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve editor settings with OpenRouter fallback when the API key is unavailable."""
+    resolved = {
+        "enable_llm_editor": config_data.get("enableLlmEditor"),
+        "editor_llm_provider": config_data.get("editorLlmProvider") or preset_config.get("editor_llm_provider"),
+        "editor_model_name": config_data.get("editorModelName") or preset_config.get("editor_model_name"),
+        "editor_temperature": config_data.get("editorTemperature") if config_data.get("editorTemperature") is not None else preset_config.get("editor_temperature", 1.0),
+        "editor_reasoning_effort": config_data.get("editorReasoningEffort") or preset_config.get("editor_reasoning_effort"),
+    }
+    if resolved["enable_llm_editor"] is None:
+        resolved["enable_llm_editor"] = preset_config.get("enable_llm_editor", False)
+
+    if resolved["editor_llm_provider"] == "openrouter" and not get_api_key("openrouter"):
+        fallback_provider = config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider") or config_data.get("llmProvider") or preset_config.get("llm_provider")
+        fallback_model = config_data.get("refinementModelName") or preset_config.get("refinement_model_name") or config_data.get("llmModelName") or preset_config.get("llm_model_name")
+        resolved["editor_llm_provider"] = fallback_provider
+        resolved["editor_model_name"] = fallback_model
+        resolved["editor_reasoning_effort"] = "none"
+
+    return resolved
+
+
 def _apply_api_keys(project_api_keys: Optional[Dict[str, str]] = None) -> None:
     """Apply API keys from settings and optionally project-specific overrides."""
     # First apply system-wide settings
@@ -386,6 +408,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             logger.info(f"[DEBUG TRANSCRIBE] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
+            editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
@@ -418,6 +441,11 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
                 "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
                 "llm_temperature": config_data.get("llmTemperature") if config_data.get("llmTemperature") is not None else preset_config["llm_temperature"],
+                "enable_llm_editor": editor_runtime["enable_llm_editor"],
+                "editor_llm_provider": editor_runtime["editor_llm_provider"],
+                "editor_model_name": editor_runtime["editor_model_name"],
+                "editor_temperature": editor_runtime["editor_temperature"],
+                "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
@@ -503,16 +531,20 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
 
             update_job_progress(job_id, 15, "translation", "Translating segments")
             
-            # Progress callback for translation and refinement
+            # Progress callback for translation, refinement, and optional editor
             # Before segments created: max 35%
-            # Translation: 15-25%, Refinement: 25-35%
+            # Translation: 15-22%, Refinement: 22-29%, Editor: 29-35%
             def translation_progress(phase: str, current: int, total: int, text: str = None):
                 if phase == "translation":
-                    progress = 15 + int((current / total) * 10)
+                    progress = 15 + int((current / total) * 7)
                     step_name = "translation"
                     message = f"Translating chunk {current}/{total}"
+                elif phase == "editor":
+                    progress = 29 + int((current / total) * 6)
+                    step_name = "editor"
+                    message = "Editing full refined translation"
                 else:  # refinement
-                    progress = 25 + int((current / total) * 10)
+                    progress = 22 + int((current / total) * 7)
                     step_name = "refinement"
                     message = f"Refining chunk {current}/{total}"
                 update_job_progress(job_id, progress, step_name, message, text=text)
@@ -606,6 +638,7 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             preset_config = get_preset_config(preset)
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
+            editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
 
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
@@ -631,6 +664,11 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
                 "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
                 "llm_temperature": config_data.get("llmTemperature") if config_data.get("llmTemperature") is not None else preset_config["llm_temperature"],
+                "enable_llm_editor": editor_runtime["enable_llm_editor"],
+                "editor_llm_provider": editor_runtime["editor_llm_provider"],
+                "editor_model_name": editor_runtime["editor_model_name"],
+                "editor_temperature": editor_runtime["editor_temperature"],
+                "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
@@ -688,11 +726,15 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
 
             def translation_progress(phase: str, current: int, total: int, text: str = None):
                 if phase == "translation":
-                    progress = 15 + int((current / total) * 10)
+                    progress = 15 + int((current / total) * 7)
                     step_name = "translation"
                     message = f"Re-translating chunk {current}/{total}"
+                elif phase == "editor":
+                    progress = 29 + int((current / total) * 6)
+                    step_name = "editor"
+                    message = "Editing full refined translation"
                 else:
-                    progress = 25 + int((current / total) * 10)
+                    progress = 22 + int((current / total) * 7)
                     step_name = "refinement"
                     message = f"Refining chunk {current}/{total}"
                 update_job_progress(job_id, progress, step_name, message, text=text)
@@ -807,6 +849,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             logger.info(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
+            editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
             max_output_height = VIDEO_QUALITY_MAX_HEIGHT[video_quality_preset]
             logger.info(f"[DEBUG DUB] videoQualityPreset: {video_quality_preset} -> max_output_height={max_output_height}")
             
@@ -846,6 +889,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
                 "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
                 "llm_temperature": config_data.get("llmTemperature") if config_data.get("llmTemperature") is not None else preset_config["llm_temperature"],
+                "enable_llm_editor": editor_runtime["enable_llm_editor"],
+                "editor_llm_provider": editor_runtime["editor_llm_provider"],
+                "editor_model_name": editor_runtime["editor_model_name"],
+                "editor_temperature": editor_runtime["editor_temperature"],
+                "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),

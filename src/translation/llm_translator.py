@@ -4,6 +4,7 @@ import json
 import os
 import hashlib
 import re
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 import math
@@ -21,6 +22,7 @@ from src.translation.prompts import (
     TRANSLATION_PROMPT_TEMPLATE,
     ALTERNATIVE_VERSIONS_FULL,
     ALTERNATIVE_VERSIONS_LONG_ONLY,
+    EDITOR_PASS_GUIDANCE_TEMPLATE,
     JSON_OUTPUT_FORMAT_FULL,
     JSON_OUTPUT_FORMAT_LONG_ONLY,
 )
@@ -64,7 +66,24 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-
+EditorReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "none"]
+EDITOR_SCHEMA_VERSION = "v1"
+DEFAULT_EDITOR_OPENROUTER_MODEL = "openai/gpt-5.4"
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
+EDITOR_REASONING_MIN_MAX_TOKENS: Dict[EditorReasoningEffort, int] = {
+    "none": 16384,
+    "minimal": 16384,
+    "low": 16384,
+    "medium": 24576,
+    "high": 32768,
+    "xhigh": 65536,
+}
+EDITOR_MODEL_MAX_OUTPUT_TOKENS: Dict[str, int] = {
+    "openai/gpt-5.4": 128000,
+    "gpt-5.4": 128000,
+    "openai/gpt-5.4-pro": 128000,
+    "gpt-5.4-pro": 128000,
+}
 class LLMTranslator(TranslationInterface):
     """
     Language Model-based translator implementing TranslationInterface.
@@ -91,6 +110,11 @@ class LLMTranslator(TranslationInterface):
         cost_tracker: Optional[Any] = None,
         enable_emotion_enrichment: bool = False,
         segment_stretch: str = "audio_and_video",
+        enable_llm_editor: bool = False,
+        editor_llm_provider: Optional[Literal["gemini", "openrouter"]] = None,
+        editor_model_name: Optional[str] = None,
+        editor_temperature: float = 1.0,
+        editor_reasoning_effort: Optional[EditorReasoningEffort] = None,
     ):
         """
         Initialize LLM translator.
@@ -133,6 +157,16 @@ class LLMTranslator(TranslationInterface):
         self.refinement_model_name = refinement_model_name or self.model_name
         self.refinement_temperature = refinement_temperature
         self.refinement_max_tokens = refinement_max_tokens or max_tokens
+        self.enable_llm_editor = bool(enable_llm_editor)
+        self.editor_llm_provider = editor_llm_provider or self.refinement_llm_provider
+        if editor_model_name:
+            self.editor_model_name = editor_model_name
+        elif self.editor_llm_provider == "openrouter":
+            self.editor_model_name = DEFAULT_EDITOR_OPENROUTER_MODEL
+        else:
+            self.editor_model_name = self.refinement_model_name
+        self.editor_temperature = editor_temperature
+        self.editor_reasoning_effort = self._normalize_editor_reasoning_effort(editor_reasoning_effort)
         
         # Initialize caching settings
         self.enable_cache = enable_cache
@@ -148,6 +182,7 @@ class LLMTranslator(TranslationInterface):
         
         self.llm = None
         self.refinement_llm = None
+        self.editor_llm = None
         self.cost_tracker = cost_tracker
         # Stores the most recent context information computed during translate()
         self.last_context_info = None
@@ -176,6 +211,134 @@ class LLMTranslator(TranslationInterface):
             self.last_speaker_metadata,
             speakers=speakers,
         )
+
+    @staticmethod
+    def _normalize_editor_reasoning_effort(
+        value: Optional[EditorReasoningEffort],
+    ) -> EditorReasoningEffort:
+        normalized = str(value or "none").strip().lower()
+        if normalized in {"", "null", "false"}:
+            return "none"
+        allowed = {"minimal", "low", "medium", "high", "xhigh", "none"}
+        return normalized if normalized in allowed else "none"
+
+    def _required_variant_keys(self) -> List[str]:
+        if self.segment_stretch in ("video", "audio_and_video"):
+            return ["long"]
+        return ["very_short", "short", "long"]
+
+    def _build_dialogue_text(self, items: List[Dict[str, Any]], text_key: str = "text") -> str:
+        lines = []
+        for item in items:
+            speaker = str(item.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
+            text = str(item.get(text_key, "") or "").strip()
+            lines.append(f"{speaker}: {text}")
+        return "\n".join(lines)
+
+    def _serialize_editor_slot_payload(self, segments: List[Dict[str, Any]]) -> str:
+        payload = []
+        for idx, segment in enumerate(segments, start=1):
+            payload.append(
+                {
+                    "slot": idx,
+                    "speaker": segment.get("speaker", "UNKNOWN"),
+                    "start": round(float(segment.get("start", 0.0) or 0.0), 3),
+                    "end": round(float(segment.get("end", 0.0) or 0.0), 3),
+                    "original_text": segment.get("text", ""),
+                    "translation": segment.get("translation", ""),
+                    "very_short_translation": segment.get("very_short_translation", ""),
+                    "short_translation": segment.get("short_translation", ""),
+                    "long_translation": segment.get("long_translation", ""),
+                }
+            )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _normalize_term_key(self, term: str) -> str:
+        return re.sub(r"[^a-z0-9.+_/#:-]+", "", term.strip().lower())
+
+    def _extract_ascii_terms(self, text: str) -> List[str]:
+        if not text:
+            return []
+        return re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:[._:/+#-][A-Za-z0-9]+)*\b", text)
+
+    def _extract_editor_term_candidates(
+        self,
+        segments: List[Dict[str, Any]],
+        context_info: Optional[Dict[str, Any]],
+    ) -> List[Tuple[str, str]]:
+        terminology_entries: Dict[str, str] = {}
+        for term in self.glossary.keys():
+            normalized = self._normalize_term_key(str(term))
+            if normalized:
+                terminology_entries.setdefault(normalized, str(term))
+
+        for term in (context_info or {}).get("terminology", []) or []:
+            normalized = self._normalize_term_key(str(term))
+            if normalized:
+                terminology_entries.setdefault(normalized, str(term))
+
+        ordered_terms: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        common_terms = {"a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "is"}
+
+        for segment in segments:
+            original_terms = {
+                self._normalize_term_key(term): term
+                for term in self._extract_ascii_terms(str(segment.get("text", "") or ""))
+            }
+            translated_terms = {
+                self._normalize_term_key(term): term
+                for term in self._extract_ascii_terms(str(segment.get("translation", "") or ""))
+            }
+            segment_candidates = set(original_terms).intersection(translated_terms)
+            segment_candidates.update(set(translated_terms).intersection(terminology_entries))
+            for normalized in sorted(segment_candidates):
+                if (
+                    not normalized
+                    or normalized in seen
+                    or len(normalized) <= 1
+                    or normalized in common_terms
+                ):
+                    continue
+                display = original_terms.get(normalized) or translated_terms.get(normalized) or terminology_entries.get(normalized)
+                if not display:
+                    continue
+                ordered_terms.append((normalized, display))
+                seen.add(normalized)
+
+        return ordered_terms
+
+    def _build_editor_batches(
+        self,
+        segments: List[Dict[str, Any]],
+        max_segments: int = 24,
+        max_chars: int = 6000,
+    ) -> List[List[Dict[str, Any]]]:
+        batches: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+        current_chars = 0
+
+        for segment in segments:
+            segment_chars = (
+                len(str(segment.get("text", "") or ""))
+                + len(str(segment.get("translation", "") or ""))
+                + len(str(segment.get("long_translation", "") or ""))
+            )
+            if current_batch and (
+                len(current_batch) >= max_segments
+                or current_chars + segment_chars > max_chars
+            ):
+                batches.append(current_batch)
+                current_batch = []
+                current_chars = 0
+
+            current_batch.append(segment)
+            current_chars += segment_chars
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     def _enrich_text_with_llm(
         self,
@@ -350,6 +513,15 @@ Rules:
             max_tokens=self.refinement_max_tokens,
             purpose="refinement"
         )
+
+        if self.enable_llm_editor and not self._editor_uses_direct_openrouter():
+            self.editor_llm = self._create_llm(
+                provider=self.editor_llm_provider,
+                model_name=self.editor_model_name,
+                temperature=self.editor_temperature,
+                max_tokens=self.refinement_max_tokens,
+                purpose="editor",
+            )
         
         # Initialize cache directory if caching is enabled
         if self.enable_cache:
@@ -428,6 +600,9 @@ Rules:
                 raise RuntimeError(f"Failed to initialize OpenRouter LLM for {purpose}: {str(e)}")
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}. Use 'gemini' or 'openrouter'.")
+
+    def _editor_uses_direct_openrouter(self) -> bool:
+        return self.enable_llm_editor and self.editor_llm_provider == "openrouter"
 
     def _count_tokens(self, model_name: Optional[str], text: Optional[str]) -> int:
         """Count tokens for usage billing, leveraging tiktoken when available."""
@@ -523,6 +698,14 @@ Rules:
                 for normalized_key in target_key:
                     if normalized_key:
                         token_data[normalized_key] = float(value)
+
+        if isinstance(llm_result, dict):
+            _update_from_dict(llm_result.get("usage"))
+            usage = llm_result.get("usage")
+            if isinstance(usage, dict):
+                _update_from_dict(usage.get("completion_tokens_details"))
+                _update_from_dict(usage.get("prompt_tokens_details"))
+            return token_data
 
         # additional_kwargs usually contains prompt/completion tokens
         additional_kwargs = getattr(llm_result, "additional_kwargs", None)
@@ -623,7 +806,9 @@ Rules:
         cache_data = (
             f"{chunk_text}|{source_language}|{target_language}|{self.llm_provider}|"
             f"{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}|"
-            f"{self.last_speaker_metadata_cache_signature}"
+            f"{self.last_speaker_metadata_cache_signature}|editor={int(self.enable_llm_editor)}|"
+            f"{self.editor_llm_provider}|{self.editor_model_name}|{self.editor_temperature}|{self.editor_reasoning_effort}|"
+            f"{EDITOR_SCHEMA_VERSION}"
         )
         # Create a hash of this data
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
@@ -773,6 +958,515 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             
             return combined_info
 
+    def _build_editor_prompt(
+        self,
+        batch_segments: List[Dict[str, Any]],
+        context_info: Dict[str, Any],
+        source_language: str,
+        target_language: str,
+        dialogue_summary: str,
+        explained_terms: Set[str],
+        previous_context_segments: Optional[List[Dict[str, Any]]] = None,
+        next_context_segments: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, List[Tuple[str, str]]]:
+        persona = self.refinement_persona if self.refinement_persona in REFINEMENT_PROMPTS else "normal"
+        base_prompt = REFINEMENT_PROMPTS[persona]
+
+        if self.segment_stretch in ("video", "audio_and_video"):
+            alternative_versions_section = ALTERNATIVE_VERSIONS_LONG_ONLY
+            json_output_format = JSON_OUTPUT_FORMAT_LONG_ONLY
+        else:
+            alternative_versions_section = ALTERNATIVE_VERSIONS_FULL
+            json_output_format = JSON_OUTPUT_FORMAT_FULL
+
+        glossary_section = ""
+        if self.glossary:
+            glossary_entries = "\n".join(
+                [f"- \"{term}\" -> \"{translation}\"" for term, translation in self.glossary.items()]
+            )
+            glossary_section = f"""
+# Translation glossary (MUST be followed. Adapt for grammar):
+<glossary>
+{glossary_entries}
+</glossary>
+"""
+
+        previous_chunk_context = ""
+        if previous_context_segments:
+            previous_chunk_context = (
+                "# Context from previous segment:\n"
+                f"{self._build_dialogue_text(previous_context_segments, 'translation')}\n\n"
+            )
+
+        next_chunk_context = ""
+        if next_context_segments:
+            next_chunk_context = (
+                "# Context from next segment:\n"
+                f"{self._build_dialogue_text(next_context_segments, 'translation')}\n\n"
+            )
+
+        original_conversation_text = self._build_dialogue_text(batch_segments, "text")
+        translated_conversation_text = self._build_dialogue_text(batch_segments, "translation")
+
+        explained_terms_section = (
+            "\n".join([f"- {term}" for term in sorted(explained_terms)])
+            if explained_terms
+            else "- none"
+        )
+        term_candidates = self._extract_editor_term_candidates(batch_segments, context_info)
+        terms_to_explain = [(normalized, display) for normalized, display in term_candidates if normalized not in explained_terms]
+        terms_to_explain_section = (
+            "\n".join([f"- {display}" for _, display in terms_to_explain])
+            if terms_to_explain
+            else "- none"
+        )
+
+        editor_guidance = EDITOR_PASS_GUIDANCE_TEMPLATE.format(
+            target_language=target_language,
+            explained_terms_section=explained_terms_section,
+            terms_to_explain_section=terms_to_explain_section,
+            slot_payload=self._serialize_editor_slot_payload(batch_segments),
+        )
+
+        prompt = base_prompt.format(
+            dialogue_summary=dialogue_summary or "No summary available.",
+            glossary_section=glossary_section,
+            domain=context_info.get("domain", "general"),
+            tone=context_info.get("tone", "neutral"),
+            themes=", ".join(context_info.get("themes", [])),
+            terminology=", ".join(context_info.get("terminology", [])),
+            previous_chunk_context=previous_chunk_context,
+            original_conversation_text=original_conversation_text,
+            next_chunk_context=next_chunk_context,
+            translated_conversation_text=translated_conversation_text,
+            source_language=source_language,
+            target_language=target_language,
+            alternative_versions_section=alternative_versions_section,
+            json_output_format=json_output_format,
+        )
+
+        speaker_grammar_section = self._build_speaker_grammar_section(
+            [str(segment.get("speaker", "") or "") for segment in batch_segments]
+        )
+        parts = [editor_guidance]
+        if speaker_grammar_section:
+            parts.append(
+                f"{speaker_grammar_section}\nUse speaker grammar metadata only for grammatical agreement and self-reference."
+            )
+        parts.append(prompt)
+        if self.prompt_prefix:
+            parts.insert(0, f"# Additional context (optional):\n{self.prompt_prefix}")
+
+        return "\n\n".join(parts), terms_to_explain
+
+    def _extract_openrouter_message_text(self, payload: Dict[str, Any]) -> str:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("OpenRouter response did not include choices.")
+        message = choices[0].get("message") or {}
+        usage_tokens = self._extract_usage_tokens(payload)
+        finish_reason = choices[0].get("finish_reason")
+        native_finish_reason = choices[0].get("native_finish_reason")
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                return content
+        if isinstance(content, list):
+            fragments: List[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    fragments.append(text)
+                    continue
+                if item.get("type") in {"output_text", "text"} and isinstance(item.get("content"), str):
+                    fragments.append(str(item["content"]))
+            if fragments:
+                return "".join(fragments)
+        detail = (
+            "OpenRouter response did not include text content. "
+            f"finish_reason={finish_reason!r}, "
+            f"native_finish_reason={native_finish_reason!r}, "
+            f"completion_tokens={usage_tokens.get('completion_tokens')!r}, "
+            f"reasoning_tokens={usage_tokens.get('reasoning_tokens')!r}, "
+            f"message_keys={sorted(message.keys()) if isinstance(message, dict) else []!r}"
+        )
+        if (
+            self._editor_uses_direct_openrouter()
+            and self.editor_reasoning_effort in {"high", "xhigh"}
+            and not usage_tokens.get("completion_tokens")
+        ):
+            detail += (
+                f". Likely zero-completion under reasoning effort={self.editor_reasoning_effort}; "
+                "increase max_tokens and inspect provider-side completion limits."
+            )
+        raise ValueError(detail)
+
+    def _estimate_editor_prompt_tokens(self, prompt: str) -> int:
+        try:
+            return max(self._count_tokens(self.editor_model_name, prompt), 0)
+        except Exception:
+            # Fallback heuristic: 1 token ~= 4 chars
+            return max(math.ceil(len(prompt) / 4), 0)
+
+    def _resolve_editor_model_output_cap(self) -> Optional[int]:
+        model_name = str(self.editor_model_name or "").strip().lower()
+        if not model_name:
+            return None
+        return EDITOR_MODEL_MAX_OUTPUT_TOKENS.get(model_name)
+
+    def _resolve_editor_openrouter_max_tokens(self, prompt: Optional[str] = None) -> int:
+        base_max_tokens = int(self.refinement_max_tokens or self.max_tokens or 16384)
+        if not self._editor_uses_direct_openrouter():
+            return base_max_tokens
+
+        prompt_budget = 0
+        if prompt:
+            prompt_budget = self._estimate_editor_prompt_tokens(prompt) * 4
+
+        desired_max_tokens = max(
+            base_max_tokens,
+            prompt_budget,
+            EDITOR_REASONING_MIN_MAX_TOKENS.get(self.editor_reasoning_effort, base_max_tokens),
+        )
+        model_output_cap = self._resolve_editor_model_output_cap()
+        if model_output_cap is not None:
+            return min(desired_max_tokens, model_output_cap)
+        return desired_max_tokens
+
+    def _complete_editor_prompt(self, prompt: str) -> Tuple[str, Any]:
+        if self._editor_uses_direct_openrouter():
+            openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not openrouter_api_key:
+                raise ValueError("OpenRouter API key not found in environment. Set OPENROUTER_API_KEY.")
+
+            prompt_tokens_estimate = self._estimate_editor_prompt_tokens(prompt)
+            editor_max_tokens = self._resolve_editor_openrouter_max_tokens(prompt)
+            model_output_cap = self._resolve_editor_model_output_cap()
+            logger.debug(
+                "Editor OpenRouter token budget: prompt_tokens_estimate=%s max_tokens=%s model_output_cap=%s reasoning_effort=%s",
+                prompt_tokens_estimate,
+                editor_max_tokens,
+                model_output_cap,
+                self.editor_reasoning_effort,
+            )
+            payload: Dict[str, Any] = {
+                "model": self.editor_model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": self.editor_temperature,
+                "max_tokens": editor_max_tokens,
+                "response_format": {"type": "json_object"},
+            }
+            if self.editor_reasoning_effort != "none":
+                payload["reasoning"] = {
+                    "effort": self.editor_reasoning_effort,
+                    "exclude": True,
+                }
+
+            response = requests.post(
+                OPENROUTER_CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {openrouter_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=180,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"OpenRouter editor request failed with status {response.status_code}: {response.text[:500]}"
+                )
+            payload_json = response.json()
+            response_text = self._extract_openrouter_message_text(payload_json).strip()
+            self._record_llm_cost(
+                "openrouter",
+                self.editor_model_name,
+                prompt,
+                response_text,
+                payload_json,
+            )
+            return response_text, payload_json
+
+        editor_llm = self.editor_llm or self.refinement_llm
+        if editor_llm is None:
+            raise RuntimeError("Editor LLM is not initialized.")
+
+        editor_response = editor_llm.complete(prompt)
+        if hasattr(editor_response, "text"):
+            response_text = editor_response.text.strip()
+        else:
+            response_text = str(editor_response).strip()
+
+        self._record_llm_cost(
+            self.editor_llm_provider,
+            self.editor_model_name,
+            prompt,
+            response_text,
+            editor_response,
+        )
+        return response_text, editor_response
+
+    def _validate_structured_translation_pairs(
+        self,
+        candidate_pairs: Any,
+        expected_speakers: List[str],
+        fallback_texts: List[str],
+        required_variant_keys: List[str],
+        phase_name: str,
+    ) -> Tuple[List[Dict[str, str]], List[str]]:
+        errors: List[str] = []
+        normalized_pairs: List[Dict[str, str]] = []
+
+        if not isinstance(candidate_pairs, list):
+            return [], [f"{phase_name}: 'translations' must be a list."]
+        if len(candidate_pairs) != len(expected_speakers):
+            return [], [
+                f"{phase_name}: expected {len(expected_speakers)} items, got {len(candidate_pairs)}."
+            ]
+
+        for idx, expected_speaker in enumerate(expected_speakers):
+            pair = candidate_pairs[idx]
+            fallback_text = fallback_texts[idx]
+            if not isinstance(pair, dict):
+                errors.append(f"{phase_name}: item {idx} is not an object.")
+                pair = {}
+
+            actual_speaker = str(pair.get("speaker", "") or "").strip()
+            if actual_speaker != expected_speaker:
+                errors.append(
+                    f"{phase_name}: item {idx} speaker mismatch (expected {expected_speaker}, got {actual_speaker or 'empty'})."
+                )
+
+            text = str(pair.get("text", "") or "").strip()
+            if not text:
+                errors.append(f"{phase_name}: item {idx} has empty text.")
+                text = fallback_text
+
+            normalized = {
+                "speaker": expected_speaker,
+                "text": text,
+            }
+            for variant_key in required_variant_keys:
+                variant_text = str(pair.get(variant_key, "") or "").strip()
+                if not variant_text:
+                    errors.append(f"{phase_name}: item {idx} missing '{variant_key}'.")
+                    variant_text = text
+                normalized[variant_key] = variant_text
+
+            normalized_pairs.append(normalized)
+
+        return normalized_pairs, errors
+
+    def _apply_pairs_to_segments(
+        self,
+        segments: List[Dict[str, Any]],
+        edited_pairs: List[Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        edited_segments: List[Dict[str, Any]] = []
+        for segment, pair in zip(segments, edited_pairs):
+            segment_copy = segment.copy()
+            segment_copy["speaker"] = segment.get("speaker", pair.get("speaker"))
+            segment_copy["translation"] = pair["text"]
+            if "very_short" in pair:
+                segment_copy["very_short_translation"] = pair["very_short"]
+            if "short" in pair:
+                segment_copy["short_translation"] = pair["short"]
+            if "long" in pair:
+                segment_copy["long_translation"] = pair["long"]
+            edited_segments.append(segment_copy)
+        return edited_segments
+
+    def _write_editor_debug_file(
+        self,
+        session_dir: Optional[str],
+        file_name: str,
+        prompt: str,
+        response_text: str,
+        validation_errors: List[str],
+    ) -> None:
+        if not session_dir:
+            return
+        try:
+            file_path = os.path.join(session_dir, file_name)
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write("=== PROMPT ===\n")
+                handle.write(prompt)
+                handle.write("\n\n=== RESPONSE ===\n")
+                handle.write(response_text)
+                handle.write("\n\n=== VALIDATION ===\n")
+                if validation_errors:
+                    handle.write("\n".join(validation_errors))
+                else:
+                    handle.write("OK")
+        except Exception as exc:
+            logger.error(f"Failed to write editor debug log: {exc}")
+
+    def _edit_batch_with_llm(
+        self,
+        batch_segments: List[Dict[str, Any]],
+        context_info: Dict[str, Any],
+        source_language: str,
+        target_language: str,
+        dialogue_summary: str,
+        explained_terms: Set[str],
+        previous_context_segments: Optional[List[Dict[str, Any]]] = None,
+        next_context_segments: Optional[List[Dict[str, Any]]] = None,
+        debug: bool = False,
+        session_dir: Optional[str] = None,
+        batch_label: str = "batch",
+    ) -> List[Dict[str, Any]]:
+        if not batch_segments:
+            return []
+
+        expected_speakers = [str(segment.get("speaker", "UNKNOWN")) for segment in batch_segments]
+        fallback_texts = [str(segment.get("translation", "") or "").strip() for segment in batch_segments]
+        required_variant_keys = self._required_variant_keys()
+        prompt, terms_to_explain = self._build_editor_prompt(
+            batch_segments,
+            context_info,
+            source_language,
+            target_language,
+            dialogue_summary,
+            explained_terms,
+            previous_context_segments=previous_context_segments,
+            next_context_segments=next_context_segments,
+        )
+
+        max_attempts = 4
+        last_response_text = ""
+        last_errors: List[str] = []
+        for attempt in range(max_attempts):
+            try:
+                response_text, _response_obj = self._complete_editor_prompt(prompt)
+                last_response_text = response_text
+                json_parser = json_repair or json
+                repaired_json = json_parser.loads(response_text)
+                if isinstance(repaired_json, dict):
+                    candidate_pairs = repaired_json.get("translations", [])
+                else:
+                    candidate_pairs = repaired_json
+
+                normalized_pairs, validation_errors = self._validate_structured_translation_pairs(
+                    candidate_pairs,
+                    expected_speakers,
+                    fallback_texts,
+                    required_variant_keys,
+                    phase_name="editor",
+                )
+                last_errors = validation_errors
+                if validation_errors:
+                    logger.warning(
+                        "Editor validation failed for %s attempt %s/%s: %s",
+                        batch_label,
+                        attempt + 1,
+                        max_attempts,
+                        "; ".join(validation_errors),
+                    )
+                    if debug:
+                        self._write_editor_debug_file(
+                            session_dir,
+                            f"{batch_label}_attempt_{attempt + 1}.txt",
+                            prompt,
+                            response_text,
+                            validation_errors,
+                        )
+                    continue
+
+                explained_terms.update({normalized for normalized, _display in terms_to_explain})
+                if debug:
+                    self._write_editor_debug_file(
+                        session_dir,
+                        f"{batch_label}_success.txt",
+                        prompt,
+                        response_text,
+                        [],
+                    )
+                return self._apply_pairs_to_segments(batch_segments, normalized_pairs)
+            except Exception as exc:
+                last_errors = [str(exc)]
+                logger.warning(
+                    "Editor call failed for %s attempt %s/%s: %s",
+                    batch_label,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+                if debug:
+                    self._write_editor_debug_file(
+                        session_dir,
+                        f"{batch_label}_attempt_{attempt + 1}.txt",
+                        prompt,
+                        last_response_text,
+                        last_errors,
+                    )
+
+        logger.error(
+            "Editor failed for %s after retries; falling back to pre-editor translation unchanged. Last errors: %s",
+            batch_label,
+            "; ".join(last_errors) if last_errors else "unknown",
+        )
+        return [segment.copy() for segment in batch_segments]
+
+    def _edit_segments_with_llm(
+        self,
+        segments: List[Dict[str, Any]],
+        context_info: Dict[str, Any],
+        source_language: str,
+        target_language: str,
+        dialogue_summary: str,
+        progress_callback: Optional[Any] = None,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        if not self.enable_llm_editor or not segments:
+            return segments
+
+        logger.info(
+            "Running optional LLM editor pass over full refined translation with provider=%s model=%s reasoning_effort=%s max_tokens_base=%s segment_count=%s",
+            self.editor_llm_provider,
+            self.editor_model_name,
+            self.editor_reasoning_effort,
+            self._resolve_editor_openrouter_max_tokens() if self._editor_uses_direct_openrouter() else self.refinement_max_tokens or self.max_tokens,
+            len(segments),
+        )
+
+        session_dir = None
+        if debug:
+            debug_dir = "artifacts/debug/translation_editor"
+            Path(debug_dir).mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            session_dir = os.path.join(debug_dir, f"editor_session_{timestamp}")
+            os.makedirs(session_dir, exist_ok=True)
+
+        explained_terms: Set[str] = set()
+        edited_segments = self._edit_batch_with_llm(
+            segments,
+            context_info,
+            source_language,
+            target_language,
+            dialogue_summary,
+            explained_terms,
+            previous_context_segments=None,
+            next_context_segments=None,
+            debug=debug,
+            session_dir=session_dir,
+            batch_label="full_translation",
+        )
+
+        if len(edited_segments) != len(segments):
+            logger.error(
+                "Editor pass changed segment count (%s != %s). Using pre-editor translations.",
+                len(edited_segments),
+                len(segments),
+            )
+            return [segment.copy() for segment in segments]
+
+        if progress_callback:
+            preview_text = edited_segments[0].get("translation", "") if edited_segments else ""
+            progress_callback("editor", 1, 1, preview_text)
+
+        return edited_segments
+
     def translate(
         self,
         segments: List[Dict],
@@ -879,7 +1573,20 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         # 7. Segment refined translations back to individual segments
         logger.debug("Decomposing refined translated chunks back to segment level...")
         translated_segments = self._segment_translations(refined_chunks)
-        
+
+        if self.enable_llm_editor:
+            translated_segments = self._edit_segments_with_llm(
+                translated_segments,
+                context_info=context_info,
+                source_language=source_language,
+                target_language=target_language,
+                dialogue_summary=source_summary,
+                progress_callback=kwargs.get("progress_callback"),
+                debug=kwargs.get("debug", self.debug),
+            )
+        else:
+            logger.debug("LLM editor disabled; skipping editor step.")
+
         # 8. Second optimization pass - larger chunks for final output
         if preserve_segment_boundaries:
             final_segments = translated_segments
@@ -1831,50 +2538,25 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     try:
                         # Parse JSON from LLM response
                         repaired_json = json_repair.loads(llm_response_text)
-                        refined_pairs = repaired_json.get("translations", [])
+                        if isinstance(repaired_json, dict):
+                            candidate_pairs = repaired_json.get("translations", [])
+                        else:
+                            candidate_pairs = repaired_json
 
-                        # Basic validation
-                        if not refined_pairs or not isinstance(refined_pairs, list):
-                            raise ValueError("Invalid or empty 'translations' array in response.")
-                        
-                        if len(refined_pairs) != len(all_translated_pairs):
-                            raise ValueError(f"Refined pairs count ({len(refined_pairs)}) does not match original pairs count ({len(all_translated_pairs)}).")
-
-                        # Validate individual pairs
-                        has_invalid_pairs = False
-                        for i, pair in enumerate(refined_pairs):
-                            if not isinstance(pair, dict) or "speaker" not in pair or "text" not in pair:
-                                logger.warning(f"Invalid refined pair structure at index {i}: {pair}")
-                                has_invalid_pairs = True
-                                # Attempt to fix by using original data
-                                refined_pairs[i] = all_translated_pairs[i] 
-                            elif pair["speaker"] != all_translated_pairs[i]["speaker"]:
-                                logger.warning(f"Speaker mismatch at index {i}. Expected {all_translated_pairs[i]['speaker']}, got {pair['speaker']}. Correcting.")
-                                refined_pairs[i]["speaker"] = all_translated_pairs[i]["speaker"] # Enforce original speaker
-                                has_invalid_pairs = True # Consider it invalid for retry logic
-                                
-                            # Validate alternative versions exist, or create fallbacks
-                            # In video/audio_and_video modes, only "long" is required
-                            skip_short_variants = self.segment_stretch in ("video", "audio_and_video")
-                            
-                            if not skip_short_variants:
-                                if "short" not in pair or not pair["short"]:
-                                    logger.debug(f"Missing 'short' version at index {i}. Using main text as fallback.")
-                                    refined_pairs[i]["short"] = pair.get("text", "")
-                                    has_invalid_pairs = True
-                                    
-                                if "very_short" not in pair or not pair["very_short"]:
-                                    logger.debug(f"Missing 'very_short' version at index {i}. Using main text as fallback.")
-                                    refined_pairs[i]["very_short"] = pair.get("text", "")
-                                    has_invalid_pairs = True
-
-                            if "long" not in pair or not pair["long"]:
-                                logger.debug(f"Missing 'long' version at index {i}. Using main text as fallback.")
-                                refined_pairs[i]["long"] = pair.get("text", "")
-                                has_invalid_pairs = True
-                            
-                        if has_invalid_pairs and attempt < max_attempts - 1:
-                            logger.warning(f"Invalid pairs found in refinement, retrying ({attempt+1}/{max_attempts})...")
+                        refined_pairs, validation_errors = self._validate_structured_translation_pairs(
+                            candidate_pairs,
+                            [pair["speaker"] for pair in all_translated_pairs],
+                            [pair["text"] for pair in all_translated_pairs],
+                            self._required_variant_keys(),
+                            phase_name="refinement",
+                        )
+                        if validation_errors and attempt < max_attempts - 1:
+                            logger.warning(
+                                "Invalid pairs found in refinement, retrying (%s/%s): %s...",
+                                attempt + 1,
+                                max_attempts,
+                                "; ".join(validation_errors),
+                            )
                             continue
 
                         # If we get here, refinement was successful
@@ -2187,9 +2869,25 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
     def is_available(self) -> bool:
         """Check if the LLM translator is available and properly initialized."""
         if self.llm_provider == "gemini":
-            return GEMINI_AVAILABLE and self.llm is not None and self.refinement_llm is not None
+            base_ready = GEMINI_AVAILABLE and self.llm is not None and self.refinement_llm is not None
         elif self.llm_provider == "openrouter":
-            return OPENROUTER_AVAILABLE and self.llm is not None and self.refinement_llm is not None
+            base_ready = OPENROUTER_AVAILABLE and self.llm is not None and self.refinement_llm is not None
+        else:
+            return False
+
+        if not base_ready:
+            return False
+
+        if not self.enable_llm_editor:
+            return True
+
+        if self._editor_uses_direct_openrouter():
+            return bool(os.environ.get("OPENROUTER_API_KEY"))
+
+        if self.editor_llm_provider == "gemini":
+            return GEMINI_AVAILABLE and self.editor_llm is not None
+        if self.editor_llm_provider == "openrouter":
+            return OPENROUTER_AVAILABLE and self.editor_llm is not None
         return False
         
     def _generate_timecodes_report(self, summary_json: Dict[str, Any], report_path: str = "artifacts/timecodes.txt") -> None:

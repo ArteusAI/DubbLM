@@ -60,6 +60,11 @@ class TranslatorFactory:
             cache_manager = kwargs.get("cache_manager")
 
             enable_emotion_enrichment = kwargs.get("enable_emotion_enrichment", False)
+            enable_llm_editor = kwargs.get("enable_llm_editor", False)
+            editor_llm_provider = kwargs.get("editor_llm_provider")
+            editor_model_name = kwargs.get("editor_model_name")
+            editor_temperature = kwargs.get("editor_temperature", 1.0)
+            editor_reasoning_effort = kwargs.get("editor_reasoning_effort")
             
             # Segment stretch mode for alternative version generation
             segment_stretch = kwargs.get("segment_stretch", "audio_and_video")
@@ -80,6 +85,11 @@ class TranslatorFactory:
                 cost_tracker=cost_tracker,
                 enable_emotion_enrichment=enable_emotion_enrichment,
                 segment_stretch=segment_stretch,
+                enable_llm_editor=enable_llm_editor,
+                editor_llm_provider=editor_llm_provider,
+                editor_model_name=editor_model_name,
+                editor_temperature=editor_temperature,
+                editor_reasoning_effort=editor_reasoning_effort,
             )
                 
             # Initialize the translator

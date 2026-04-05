@@ -27,6 +27,11 @@ export interface PresetConfig {
   llmProvider: LlmProvider;
   llmModelName: string;
   llmTemperature: number;
+  enableLlmEditor?: boolean;
+  editorLlmProvider?: LlmProvider;
+  editorModelName?: string;
+  editorTemperature?: number;
+  editorReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'none';
   refinementLlmProvider?: LlmProvider;
   refinementModelName?: string;
   refinementTemperature: number;
@@ -131,6 +136,11 @@ export interface AppConfig {
   llmProvider?: LlmProvider;
   llmModelName?: string;
   llmTemperature?: number;
+  enableLlmEditor?: boolean;
+  editorLlmProvider?: LlmProvider;
+  editorModelName?: string;
+  editorTemperature?: number;
+  editorReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'none';
   speakerTtsPrompts?: Record<string, string>;
   speakerVoiceMappings?: Record<string, string>;
   enableSpeakerGenderInference?: boolean;

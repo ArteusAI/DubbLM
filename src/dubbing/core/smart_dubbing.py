@@ -199,6 +199,11 @@ class SmartDubbing:
                 refinement_temperature=self.config.get('refinement_temperature', 1.0),
                 refinement_max_tokens=self.config.get('refinement_max_tokens'),
                 refinement_persona=self.config.get('refinement_persona', 'normal'),
+                enable_llm_editor=self.config.get('enable_llm_editor', False),
+                editor_llm_provider=self.config.get('editor_llm_provider'),
+                editor_model_name=self.config.get('editor_model_name'),
+                editor_temperature=self.config.get('editor_temperature', 1.0),
+                editor_reasoning_effort=self.config.get('editor_reasoning_effort'),
                 translation_prompt_prefix=self.config.get('translation_prompt_prefix'),
                 glossary=self.config.get('glossary'),
                 cache_manager=self.cache_manager,
@@ -826,9 +831,20 @@ class SmartDubbing:
             for speaker, metadata in sorted(normalized_speaker_metadata.items())
         )
         speaker_metadata_hash = hashlib.md5(speaker_metadata_signature.encode("utf-8")).hexdigest()[:10] if speaker_metadata_signature else "none"
+        editor_signature = hashlib.md5(
+            (
+                f"{int(bool(self.config.get('enable_llm_editor', False)))}|"
+                f"{self.config.get('editor_llm_provider') or 'default'}|"
+                f"{self.config.get('editor_model_name') or 'default'}|"
+                f"{self.config.get('editor_temperature', 1.0)}|"
+                f"{self.config.get('editor_reasoning_effort') or 'none'}|"
+                "editor_schema_v1"
+            ).encode("utf-8")
+        ).hexdigest()[:12]
         cache_key = (
             f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
             f"_{self.config.get('target_language')}_gender_{speaker_metadata_hash}_keep_{int(preserve_segment_boundaries)}"
+            f"_editor_{editor_signature}"
         )
         step_name = "translation"
         

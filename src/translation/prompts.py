@@ -347,3 +347,32 @@ Example 1 output:
 Example 2 output:
 {"translations":[{"speaker":"SPEAKER_A","text":"We start at nine.","long":"Alright, we start at nine."},{"speaker":"SPEAKER_B","text":"Perfect.","long":"Perfect, that works."}]}
 """
+
+
+EDITOR_PASS_GUIDANCE_TEMPLATE = """
+# Additional editor pass rules
+You are running a dedicated clarity-editing pass over an already translated dialogue.
+
+Editor-only goals:
+- You MAY redistribute meaning between nearby lines in the full dialogue if that improves clarity or makes the speakers' thoughts easier to follow.
+- You MAY rewrite sentences aggressively, including changing where information is expressed between consecutive replies.
+- You MUST keep the exact same number of output items and preserve the original speaker assigned to each slot.
+- You MUST keep each output line non-empty and natural for dubbing.
+- You MUST preserve all concrete facts, names, numbers, and technical details across the full dialogue.
+
+Untranslated term handling:
+- If an untranslated technical/product term appears for the first time in this full dialogue and is listed below, briefly give its meaning in {target_language} the first time it appears in the main "text" version.
+- After the first explained occurrence, later mentions may use the untranslated term without repeating the explanation unless needed for clarity.
+- Do not invent meanings. Use established target-language equivalents or a short explanatory gloss.
+
+Terms already explained earlier in the dialogue:
+{explained_terms_section}
+
+Terms that still need first-use explanation in this full dialogue:
+{terms_to_explain_section}
+
+Full dialogue slot data (order and speakers are fixed):
+<slot_payload>
+{slot_payload}
+</slot_payload>
+"""
