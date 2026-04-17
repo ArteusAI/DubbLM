@@ -67,7 +67,7 @@ except ImportError:
 logger = get_logger(__name__)
 
 EditorReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "none"]
-EDITOR_SCHEMA_VERSION = "v1"
+EDITOR_SCHEMA_VERSION = "v2"
 DEFAULT_EDITOR_OPENROUTER_MODEL = "openai/gpt-5.4"
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 EDITOR_REASONING_MIN_MAX_TOKENS: Dict[EditorReasoningEffort, int] = {
@@ -115,6 +115,8 @@ class LLMTranslator(TranslationInterface):
         editor_model_name: Optional[str] = None,
         editor_temperature: float = 1.0,
         editor_reasoning_effort: Optional[EditorReasoningEffort] = None,
+        tts_system: Optional[str] = None,
+        tts_system_mapping: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize LLM translator.
@@ -191,6 +193,13 @@ class LLMTranslator(TranslationInterface):
         self.enable_emotion_enrichment = enable_emotion_enrichment
         # Segment stretch mode: determines which alternative versions to generate
         self.segment_stretch = segment_stretch
+        self.tts_system = str(tts_system or "").strip().lower() or None
+        raw_tts_mapping = tts_system_mapping or {}
+        self.tts_system_mapping = {
+            str(speaker).strip(): str(system).strip().lower()
+            for speaker, system in raw_tts_mapping.items()
+            if str(speaker).strip() and str(system).strip()
+        }
 
     def set_speaker_metadata(self, speaker_metadata: Optional[Dict[str, Dict[str, Any]]]) -> None:
         """Persist speaker metadata for subsequent translation/refinement steps."""
@@ -238,10 +247,12 @@ class LLMTranslator(TranslationInterface):
     def _serialize_editor_slot_payload(self, segments: List[Dict[str, Any]]) -> str:
         payload = []
         for idx, segment in enumerate(segments, start=1):
+            speaker = str(segment.get("speaker", "UNKNOWN")).strip() or "UNKNOWN"
             payload.append(
                 {
                     "slot": idx,
-                    "speaker": segment.get("speaker", "UNKNOWN"),
+                    "speaker": speaker,
+                    "tts_system": self._resolve_tts_system_for_speaker(speaker),
                     "start": round(float(segment.get("start", 0.0) or 0.0), 3),
                     "end": round(float(segment.get("end", 0.0) or 0.0), 3),
                     "original_text": segment.get("text", ""),
@@ -252,6 +263,42 @@ class LLMTranslator(TranslationInterface):
                 }
             )
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _resolve_tts_system_for_speaker(self, speaker: Optional[str]) -> str:
+        speaker_id = str(speaker or "").strip()
+        if speaker_id and speaker_id in self.tts_system_mapping:
+            return self.tts_system_mapping[speaker_id]
+        if "*" in self.tts_system_mapping:
+            return self.tts_system_mapping["*"]
+        return self.tts_system or "unknown"
+
+    def _editor_tts_signature(self) -> str:
+        mapping_signature = ",".join(
+            f"{speaker}:{system}"
+            for speaker, system in sorted(self.tts_system_mapping.items())
+        )
+        return f"default={self.tts_system or 'unknown'}|mapping={mapping_signature}"
+
+    def _build_editor_tts_guidance(self, batch_segments: List[Dict[str, Any]]) -> str:
+        batch_tts_systems = {
+            self._resolve_tts_system_for_speaker(segment.get("speaker"))
+            for segment in batch_segments
+        }
+        if "gemini" not in batch_tts_systems:
+            return ""
+
+        return """
+# Gemini TTS delivery guidance
+- Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup directly in the output text.
+- Allowed Gemini-friendly markup includes emotion/style tags such as [happy], [sad], [angry], [surprised], [excited], [calm], [whispering], [shouting], [sarcasm], [sigh], [uhm].
+- You MAY also insert pause markers [short pause], [medium pause], or [long pause] where they sound natural and improve delivery.
+- Insert tags and pauses only where context clearly supports them. Subtlety is mandatory.
+- Do not decorate every line. Many lines should stay untagged.
+- Preserve the exact factual meaning and keep the text natural in the target language.
+- Avoid turning tags into standalone content. They should support delivery, not replace wording.
+- For non-Gemini slots, do not add markup tags or pause markers.
+- For very short variants, prefer fewer tags unless a tag or pause materially helps the delivery.
+""".strip()
 
     def _normalize_term_key(self, term: str) -> str:
         return re.sub(r"[^a-z0-9.+_/#:-]+", "", term.strip().lower())
@@ -392,6 +439,8 @@ Rules:
 - Preserve the original words and meaning; only add lightweight tags.
 - Keep length close to the input; avoid doubling length.
 - Use tags sparingly - they work best when text content already implies the emotion/style.
+- The input may already contain markup tags from an earlier editing step; preserve good existing tags, improve them when useful, and avoid duplicating or stacking near-identical tags.
+- If a pause or emotion tag is already present, you may reposition, replace, or remove it to make the delivery better, but do not blindly add more tags on top.
 - Do NOT use emotional adjectives like "scared" or "curious" as tags (they get vocalized as words).
 - Respect existing punctuation and speaker intent in {target_language}.
 - Return JSON with the same keys you received, enriched text as values.
@@ -808,7 +857,7 @@ Rules:
             f"{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}|"
             f"{self.last_speaker_metadata_cache_signature}|editor={int(self.enable_llm_editor)}|"
             f"{self.editor_llm_provider}|{self.editor_model_name}|{self.editor_temperature}|{self.editor_reasoning_effort}|"
-            f"{EDITOR_SCHEMA_VERSION}"
+            f"{self._editor_tts_signature() if self.enable_llm_editor else ''}|{EDITOR_SCHEMA_VERSION}"
         )
         # Create a hash of this data
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
@@ -1027,6 +1076,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             terms_to_explain_section=terms_to_explain_section,
             slot_payload=self._serialize_editor_slot_payload(batch_segments),
         )
+        editor_tts_guidance = self._build_editor_tts_guidance(batch_segments)
 
         prompt = base_prompt.format(
             dialogue_summary=dialogue_summary or "No summary available.",
@@ -1049,6 +1099,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             [str(segment.get("speaker", "") or "") for segment in batch_segments]
         )
         parts = [editor_guidance]
+        if editor_tts_guidance:
+            parts.append(editor_tts_guidance)
         if speaker_grammar_section:
             parts.append(
                 f"{speaker_grammar_section}\nUse speaker grammar metadata only for grammatical agreement and self-reference."

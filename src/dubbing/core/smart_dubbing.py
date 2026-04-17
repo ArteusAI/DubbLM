@@ -210,6 +210,8 @@ class SmartDubbing:
                 cost_tracker=self.cost_tracker,
                 enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
                 segment_stretch=self.config.get('segment_stretch', 'audio_and_video'),
+                tts_system=self.config.get('tts_system'),
+                tts_system_mapping=self.config.get('tts_system_mapping'),
             )
             if hasattr(self.translator, "set_speaker_metadata"):
                 self.translator.set_speaker_metadata(self.config.get("speaker_metadata"))

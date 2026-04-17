@@ -315,7 +315,9 @@ Guidelines:
 - Use pauses for natural rhythm and emphasis
 - Non-speech sounds should feel natural and contextually appropriate
 - DO NOT overuse tags - subtlety is key
-- Preserve the original text exactly, only add markup tags where appropriate
+- The input may already contain markup tags from an earlier editing step; keep useful existing tags, improve them if needed, and avoid duplicating or stacking similar tags
+- If a pause or emotion tag is already present, you may reposition, replace, or remove it to improve delivery, but do not blindly add more tags on top
+- Preserve the original text exactly, only add or adjust markup tags where appropriate
 
 {{context_section}}
 
