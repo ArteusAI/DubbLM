@@ -466,6 +466,9 @@ const getStatusInfo = (status: ProjectStatus, isUploading?: boolean, processStag
     if (stageLower.includes('refin')) {
       return { label: 'Refining', color: 'bg-teal-500/10 text-teal-400 border-teal-500/20' };
     }
+    if (stageLower.includes('editor')) {
+      return { label: 'Editing', color: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' };
+    }
   }
   
   switch (status) {

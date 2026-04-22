@@ -52,9 +52,11 @@ class ProjectConfig(BaseModel):
     translationPromptPrefix: Optional[str] = None
     ttsSystem: Optional[str] = None
     ttsModel: Optional[str] = None
+    ttsFallbackModel: Optional[str] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    enableContentValidation: Optional[bool] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None
@@ -106,9 +108,11 @@ class ProjectConfigUpdate(BaseModel):
     translationPromptPrefix: Optional[str] = None
     ttsSystem: Optional[str] = None
     ttsModel: Optional[str] = None
+    ttsFallbackModel: Optional[str] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    enableContentValidation: Optional[bool] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None

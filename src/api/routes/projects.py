@@ -65,6 +65,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             ttsPromptPrefix=config.get("ttsPromptPrefix"),
             voiceAutoSelection=config.get("voiceAutoSelection"),
             enableEmotionEnrichment=config.get("enableEmotionEnrichment"),
+            enableContentValidation=config.get("enableContentValidation"),
             # Audio settings
             dubbedVolume=config.get("dubbedVolume"),
             backgroundVolume=config.get("backgroundVolume"),

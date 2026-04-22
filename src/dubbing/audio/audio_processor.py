@@ -65,13 +65,24 @@ class AudioProcessor:
         self._determine_video_duration(video_path, start_time, duration)
         
         if start_time is not None or duration is not None:
-            # Extract only the specified segment using ffmpeg
-            ss_param = f"-ss {start_time}" if start_time is not None else ""
-            t_param = f"-t {duration}" if duration is not None else ""
-            
-            trim_cmd = f'ffmpeg -y {ss_param} -i "{video_path}" {t_param} -y -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_file}'
-            subprocess.run(trim_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
+            # Use argv form to avoid shell-quoting issues when video_path contains both
+            # quotes and apostrophes.
+            trim_cmd: list[str] = ["ffmpeg", "-y"]
+            if start_time is not None:
+                trim_cmd += ["-ss", str(start_time)]
+            trim_cmd += ["-i", str(video_path)]
+            if duration is not None:
+                trim_cmd += ["-t", str(duration)]
+            trim_cmd += ["-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_file]
+
+            result = subprocess.run(trim_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode != 0 or not os.path.exists(audio_file):
+                stderr_tail = result.stderr.decode(errors="replace")[-1000:]
+                raise RuntimeError(
+                    f"ffmpeg audio extraction failed (rc={result.returncode}) for "
+                    f"{video_path}: {stderr_tail}"
+                )
+
             start_str = f"from {start_time}s" if start_time is not None else "from beginning"
             duration_str = f"for {duration}s" if duration is not None else "to the end"
             logger.debug(f"Extracted audio segment {start_str} {duration_str} to {audio_file}")
@@ -102,8 +113,13 @@ class AudioProcessor:
             
         # Otherwise, get the duration from ffmpeg
         try:
-            duration_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{video_path}"'
-            full_duration = float(subprocess.check_output(duration_cmd, shell=True).decode().strip())
+            duration_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ]
+            full_duration = float(subprocess.check_output(duration_cmd).decode().strip())
             
             # If we're processing a segment, calculate accordingly
             if start_time is not None:

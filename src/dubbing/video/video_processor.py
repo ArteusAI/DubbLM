@@ -7,7 +7,7 @@ import tempfile
 import shutil
 import threading
 from typing import Optional, List, Tuple, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from ..debug.performance_tracker import PerformanceTracker
 from ..audio.audio_processor import AudioProcessor
@@ -105,6 +105,16 @@ class VideoProcessor:
             raise subprocess.CalledProcessError(
                 proc.returncode, cmd, output="", stderr=stderr_text
             )
+
+        # FFmpeg progress often stops slightly below 100% because the last
+        # reported out_time_us undershoots total_duration and we intentionally
+        # clamp intermediate updates below 100. Emit a final completion event
+        # after a successful exit so the UI progress bar reaches 100%.
+        if last_pct < 100:
+            if progress_callback:
+                progress_callback(100, 100, label)
+            if log_callback:
+                log_callback(f"{label}: 100%")
 
         return subprocess.CompletedProcess(
             cmd, proc.returncode, stdout="", stderr="".join(stderr_lines)
@@ -784,6 +794,7 @@ class VideoProcessor:
         video_path: str,
         speed_segments: List[Dict],
         output_path: str,
+        source_start_offset: float = 0.0,
         progress_callback: Optional[callable] = None,
         log_callback: Optional[callable] = None
     ) -> Tuple[str, List[Dict[str, float]]]:
@@ -797,6 +808,9 @@ class VideoProcessor:
             video_path: Path to original video
             speed_segments: List of dicts with keys: original_start, original_end, video_speed, use_minterpolate
             output_path: Path for output video
+            source_start_offset: Clip start offset in the source video. Speed segments are
+                expressed in the clipped timeline, so this offset must be added when
+                extracting frames from the full source video.
             progress_callback: Optional progress callback
             log_callback: Optional log callback
             
@@ -813,6 +827,7 @@ class VideoProcessor:
             return video_path, []
 
         log(f"Adjusting video speed ({len(speed_segments)} segments)...")
+        source_start_offset = max(0.0, float(source_start_offset or 0.0))
 
         # Get video info for quality settings
         video_info = self._get_video_info(video_path)
@@ -851,6 +866,17 @@ class VideoProcessor:
         if not valid_segments:
             log("No valid segments to process")
             return video_path, []
+
+        # Emit an initial progress event so the UI switches to a progress bar
+        # immediately. Without this, heavy minterpolate segments (scheduled
+        # first by LPT) can take many minutes to complete, leaving the
+        # frontend frozen on the last log line with no visible progress.
+        if progress_callback:
+            try:
+                progress_callback(0, len(valid_segments), "Video speed segment processing")
+            except Exception as cb_exc:
+                logger.debug(f"Initial video speed progress_callback failed: {cb_exc}")
+
         segment_meta_by_index = {seg["index"]: seg for seg in valid_segments}
         uses_minterpolate = any(
             seg["use_minterpolate"] and seg["video_speed"] < self.video_minterpolate_threshold
@@ -860,26 +886,82 @@ class VideoProcessor:
         target_output_fps_arg = f"{target_output_fps:.6f}"
         logger.info(f"Using stable CFR for speed segments: {target_output_fps:.2f} fps")
 
+        # x264 encoding is dominated by L3 cache + RAM bandwidth, not raw CPU.
+        # Beyond ~8 parallel single-threaded encoders we lose throughput: encoders
+        # thrash each other's caches, the page cache gets fragmented by disjoint
+        # -ss seeks into the source video, and peak RSS grows O(n_workers * buffer)
+        # which can exhaust RAM on big hosts (observed: 40 workers → 62G RAM + swap).
+        # Defaults: min(8, max(2, cpu//4)). Users can override via config.
         cpu_total = os.cpu_count() or 1
-        segment_workers = max(1, cpu_total - 1)
-        logger.info(f"Parallel video speed stretching: workers={segment_workers} (host_cpu={cpu_total})")
+        configured_workers = self.config.get("video_segment_workers")
+        if configured_workers:
+            segment_workers = max(1, int(configured_workers))
+        else:
+            segment_workers = max(2, min(8, cpu_total // 4))
+        segment_workers = min(segment_workers, max(1, len(valid_segments)))
+        logger.info(
+            f"Parallel video speed stretching: workers={segment_workers} "
+            f"(host_cpu={cpu_total}, configured={configured_workers or 'auto'})"
+        )
+
+        # Longest-Processing-Time-first scheduling: heavy segments start earlier so
+        # the pool tail contains only light work. Cost approximates output frames to
+        # encode; minterpolate is ~50x more expensive than plain encode.
+        def _estimate_segment_cost(seg: Dict[str, Any]) -> float:
+            duration = max(0.0, seg["original_end"] - seg["original_start"])
+            speed = max(0.01, seg["video_speed"])
+            output_duration = duration / speed
+            uses_mi = (
+                seg["use_minterpolate"]
+                and seg["video_speed"] < self.video_minterpolate_threshold
+            )
+            return output_duration * (50.0 if uses_mi else 1.0)
+
+        # minterpolate segments dominate total cost and contend heavily for L3/RAM
+        # when run in parallel. Run them strictly sequentially (first, so progress
+        # starts moving right away) with `-threads=cpu-1`, then handle the fast
+        # plain segments in parallel using the regular worker pool.
+        def _is_minterpolate(seg: Dict[str, Any]) -> bool:
+            return bool(
+                seg["use_minterpolate"]
+                and seg["video_speed"] < self.video_minterpolate_threshold
+            )
+
+        minterpolate_segments = sorted(
+            (s for s in valid_segments if _is_minterpolate(s)),
+            key=_estimate_segment_cost,
+            reverse=True,
+        )
+        plain_segments = sorted(
+            (s for s in valid_segments if not _is_minterpolate(s)),
+            key=_estimate_segment_cost,
+            reverse=True,
+        )
+        minterpolate_threads = max(1, cpu_total - 1)
+        logger.info(
+            f"Video speed stages: minterpolate={len(minterpolate_segments)} "
+            f"(sequential, threads={minterpolate_threads}), "
+            f"plain={len(plain_segments)} (parallel workers={segment_workers})"
+        )
 
         temp_dir = tempfile.mkdtemp(prefix="video_speed_segments_")
         segment_outputs: List[Tuple[int, str]] = []
         completed = 0
 
-        def process_segment(seg_meta: Dict[str, Any]) -> Tuple[int, str]:
+        def process_segment(seg_meta: Dict[str, Any], threads_count: int) -> Tuple[int, str]:
             seg_idx = seg_meta["index"]
             original_start = seg_meta["original_start"]
             original_end = seg_meta["original_end"]
+            source_original_start = original_start + source_start_offset
+            source_original_end = original_end + source_start_offset
             video_speed = seg_meta["video_speed"]
             use_minterpolate = seg_meta["use_minterpolate"]
 
             # Use coarse input seek to avoid decoding from the beginning for each segment.
             # Precision is preserved by applying exact trim on top of the seeked input.
-            input_seek = max(0.0, original_start - self.video_segment_seek_padding)
-            trim_start = max(0.0, original_start - input_seek)
-            trim_end = max(trim_start, original_end - input_seek)
+            input_seek = max(0.0, source_original_start - self.video_segment_seek_padding)
+            trim_start = max(0.0, source_original_start - input_seek)
+            trim_end = max(trim_start, source_original_end - input_seek)
 
             start_s = f"{trim_start:.6f}"
             end_s = f"{trim_end:.6f}"
@@ -887,13 +969,15 @@ class VideoProcessor:
             speed_is_unity = abs(video_speed - 1.0) < 0.001
             logger.debug(
                 "Segment %s seek plan: input_seek=%.6f, trim_start=%.6f, trim_end=%.6f, "
-                "original=[%.6f, %.6f], speed=%.4f",
+                "clip=[%.6f, %.6f], source=[%.6f, %.6f], speed=%.4f",
                 seg_idx,
                 input_seek,
                 trim_start,
                 trim_end,
                 original_start,
                 original_end,
+                source_original_start,
+                source_original_end,
                 video_speed,
             )
 
@@ -902,6 +986,9 @@ class VideoProcessor:
             if input_seek > 0:
                 segment_cmd.extend(["-ss", f"{input_seek:.6f}"])
             segment_cmd.extend(["-i", video_path])
+
+            threads_arg = max(1, int(threads_count))
+            threads_note = f", threads={threads_arg}" if threads_arg > 1 else ""
 
             if use_minterpolate and video_speed < self.video_minterpolate_threshold:
                 vf_parts = [
@@ -912,7 +999,7 @@ class VideoProcessor:
                 ]
                 logger.info(
                     f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
-                    f"speed={video_speed:.2f}x with minterpolate"
+                    f"speed={video_speed:.2f}x with minterpolate{threads_note}"
                 )
             elif speed_is_unity:
                 # Fast path for 1.0x segments: exact trim without speed transform.
@@ -920,13 +1007,19 @@ class VideoProcessor:
                     f"trim=start={start_s}:end={end_s}",
                     "setpts=PTS-STARTPTS",
                 ]
-                logger.info(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed=1.00x")
+                logger.info(
+                    f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
+                    f"speed=1.00x{threads_note}"
+                )
             else:
                 vf_parts = [
                     f"trim=start={start_s}:end={end_s}",
                     f"setpts={setpts_factor:.6f}*(PTS-STARTPTS)",
                 ]
-                logger.info(f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, speed={video_speed:.2f}x")
+                logger.info(
+                    f"Segment {seg_idx}: {original_start:.2f}-{original_end:.2f}s, "
+                    f"speed={video_speed:.2f}x{threads_note}"
+                )
             # Keep all rendered segments on one constant frame rate/timebase.
             vf_parts.append(f"fps=fps={target_output_fps_arg}")
             vf = ",".join(vf_parts)
@@ -934,7 +1027,7 @@ class VideoProcessor:
             segment_cmd.extend([
                 "-vf", vf,
                 "-an",
-                "-threads", "1",
+                "-threads", str(threads_arg),
                 "-vsync", "cfr",
                 "-r", target_output_fps_arg,
                 "-c:v", "libx264",
@@ -949,14 +1042,65 @@ class VideoProcessor:
             return seg_idx, segment_output
 
         try:
-            with ThreadPoolExecutor(max_workers=segment_workers) as executor:
-                futures = [executor.submit(process_segment, seg_meta) for seg_meta in valid_segments]
-                for future in as_completed(futures):
-                    seg_idx, seg_path = future.result()
-                    segment_outputs.append((seg_idx, seg_path))
-                    completed += 1
-                    if progress_callback:
-                        progress_callback(completed, len(valid_segments), "Video speed segment processing")
+            # Phase 1: minterpolate segments — sequentially, one ffmpeg at a time,
+            # each with near-full CPU via -threads=cpu-1. These are the heavy
+            # slow-motion renders; parallelizing them thrashes caches and only
+            # elongates the tail, so we front-load them.
+            for seg_meta in minterpolate_segments:
+                seg_idx, seg_path = process_segment(seg_meta, minterpolate_threads)
+                segment_outputs.append((seg_idx, seg_path))
+                completed += 1
+                if progress_callback:
+                    progress_callback(
+                        completed, len(valid_segments), "Video speed segment processing"
+                    )
+
+            # Phase 2: plain segments — parallel pool with adaptive thread budget.
+            # While the queue is deeper than the pool, every ffmpeg runs with
+            # -threads=1 (max parallelism). When the tail shrinks below the worker
+            # count, remaining tasks get leftover cores via -threads.
+            pending_segments = list(plain_segments)
+            in_flight_count = 0
+            state_lock = threading.Lock()
+
+            if pending_segments:
+                pool_size = min(segment_workers, len(pending_segments))
+                with ThreadPoolExecutor(max_workers=pool_size) as executor:
+                    in_flight_futures: set = set()
+
+                    def submit_one() -> None:
+                        nonlocal in_flight_count
+                        with state_lock:
+                            if not pending_segments:
+                                return
+                            seg_meta = pending_segments.pop(0)
+                            in_flight_count += 1
+                            remaining_total = len(pending_segments) + in_flight_count
+                            threads_budget = (
+                                1
+                                if remaining_total >= pool_size
+                                else max(1, pool_size // max(1, remaining_total))
+                            )
+                        future = executor.submit(process_segment, seg_meta, threads_budget)
+                        in_flight_futures.add(future)
+
+                    for _ in range(min(pool_size, len(pending_segments))):
+                        submit_one()
+
+                    while in_flight_futures:
+                        done_futures, _ = wait(in_flight_futures, return_when=FIRST_COMPLETED)
+                        for future in done_futures:
+                            in_flight_futures.discard(future)
+                            with state_lock:
+                                in_flight_count -= 1
+                            seg_idx, seg_path = future.result()
+                            segment_outputs.append((seg_idx, seg_path))
+                            completed += 1
+                            if progress_callback:
+                                progress_callback(
+                                    completed, len(valid_segments), "Video speed segment processing"
+                                )
+                            submit_one()
 
             segment_outputs.sort(key=lambda item: item[0])
 
@@ -1024,7 +1168,13 @@ class VideoProcessor:
                 output_path
             ]
             logger.debug(f"Concat FFmpeg command: {' '.join(concat_cmd)}")
-            subprocess.run(concat_cmd, capture_output=True, text=True, check=True)
+            self._run_ffmpeg_with_progress(
+                concat_cmd,
+                total_duration=cumulative_actual_time,
+                log_callback=log_callback,
+                progress_callback=progress_callback,
+                label="Encoding final stretched video",
+            )
 
             muxed_duration = self._get_video_duration(output_path)
             if muxed_duration > 0 and cumulative_actual_time > 0:
@@ -1144,6 +1294,7 @@ class VideoProcessor:
         
         # Apply per-segment video speed if provided (video/audio_and_video modes)
         effective_video_path = video_path
+        has_nontrivial_video_speed = False
         if video_speed_segments and len(video_speed_segments) > 0:
             logger.info(f"Applying per-segment video speed adjustment ({len(video_speed_segments)} segments)")
             temp_speed_adjusted_video = "artifacts/temp_speed_adjusted_video.mp4"
@@ -1161,11 +1312,17 @@ class VideoProcessor:
                     })
                 else:
                     speed_segments_dicts.append(seg)
+
+            has_nontrivial_video_speed = any(
+                abs(float(seg.get("video_speed", 1.0)) - 1.0) > 0.01
+                for seg in speed_segments_dicts
+            )
             
             effective_video_path, video_speed_timing_adjustments = self._apply_per_segment_video_speed(
                 video_path,
                 speed_segments_dicts,
                 temp_speed_adjusted_video,
+                source_start_offset=float(start_time or 0.0),
                 progress_callback=progress_callback,
                 log_callback=log_callback
             )
@@ -1176,6 +1333,14 @@ class VideoProcessor:
                 if pause_removal != 'disabled':
                     logger.info("Disabling pause_removal for video speed modes (timing already adjusted)")
                     pause_removal = 'disabled'
+
+        if background_audio_path and has_nontrivial_video_speed:
+            logger.warning(
+                "Disabling background audio mix because per-segment video speed changes "
+                "would leave the background track in the original timeline, causing "
+                "audible desync and leaked vocals ahead/behind the picture."
+            )
+            background_audio_path = None
 
         # Audio normalization is now done per-segment before combination
         # Skip whole-track normalization since segments are already normalized
@@ -1238,6 +1403,10 @@ class VideoProcessor:
         if effective_video_path != video_path and keep_original_audio_ranges:
             current_ffmpeg_input_idx += 1
             original_audio_ffmpeg_idx = str(current_ffmpeg_input_idx)
+            if start_time is not None:
+                command.extend(["-ss", str(start_time)])
+            if duration is not None:
+                command.extend(["-t", str(duration)])
             command.extend(["-i", video_path])
             logger.debug(f"Added original video as input {original_audio_ffmpeg_idx} for keep-original-audio")
 
@@ -1245,6 +1414,10 @@ class VideoProcessor:
         if background_audio_path:
             current_ffmpeg_input_idx += 1
             background_audio_ffmpeg_idx_str = str(current_ffmpeg_input_idx)
+            if start_time is not None:
+                command.extend(["-ss", str(start_time)])
+            if duration is not None:
+                command.extend(["-t", str(duration)])
             command.extend(["-i", background_audio_path])
 
         watermark_ffmpeg_idx_str = None

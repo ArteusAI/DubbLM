@@ -1,12 +1,21 @@
 
 import React, { useState, useMemo, useRef, useEffect } from 'react';
-import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain, Plus, Trash2, Users, Play, Pause, RotateCcw } from 'lucide-react';
-import { AppConfig, Persona, PresetId, LlmProvider, VideoQualityPreset } from '../types';
-import { LANGUAGES, PRESETS, LLM_PROVIDERS, TTS_PROVIDERS, TRANSCRIPTION_PROVIDERS, WHISPER_MODELS } from '../constants';
+import { ChevronDown, ChevronRight, Speaker, Loader2, Info, Brain, Plus, Trash2, Users, Play, Pause, RotateCcw, Eraser } from 'lucide-react';
+import { AppConfig, Persona, PresetId, LlmProvider, VideoQualityPreset, TtsStyleId } from '../types';
+import {
+  LANGUAGES,
+  PRESETS,
+  LLM_PROVIDERS,
+  TTS_PROVIDERS,
+  TRANSCRIPTION_PROVIDERS,
+  WHISPER_MODELS,
+  TTS_STYLES,
+  GEMINI_DEFAULT_TTS_MODEL,
+} from '../constants';
 import api, { VoiceResponse } from '../api';
 
 const TTS_DEFAULT_MODELS: Record<string, string> = {
-  gemini: 'gemini-2.5-flash-preview-tts',
+  gemini: GEMINI_DEFAULT_TTS_MODEL,
   openai: 'gpt-4o-mini-tts',
   minimax: 'speech-02-hd',
 };
@@ -93,6 +102,7 @@ interface UploadViewProps {
   onConfigChange: (cfg: Partial<AppConfig>) => void;
   onNext: () => void;
   onResetAndStart: () => void;
+  onResetTtsCacheAndStart: () => void;
   onOpenSettings: () => void;
 }
 
@@ -107,6 +117,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
   onConfigChange, 
   onNext,
   onResetAndStart,
+  onResetTtsCacheAndStart,
 }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showExtra, setShowExtra] = useState(false);
@@ -388,9 +399,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                       refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
                       ttsSystem: presetFromApi?.ttsSystem ?? preset.ttsSystem,
                       ttsModel: presetFromApi?.ttsModel ?? preset.ttsModel,
+                      ttsStyle: (presetFromApi?.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'podcast',
                       ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
                       voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
                       enableEmotionEnrichment: presetFromApi?.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+                      enableContentValidation: presetFromApi?.enableContentValidation ?? preset.enableContentValidation,
                       dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
                       backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
                       useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
@@ -414,6 +427,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
               );
             })}
           </div>
+
         </div>
 
         {/* Advanced Options */}
@@ -509,6 +523,37 @@ export const UploadView: React.FC<UploadViewProps> = ({
                   <ChevronDown className="absolute right-3 top-2.5 w-4 h-4 text-zinc-500 pointer-events-none" />
                 </div>
               </div>
+
+              {/* Voice Style — Gemini only */}
+              {selectedTtsProvider === 'gemini' && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-zinc-400">Voice Style</label>
+                  <div className="relative">
+                    <select
+                      value={
+                        (config.ttsStyle as TtsStyleId | undefined) ??
+                        (currentPreset.ttsStyle as TtsStyleId | undefined) ??
+                        'auto'
+                      }
+                      onChange={(e) => onConfigChange({ ttsStyle: e.target.value as TtsStyleId })}
+                      className="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white appearance-none outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500"
+                    >
+                      {TTS_STYLES.map((style) => {
+                        const baseLabel =
+                          style.id === 'auto' && config.resolvedTtsStyle
+                            ? `Auto (${config.resolvedTtsStyle})`
+                            : style.label;
+                        return (
+                          <option key={style.id} value={style.id}>
+                            {baseLabel} — {style.description}
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <ChevronDown className="absolute right-3 top-2.5 w-4 h-4 text-zinc-500 pointer-events-none" />
+                  </div>
+                </div>
+              )}
 
               {/* Keep Background Audio */}
               <label className="flex items-center gap-2 cursor-pointer group">
@@ -804,7 +849,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Model
-                            <InfoTip text="TTS model name (e.g., gemini-2.5-flash-preview-tts)" />
+                            <InfoTip text={`TTS model name (e.g., ${GEMINI_DEFAULT_TTS_MODEL})`} />
                           </label>
                           <input 
                             type="text"
@@ -836,19 +881,57 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           <span className="text-[10px] text-zinc-400">Enrich emotions</span>
                           <InfoTip text="Enrich TTS prompts with detected emotions" />
                         </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={config.enableContentValidation ?? currentPreset.enableContentValidation ?? true}
+                            onChange={(e) => onConfigChange({ enableContentValidation: e.target.checked })}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                          />
+                          <span className="text-[10px] text-zinc-400">Content validation</span>
+                          <InfoTip text="Round-trip ASR check that TTS actually produced all expected words. Catches truncated speech at segment end; adds a small per-segment ASR cost." />
+                        </label>
                       </div>
                       <div className="space-y-1">
-                        <label className={`text-[10px] flex items-center ${selectedTtsProvider === 'gemini' ? 'text-zinc-500' : 'text-zinc-600'}`}>
-                          TTS Prompt Prefix
-                          <InfoTip text="Global instruction prefix for TTS (Gemini only)" />
-                        </label>
-                        <input 
-                          type="text"
-                          value={selectedTtsProvider === 'gemini' ? (config.ttsPromptPrefix || currentPreset.ttsPromptPrefix || '') : ''}
-                          onChange={(e) => onConfigChange({ ttsPromptPrefix: e.target.value || undefined })}
-                          disabled={selectedTtsProvider !== 'gemini'}
-                          className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${selectedTtsProvider !== 'gemini' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          placeholder={selectedTtsProvider === 'gemini' ? "Speak with natural conversational energy..." : "Only available for Gemini"}/>
+                        {(() => {
+                          const effectiveStyle: TtsStyleId =
+                            (config.ttsStyle as TtsStyleId | undefined) ??
+                            (currentPreset.ttsStyle as TtsStyleId | undefined) ??
+                            'podcast';
+                          const isGemini = selectedTtsProvider === 'gemini';
+                          const isCustom = isGemini && effectiveStyle === 'custom';
+                          const bakedPrompt =
+                            TTS_STYLES.find((s) => s.id === effectiveStyle)?.prompt;
+                          const resolvedPrompt =
+                            effectiveStyle === 'auto' && config.resolvedTtsStyle
+                              ? TTS_STYLES.find((s) => s.id === config.resolvedTtsStyle)?.prompt
+                              : undefined;
+                          const readOnlyPreview = (resolvedPrompt || bakedPrompt || '').slice(0, 120);
+                          return (
+                            <>
+                              <label className={`text-[10px] flex items-center ${isGemini ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                                TTS Prompt Prefix
+                                <InfoTip text="Editable only when TTS style is 'Custom'. Otherwise driven by the selected style." />
+                              </label>
+                              <input
+                                type="text"
+                                value={isCustom ? (config.ttsPromptPrefix || '') : ''}
+                                onChange={(e) => onConfigChange({ ttsPromptPrefix: e.target.value || undefined })}
+                                disabled={!isCustom}
+                                className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${!isCustom ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                placeholder={
+                                  !isGemini
+                                    ? 'Only available for Gemini'
+                                    : isCustom
+                                      ? '## Scene:\nA high-quality recording studio...'
+                                      : readOnlyPreview
+                                        ? `Using "${effectiveStyle}" style — ${readOnlyPreview}…`
+                                        : `Using "${effectiveStyle}" style (resolved at runtime)`
+                                }
+                              />
+                            </>
+                          );
+                        })()}
                       </div>
 
                       {/* Per-Speaker Voice Mapping */}
@@ -1356,7 +1439,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
           </div>
 
           {showStartMenu && canProceed && !isUploading && (
-            <div className="absolute right-0 mt-2 w-64 bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl overflow-hidden z-30">
+            <div className="absolute right-0 mt-2 w-72 bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl overflow-hidden z-30">
               <button
                 type="button"
                 onClick={() => {
@@ -1371,6 +1454,23 @@ export const UploadView: React.FC<UploadViewProps> = ({
                 </span>
                 <span className="block mt-1 text-[11px] text-zinc-400">
                   Clear cache/artifacts and run the whole pipeline from scratch.
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowStartMenu(false);
+                  onResetTtsCacheAndStart();
+                }}
+                className="w-full px-4 py-3 text-left hover:bg-zinc-800 transition-colors border-t border-zinc-800"
+              >
+                <span className="flex items-center gap-2 text-sm text-white font-medium">
+                  <Eraser className="w-4 h-4 text-amber-400" />
+                  Clear TTS Cache & Start
+                </span>
+                <span className="block mt-1 text-[11px] text-zinc-400">
+                  Wipe per-segment synthesized audio and the combined track,
+                  then re-run the pipeline. Transcription and translation are kept.
                 </span>
               </button>
             </div>

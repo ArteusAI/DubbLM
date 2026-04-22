@@ -1,6 +1,12 @@
 
 import { Persona, Language, PresetConfig } from './types';
 
+// Default Gemini TTS model names. Keep aligned with
+// DEFAULT_GEMINI_TTS_MODEL / DEFAULT_GEMINI_TTS_FALLBACK_MODEL in
+// src/tts/gemini_tts_wrapper.py (the backend source of truth).
+export const GEMINI_DEFAULT_TTS_MODEL = 'gemini-2.5-pro-preview-tts';
+export const GEMINI_DEFAULT_TTS_FALLBACK_MODEL = 'gemini-2.5-flash-preview-tts';
+
 export const LANGUAGES: Language[] = [
   { code: 'auto', name: 'Auto Detect' },
   { code: 'en', name: 'English' },
@@ -48,6 +54,48 @@ export const LLM_PROVIDERS = [
   { id: 'openrouter', name: 'OpenRouter' },
 ];
 
+export const TTS_STYLES: {
+  id: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
+  label: string;
+  icon: string;
+  description: string;
+  prompt?: string;
+}[] = [
+  {
+    id: 'podcast',
+    label: 'Podcast',
+    icon: 'Mic',
+    description: 'Casual conversation, two hosts, warm and energetic.',
+    prompt: 'Speak with natural conversational energy, clear articulation:',
+  },
+  {
+    id: 'lecture',
+    label: 'Lecture',
+    icon: 'GraduationCap',
+    description: 'Instructional e-learning, clear and articulate.',
+    prompt: 'Read aloud in a calm, authoritative and articulate manner with measured pacing:',
+  },
+  {
+    id: 'gothic',
+    label: 'Gothic',
+    icon: 'BookMarked',
+    description: 'Slow, atmospheric storytelling with deep resonance.',
+    prompt: 'Read in a slow, deliberate, suspenseful tone with deep resonance:',
+  },
+  {
+    id: 'custom',
+    label: 'Custom',
+    icon: 'Pencil',
+    description: 'Write your own scene & style prompt in Advanced settings.',
+  },
+  {
+    id: 'auto',
+    label: 'Auto',
+    icon: 'Sparkles',
+    description: 'LLM picks a style during context analysis.',
+  },
+];
+
 export const TRANSCRIPTION_PROVIDERS = [
   { id: 'assemblyai', name: 'AssemblyAI' },
   { id: 'openai', name: 'OpenAI + PyAnnote' },
@@ -93,9 +141,11 @@ export const PRESETS: PresetConfig[] = [
     refinementModelName: 'gemini-flash-latest',
     refinementTemperature: 1.0,
     ttsSystem: 'openai',
+    ttsStyle: 'auto',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
     enableEmotionEnrichment: false,
+    enableContentValidation: true,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,
@@ -121,12 +171,13 @@ export const PRESETS: PresetConfig[] = [
     refinementModelName: 'gemini-2.5-pro',
     refinementTemperature: 1.0,
     ttsSystem: 'gemini',
-    ttsModel: 'gemini-2.5-flash-preview-tts',
-    ttsFallbackModel: 'gemini-2.5-flash-preview-tts',
-    ttsPromptPrefix: 'Speak with natural conversational energy, clear articulation:',
+    ttsModel: GEMINI_DEFAULT_TTS_MODEL,
+    ttsFallbackModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
+    ttsStyle: 'auto',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
     enableEmotionEnrichment: false,
+    enableContentValidation: true,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,
@@ -139,25 +190,26 @@ export const PRESETS: PresetConfig[] = [
     name: 'Ultra',
     description: '~4x video duration',
     icon: '💎',
-    keepBackground: false,
+    keepBackground: true,
     llmProvider: 'gemini',
-    llmModelName: 'gemini-2.5-pro',
+    llmModelName: 'gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: true,
     editorLlmProvider: 'openrouter',
     editorModelName: 'openai/gpt-5.4',
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
-    refinementLlmProvider: 'gemini',
-    refinementModelName: 'gemini-2.5-pro',
-    refinementTemperature: 1.0,
+    refinementLlmProvider: 'openrouter',
+    refinementModelName: 'openai/gpt-5.4',
+    refinementTemperature: 0.8,
     ttsSystem: 'gemini',
-    ttsModel: 'gemini-2.5-pro-preview-tts',
-    ttsFallbackModel: 'gemini-2.5-pro-preview-tts',
-    ttsPromptPrefix: 'Speak with natural conversational energy, clear articulation:',
+    ttsModel: GEMINI_DEFAULT_TTS_MODEL,
+    ttsFallbackModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
+    ttsStyle: 'auto',
     voiceAutoSelection: true,
     enableEmotionAnalysis: true,
     enableEmotionEnrichment: true,
+    enableContentValidation: true,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,

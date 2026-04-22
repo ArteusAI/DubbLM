@@ -231,11 +231,13 @@ class SmartDubbing:
                 voice_config=self.config.get('voice_name'),
                 voice_prompt=self.config.get('voice_prompt', {}),
                 prompt_prefix=self.config.get('tts_prompt_prefix'),
+                blocked_voices=self.config.get('blocked_voices') or None,
                 enable_voice_matching=self.config.get('voice_auto_selection', True),
                 debug_tts=self.config.get('debug_tts', False),
                 model=self.config.get('tts_model'),
                 fallback_model=self.config.get('tts_fallback_model'),
                 enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                enable_llm_editor=self.config.get('enable_llm_editor', False),
                 emotion_enrichment_model=self.config.get('emotion_enrichment_model'),
                 emotion_enrichment_temperature=self.config.get('emotion_enrichment_temperature'),
                 max_workers=self.config.get('max_workers', 4),
@@ -243,9 +245,11 @@ class SmartDubbing:
                 voice_similarity_threshold=self.config.get('voice_similarity_threshold'),
                 voice_similarity_relaxed_threshold=self.config.get('voice_similarity_relaxed_threshold'),
                 min_voice_validation_duration_seconds=self.config.get('min_voice_validation_duration_seconds'),
+                enable_content_validation=self.config.get('enable_content_validation', True),
                 cost_tracker=self.cost_tracker,
                 translator=self.translator,
-                target_language=self.config.get('target_language', 'en')  # Pass target language for language-specific TTS configuration
+                target_language=self.config.get('target_language', 'en'),  # Pass target language for language-specific TTS configuration
+                speaker_metadata=self.config.get('speaker_metadata'),
             )
             self.tts_systems[self.config.get('tts_system', 'coqui')] = tts_instance
             self.default_tts = tts_instance
@@ -902,14 +906,203 @@ class SmartDubbing:
         self.debug_data["translation"] = translated_segments
 
         return translated_segments
-    
+
+    def _run_batched_synthesis_prepass(
+        self,
+        segments: List[Dict],
+        target_language: str,
+        segment_cache_path,
+        base_cache_prefix: str,
+        select_best_text_variant: callable,
+        tts_locks: Dict[str, threading.Lock],
+        prepass_progress_callback: callable = None,
+    ) -> None:
+        """Warm up wrapper-level caches by running one batched synthesis call per TTS system
+        that advertises ``supports_segment_batching``. No-op for TTS backends without the flag.
+
+        The wrapper is free to coalesce adjacent segments (e.g. multi-speaker dialog for
+        Gemini) or iterate one-by-one internally; either way the regular per-segment loop
+        that follows will hit the wrapper's internal audio cache instead of paying for a
+        second round-trip.
+        """
+        from src.tts.models import TTSSegmentData
+        from pydub import AudioSegment
+
+        batches_by_tts: Dict[str, List[TTSSegmentData]] = {}
+        index_by_id: Dict[int, int] = {}
+
+        for segment_index, segment_dict in enumerate(segments):
+            speaker = segment_dict.get("speaker")
+            if not speaker:
+                continue
+            tts_system = self._get_tts_system_for_speaker(speaker)
+            tts_instance = self.tts_systems.get(tts_system)
+            if tts_instance is None or not getattr(tts_instance, "supports_segment_batching", False):
+                continue
+
+            active_segment = segment_dict.copy()
+            style_prompt = self.voice_prompt.get(speaker)
+            voice_name = None
+            voice_config = self.config.get("voice_name")
+            if isinstance(voice_config, dict):
+                voice_name = voice_config.get(speaker)
+            elif isinstance(voice_config, str):
+                voice_name = voice_config
+            if isinstance(voice_name, str) and voice_name.strip().lower() == "default":
+                voice_name = None
+
+            voice_prompt_hash = hashlib.md5((style_prompt or "").encode()).hexdigest()[:8]
+
+            def make_cache_key(text_value: str, _tts=tts_system, _spk=speaker,
+                               _idx=segment_index, _vph=voice_prompt_hash) -> str:
+                text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
+                return f"{base_cache_prefix}_{_tts}_{_idx}_{_spk}_{text_hash}_{_vph}"
+
+            if self.cache_manager.use_cache and not segment_dict.get("force_resynthesize", False):
+                candidates: List[str] = []
+                if segment_dict.get("chosen_text"):
+                    candidates.append(segment_dict["chosen_text"])
+                sel_track = segment_dict.get("selected_track_type")
+                if sel_track and isinstance(sel_track, str) and active_segment.get(sel_track):
+                    candidates.append(active_segment[sel_track])
+                for key in ("translation", "short_translation", "long_translation", "very_short_translation"):
+                    if active_segment.get(key):
+                        candidates.append(active_segment[key])
+                seen: set = set()
+                cache_hit = False
+                for text_variant in candidates:
+                    if text_variant in seen:
+                        continue
+                    seen.add(text_variant)
+                    candidate_path = segment_cache_path / f"{make_cache_key(text_variant)}.wav"
+                    if candidate_path.exists():
+                        try:
+                            if len(AudioSegment.from_file(candidate_path)) > 0:
+                                cache_hit = True
+                                break
+                        except Exception:
+                            continue
+                if cache_hit:
+                    continue
+
+            tts_segment_data_args = {
+                "speaker": speaker,
+                "text": active_segment.get("translation", ""),
+                "emotion": segment_dict.get("emotion", "Neutral"),
+                "style_prompt": style_prompt,
+                "reference_audio_path": None,
+                "reference_text": None,
+                "voice": voice_name,
+                "speed": 1.0,
+            }
+            potential_ref_audio = f"artifacts/speakers_audio/{speaker}.wav"
+            if os.path.exists(potential_ref_audio):
+                tts_segment_data_args["reference_audio_path"] = potential_ref_audio
+
+            original_duration = segment_dict["end"] - segment_dict["start"]
+            try:
+                best_text, _ratio, _dev, best_track_type = select_best_text_variant(
+                    segment_index,
+                    active_segment,
+                    tts_segment_data_args,
+                    tts_instance,
+                    tts_system,
+                    original_duration,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Prepass: text-variant selection failed for segment {segment_index+1}: {exc}"
+                )
+                best_text = tts_segment_data_args["text"]
+                best_track_type = "translation"
+
+            output_path = f"artifacts/audio_chunks/{segment_index}.wav"
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            final_segment_data = TTSSegmentData(
+                **{**tts_segment_data_args, "text": best_text, "output_path": output_path}
+            )
+            # Persist the chosen variant on the segment so the subsequent cache lookup uses
+            # the same text as the wrapper will see, keeping cache keys consistent.
+            segment_dict["chosen_text"] = best_text
+            segment_dict["selected_track_type"] = best_track_type
+
+            batches_by_tts.setdefault(tts_system, []).append(final_segment_data)
+            index_by_id[id(final_segment_data)] = segment_index
+
+        if not batches_by_tts:
+            return
+
+        total_prepass_segments = sum(len(batch) for batch in batches_by_tts.values())
+        completed_before_batch = 0
+
+        for tts_system, batch in batches_by_tts.items():
+            tts_instance = self.tts_systems[tts_system]
+            indices = [index_by_id[id(s)] for s in batch]
+            index_range = f"{min(indices) + 1}..{max(indices) + 1}" if indices else "-"
+            logger.info(
+                f"Prepass ({tts_system}): batched synthesis for {len(batch)} segments "
+                f"(timeline range {index_range}) — warms wrapper cache for downstream pass"
+            )
+            tts_lock = tts_locks.get(tts_system)
+            batch_progress_callback = None
+            if prepass_progress_callback:
+                batch_offset = completed_before_batch
+
+                def batch_progress(
+                    current: int,
+                    _total: int,
+                    text: str = None,
+                    *,
+                    _offset: int = batch_offset,
+                ) -> None:
+                    aggregate_current = min(
+                        total_prepass_segments,
+                        max(0, _offset + int(current)),
+                    )
+                    prepass_progress_callback(aggregate_current, total_prepass_segments, text)
+
+                batch_progress_callback = batch_progress
+            try:
+                if tts_lock is not None:
+                    with tts_lock:
+                        tts_instance.synthesize(
+                            segments_data=batch,
+                            language=target_language,
+                            previous_context=[],
+                            progress_callback=batch_progress_callback,
+                        )
+                else:
+                    tts_instance.synthesize(
+                        segments_data=batch,
+                        language=target_language,
+                        previous_context=[],
+                        progress_callback=batch_progress_callback,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Prepass ({tts_system}): batched synthesis failed — falling back to "
+                    f"per-segment synthesis. Error: {exc}"
+                )
+                if prepass_progress_callback:
+                    try:
+                        prepass_progress_callback(
+                            min(total_prepass_segments, completed_before_batch + len(batch)),
+                            total_prepass_segments,
+                            None,
+                        )
+                    except Exception:
+                        pass
+            completed_before_batch += len(batch)
+
     def synthesize_speech(
         self, 
         segments: List[Dict], 
         speakers_rolls: Dict, 
         audio_file: str,
         progress_callback: callable = None,
-        grouping_progress_callback: callable = None
+        grouping_progress_callback: callable = None,
+        prepass_progress_callback: callable = None,
     ) -> str:
         """
         Synthesize speech for translated segments with optimized batching and estimation.
@@ -920,6 +1113,7 @@ class SmartDubbing:
             audio_file: Path to the audio file for cache key
             progress_callback: Optional callback for TTS progress updates (current, total, text)
             grouping_progress_callback: Optional callback for grouping/overlay progress (current, total, message)
+            prepass_progress_callback: Optional callback for TTS cache prewarming progress
             
         Returns:
             Path to the output audio file
@@ -1028,7 +1222,10 @@ class SmartDubbing:
         segments_opt = self.config.get('segments_optimization', {})
         COMFORT_MIN_ADJUSTMENT_RATIO = segments_opt.get('comfort_min_adjustment_ratio', 0.85)
         COMFORT_MAX_ADJUSTMENT_RATIO = segments_opt.get('comfort_max_adjustment_ratio', 1.15)
-        use_enriched_for_tts = self.config.get('enable_emotion_enrichment', False)
+        runtime_emotion_enrichment_enabled = bool(
+            self.config.get('enable_emotion_enrichment', False)
+            and not self.config.get('enable_llm_editor', False)
+        )
         
         # Segment stretch mode: audio | audio_and_video | video
         segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
@@ -1239,18 +1436,6 @@ class SmartDubbing:
             preferred_text = (segment_dict.get("chosen_text") or active_segment.get("translation", ""))
             voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
 
-            if use_enriched_for_tts:
-                enrichment_overrides = {
-                    "translation": "emotion_enriched_translation",
-                    "very_short_translation": "emotion_enriched_very_short_translation",
-                    "short_translation": "emotion_enriched_short_translation",
-                    "long_translation": "emotion_enriched_long_translation",
-                }
-                for base_key, enriched_key in enrichment_overrides.items():
-                    enriched_val = segment_dict.get(enriched_key)
-                    if enriched_val:
-                        active_segment[base_key] = enriched_val
-
             def make_cache_key(text_value: str) -> str:
                 text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
                 return f"{base_cache_prefix}_{tts_system}_{segment_index}_{speaker}_{text_hash}_{voice_prompt_hash}"
@@ -1319,7 +1504,8 @@ class SmartDubbing:
                 "reference_audio_path": None,
                 "reference_text": None,
                 "voice": voice_name,
-                "speed": 1.0
+                "speed": 1.0,
+                "cohesion_with_prev": segment_dict.get("cohesion_with_prev", "normal"),
             }
 
             potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"
@@ -1342,10 +1528,10 @@ class SmartDubbing:
             )
 
             previous_texts: List[str] = []
-            if self.config.get('enable_emotion_enrichment', False):
+            if runtime_emotion_enrichment_enabled:
                 for j in range(max(0, segment_index - 5), segment_index):
                     prev_segment = segments[j]
-                    prev_text = prev_segment.get('emotion_enriched_translation') or prev_segment.get('translation', '')
+                    prev_text = prev_segment.get('translation', '')
                     if prev_text:
                         previous_texts.append(prev_text)
 
@@ -1482,6 +1668,21 @@ class SmartDubbing:
                         f"Unexpected error while processing segment {segment_index+1} "
                         f"for speaker '{speaker_id}': {segment_exc}"
                     )
+
+        # Pre-pass: if any TTS instance advertises segment batching support, run a single
+        # batched synthesis call per TTS so the wrapper can coalesce consecutive segments
+        # (e.g. Gemini multi-speaker). The wrapper writes per-segment output files and
+        # populates its internal audio cache, so the regular threaded loop below turns into
+        # cache-hits (fast) while still performing per-segment duration checks/resynthesis.
+        self._run_batched_synthesis_prepass(
+            segments=segments,
+            target_language=target_language,
+            segment_cache_path=segment_cache_path,
+            base_cache_prefix=base_cache_prefix,
+            select_best_text_variant=select_best_text_variant,
+            tts_locks=tts_locks,
+            prepass_progress_callback=prepass_progress_callback,
+        )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -1729,8 +1930,7 @@ class SmartDubbing:
         base_args = metadata["segment_data_args"]
 
         def get_variant_text(key: str) -> str:
-            enriched_key = f"emotion_enriched_{key}"
-            return segment_dict.get(enriched_key) or segment_dict.get(key) or ""
+            return segment_dict.get(key) or ""
         
         # Log resynthesis attempt
         logger.info(f"Resynthesizing segment {metadata['index']+1} (Speaker: {segment_dict['speaker']}) for better duration matching...")

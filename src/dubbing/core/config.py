@@ -8,6 +8,10 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 import yaml
 from .log_config import get_logger
+from src.tts.gemini_tts_wrapper import (
+    DEFAULT_GEMINI_TTS_MODEL,
+    DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
+)
 
 logger = get_logger(__name__)
 
@@ -36,8 +40,8 @@ class DubbingConfig:
             'duration': None,
             'no_cache': False,
             'tts_system': 'gemini',
-            'tts_model': 'gemini-2.5-flash-preview-tts',
-            'tts_fallback_model': 'gemini-2.5-flash-preview-tts',
+            'tts_model': DEFAULT_GEMINI_TTS_MODEL,
+            'tts_fallback_model': DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
             'transcription_system': 'assemblyai',
             'translator_type': 'llm',
             'llm_provider': 'gemini',
@@ -75,6 +79,7 @@ class DubbingConfig:
             'keep_original_audio_ranges': None,
             'tts_system_mapping': None,
             'tts_prompt_prefix': None,
+            'blocked_voices': None,
             'pause_removal': 'disabled',  # 'cut' or 'disabled'
             'use_two_pass_encoding': True,
             'keyframe_buffer': 0.2,
@@ -83,6 +88,11 @@ class DubbingConfig:
             'enable_emotion_enrichment': False,
             'emotion_enrichment_model': 'gemini-2.5-pro',
             'emotion_enrichment_temperature': 0.7,
+            'enable_content_validation': True,
+            # Parallel ffmpeg workers for per-segment video speed adjustments.
+            # None = auto: min(8, max(2, cpu_count//4)). x264 is cache/RAM-bandwidth
+            # bound so oversubscribing CPU cores thrashes throughput and exhausts RAM.
+            'video_segment_workers': None,
             'max_workers': 4,
             'estimate_cost': False,
             'speakers_expected': None,

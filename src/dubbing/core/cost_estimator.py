@@ -9,6 +9,7 @@ import tiktoken
 
 from ..debug.cost_tracker import CostTracker
 from .log_config import get_logger
+from src.tts.gemini_tts_wrapper import DEFAULT_GEMINI_TTS_MODEL
 from src.translation.prompts import (
     REFINEMENT_PROMPTS,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
@@ -260,7 +261,7 @@ class CostEstimator:
             return model
         if system == "gemini":
             fallback = self._config.get("tts_fallback_model")
-            return fallback or "gemini-2.5-pro-preview-tts"
+            return fallback or DEFAULT_GEMINI_TTS_MODEL
         if system == "openai":
             return "tts-1"
         return None

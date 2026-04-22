@@ -28,12 +28,9 @@ pricing:
   tts:
     gemini:
       models:
-        gemini-2.5-flash-preview-tts:
+        gemini-2.5-pro-preview-tts:
           input_per_1m_tokens: 0.50
           output_per_1m_tokens: 10.00
-        gemini-2.5-pro-preview-tts:
-          input_per_1m_tokens: 1.00
-          output_per_1m_tokens: 20.00
       per_audio_min: null
     openai:
       input_per_1m_tokens: 0.6

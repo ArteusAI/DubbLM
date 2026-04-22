@@ -18,6 +18,7 @@ from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, J
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
 from ..services.preset_service import get_preset_config
+from src.dubbing.tts_styles import get_blocked_voices_for_style, resolve_tts_prompt_prefix
 from src.dubbing.audio.speaker_gender_inferencer import SpeakerGenderInferencer
 from src.utils.speaker_gender import (
     SPEAKER_GENDER_SIGNATURE_CONFIG_KEY,
@@ -425,14 +426,23 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "no_cache": False,
                 # TTS settings (config_data overrides preset)
                 "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
-                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
-                "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
-                "tts_prompt_prefix": config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
+                "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
+                "tts_prompt_prefix": resolve_tts_prompt_prefix(
+                    style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                    custom_prompt=config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                    resolved_style=config_data.get("resolvedTtsStyle"),
+                ),
+                "blocked_voices": get_blocked_voices_for_style(
+                    style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                    resolved_style=config_data.get("resolvedTtsStyle"),
+                ),
                 "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_content_validation": config_data.get("enableContentValidation", True),
                 # Transcription settings
                 "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
@@ -542,7 +552,7 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 elif phase == "editor":
                     progress = 29 + int((current / total) * 6)
                     step_name = "editor"
-                    message = "Editing full refined translation"
+                    message = f"LLM editor pass: {current}/{total}" if total > 0 else "LLM editor pass"
                 else:  # refinement
                     progress = 22 + int((current / total) * 7)
                     step_name = "refinement"
@@ -556,7 +566,31 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 progress_callback=translation_progress,
                 speaker_metadata=speaker_metadata,
             )
-            
+
+            # Persist auto-resolved TTS style so the dub stage can pick it up.
+            if (config_data.get("ttsStyle") or "podcast") == "auto":
+                try:
+                    resolved_style = (
+                        (getattr(dubber.translator, "last_context_info", None) or {}).get("tts_style")
+                        or "podcast"
+                    )
+                    db_resolve = get_db_session(fresh=True)
+                    try:
+                        project_row = db_resolve.query(Project).filter(Project.id == project_id).first()
+                        if project_row is not None:
+                            project_row.config = {
+                                **(project_row.config or {}),
+                                "resolvedTtsStyle": resolved_style,
+                            }
+                            flag_modified(project_row, "config")
+                            db_resolve.commit()
+                            config_data = project_row.config
+                            logger.info(f"[WORKER TRANSCRIBE] Auto-resolved ttsStyle -> {resolved_style}")
+                    finally:
+                        db_resolve.close()
+                except Exception as resolve_err:
+                    logger.warning(f"Failed to persist resolvedTtsStyle: {resolve_err}")
+
             update_job_progress(job_id, 35, "saving", "Saving segments to database")
             
             # Save segments to database
@@ -650,14 +684,23 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "exit_before_synthesis": True,
                 "no_cache": False,
                 "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
-                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
-                "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
-                "tts_prompt_prefix": config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
+                "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
+                "tts_prompt_prefix": resolve_tts_prompt_prefix(
+                    style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                    custom_prompt=config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                    resolved_style=config_data.get("resolvedTtsStyle"),
+                ),
+                "blocked_voices": get_blocked_voices_for_style(
+                    style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                    resolved_style=config_data.get("resolvedTtsStyle"),
+                ),
                 "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_content_validation": config_data.get("enableContentValidation", True),
                 "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
                 "translator_type": "llm",
@@ -732,7 +775,7 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 elif phase == "editor":
                     progress = 29 + int((current / total) * 6)
                     step_name = "editor"
-                    message = "Editing full refined translation"
+                    message = f"LLM editor pass: {current}/{total}" if total > 0 else "LLM editor pass"
                 else:
                     progress = 22 + int((current / total) * 7)
                     step_name = "refinement"
@@ -832,11 +875,19 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             preset = config_data.get("preset", "hq")
             preset_config = get_preset_config(preset)
             
-            # Build TTS prompt prefix based on target language and preset
+            # Build TTS prompt prefix based on target language, preset, and selected style
             target_lang = config_data.get("targetLang", "ru")
-            tts_prompt_prefix = config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix")
+            tts_prompt_prefix = resolve_tts_prompt_prefix(
+                style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                custom_prompt=config_data.get("ttsPromptPrefix") or preset_config.get("tts_prompt_prefix"),
+                resolved_style=config_data.get("resolvedTtsStyle"),
+            )
             if tts_prompt_prefix and "{lang}" in tts_prompt_prefix:
                 tts_prompt_prefix = tts_prompt_prefix.replace("{lang}", target_lang)
+            blocked_voices = get_blocked_voices_for_style(
+                style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
+                resolved_style=config_data.get("resolvedTtsStyle"),
+            )
             
             # Build configuration with preset values (config_data overrides preset)
             pause_removal_value = config_data.get("pauseRemoval", "disabled")
@@ -846,6 +897,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             logger.info(f"[DEBUG DUB] ttsModel from config_data: {config_data.get('ttsModel')!r} -> final: {config_data.get('ttsModel') or preset_config.get('tts_model')!r}")
             logger.info(f"[DEBUG DUB] refinementModelName from config_data: {config_data.get('refinementModelName')!r}")
             logger.info(f"[DEBUG DUB] enableEmotionEnrichment from config_data: {config_data.get('enableEmotionEnrichment')!r}")
+            logger.info(
+                "[DEBUG DUB] clip window from config_data: startTime=%r, duration=%r",
+                config_data.get("startTime"),
+                config_data.get("duration"),
+            )
             logger.info(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
@@ -867,14 +923,16 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "save_translated_subtitles": True,
                 # TTS settings (config_data overrides preset)
                 "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
-                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model") or "gemini-2.5-flash-preview-tts",
-                "tts_fallback_model": preset_config.get("tts_fallback_model") or "gemini-2.5-flash-preview-tts",
+                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
+                "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
                 "tts_prompt_prefix": tts_prompt_prefix,
+                "blocked_voices": blocked_voices,
                 "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_content_validation": config_data.get("enableContentValidation", True),
                 "max_workers": config_data.get("maxWorkers", 4),
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
@@ -884,6 +942,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "video_quality_preset": video_quality_preset,
                 # Video processing settings
                 "video_minterpolate_threshold": config_data.get("videoMinterpolateThreshold") or preset_config.get("video_minterpolate_threshold"),
+                "start_time": config_data.get("startTime"),
+                "duration": config_data.get("duration"),
                 # Translation settings (for any re-translation)
                 "translator_type": "llm",
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
@@ -951,10 +1011,20 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             update_job_progress(job_id, 48, "speech_synthesis", "Synthesizing speech")
             
-            # Progress callback for speech synthesis (48% to 70%)
+            # Progress callback for TTS cache prewarming (48% to 52%)
             total_segments = len(segments_data)
+            def prewarm_progress(current: int, total: int, text: str = None):
+                progress = 48 + int((current / total) * 4) if total > 0 else 48
+                message = (
+                    f"Prewarming TTS cache: {current}/{total}"
+                    if total > 0
+                    else "Prewarming TTS cache"
+                )
+                update_job_progress(job_id, progress, "speech_synthesis", message)
+
+            # Progress callback for main speech synthesis (52% to 70%)
             def synthesis_progress(current: int, total: int, text: str = None):
-                progress = 48 + int((current / total) * 22) if total > 0 else 48
+                progress = 52 + int((current / total) * 18) if total > 0 else 52
                 message = f"Synthesizing segment {current}/{total}"
                 update_job_progress(job_id, progress, "speech_synthesis", message, text=text)
             
@@ -973,7 +1043,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             translated_audio_path = dubber.synthesize_speech(
                 segments_data, speakers_rolls, audio_file, 
                 progress_callback=synthesis_progress,
-                grouping_progress_callback=grouping_progress
+                grouping_progress_callback=grouping_progress,
+                prepass_progress_callback=prewarm_progress,
             )
             
             # Process background with progress callback
@@ -1027,6 +1098,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 translated_audio_path=translated_audio_path,
                 background_audio_path=background_audio_path,
                 output_file=str(pm.get_result_video_path(config_data.get("targetLang", "ru"))),
+                start_time=config_data.get("startTime"),
+                duration=config_data.get("duration"),
                 source_language=config_data.get("sourceLang", "en"),
                 target_language=config_data.get("targetLang", "ru"),
                 keep_original_audio_ranges=dubbing_config.get("keep_original_audio_ranges"),
@@ -1145,18 +1218,27 @@ def generate_preview(
             # Create TTS instance
             tts_system = segment.provider or config_data.get("ttsSystem", "gemini")
             
-            # Build TTS prompt prefix
+            # Build TTS prompt prefix from the selected style
             target_lang = config_data.get("targetLang", "ru")
-            tts_prompt_prefix = config_data.get("ttsPromptPrefix")
+            tts_prompt_prefix = resolve_tts_prompt_prefix(
+                style=config_data.get("ttsStyle"),
+                custom_prompt=config_data.get("ttsPromptPrefix"),
+                resolved_style=config_data.get("resolvedTtsStyle"),
+            )
             if tts_prompt_prefix and "{lang}" in tts_prompt_prefix:
                 tts_prompt_prefix = tts_prompt_prefix.replace("{lang}", target_lang)
-                
+            preview_blocked_voices = get_blocked_voices_for_style(
+                style=config_data.get("ttsStyle"),
+                resolved_style=config_data.get("resolvedTtsStyle"),
+            )
+
             tts = TTSFactory.create_tts(
                 tts_system=tts_system,
                 device="cpu",
                 voice_config=speaker_voice_mappings,
                 voice_prompt=config_data.get("speakerTtsPrompts", {}),
                 prompt_prefix=tts_prompt_prefix,
+                blocked_voices=preview_blocked_voices,
                 model=config_data.get("ttsModel"),
             )
             

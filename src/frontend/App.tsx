@@ -6,7 +6,7 @@ import { EditorView } from './components/EditorView';
 import { ResultView } from './components/ResultView';
 import { ProjectListView } from './components/ProjectListView';
 import { SettingsModal } from './components/SettingsModal';
-import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider, SpeakerMetadata } from './types';
+import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider, SpeakerMetadata, TtsStyleId, ResolvedTtsStyleId } from './types';
 import { DEFAULT_PERSONAS, PRESETS } from './constants';
 import { ChevronRight, LayoutDashboard, Settings, AlertTriangle, Loader2, X } from 'lucide-react';
 import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse, ProjectConfig as ApiProjectConfig } from './api';
@@ -35,9 +35,11 @@ const INITIAL_CONFIG: AppConfig = {
   refinementTemperature: DEFAULT_PRESET.refinementTemperature,
   ttsSystem: DEFAULT_PRESET.ttsSystem,
   ttsModel: DEFAULT_PRESET.ttsModel,
+  ttsStyle: DEFAULT_PRESET.ttsStyle,
   ttsPromptPrefix: DEFAULT_PRESET.ttsPromptPrefix,
   voiceAutoSelection: DEFAULT_PRESET.voiceAutoSelection,
   enableEmotionEnrichment: DEFAULT_PRESET.enableEmotionEnrichment,
+  enableContentValidation: DEFAULT_PRESET.enableContentValidation,
   dubbedVolume: DEFAULT_PRESET.dubbedVolume,
   backgroundVolume: DEFAULT_PRESET.backgroundVolume,
   keepOriginalAudioRanges: [],
@@ -101,9 +103,12 @@ const buildProjectConfigPayload = (
   translationPromptPrefix: cfg.translationPromptPrefix,
   ttsSystem: cfg.ttsSystem,
   ttsModel: cfg.ttsModel,
+  ttsStyle: cfg.ttsStyle,
   ttsPromptPrefix: cfg.ttsPromptPrefix,
+  resolvedTtsStyle: cfg.resolvedTtsStyle,
   voiceAutoSelection: cfg.voiceAutoSelection,
   enableEmotionEnrichment: cfg.enableEmotionEnrichment,
+  enableContentValidation: cfg.enableContentValidation,
   dubbedVolume: cfg.dubbedVolume,
   backgroundVolume: cfg.backgroundVolume,
   keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
@@ -183,9 +188,12 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       speakerMetadata: cfg.speakerMetadata || {},
       ttsSystem: cfg.ttsSystem || preset.ttsSystem,
       ttsModel: cfg.ttsModel || preset.ttsModel,
+      ttsStyle: (cfg.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'auto',
       ttsPromptPrefix: cfg.ttsPromptPrefix ?? preset.ttsPromptPrefix,
+      resolvedTtsStyle: cfg.resolvedTtsStyle as ResolvedTtsStyleId | undefined,
       voiceAutoSelection: cfg.voiceAutoSelection ?? preset.voiceAutoSelection,
       enableEmotionEnrichment: cfg.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+      enableContentValidation: cfg.enableContentValidation ?? preset.enableContentValidation,
       dubbedVolume: cfg.dubbedVolume ?? preset.dubbedVolume,
       backgroundVolume: cfg.backgroundVolume ?? preset.backgroundVolume,
       keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
@@ -628,6 +636,39 @@ const App: React.FC = () => {
     setShowResetDialog(true);
   };
 
+  const handleResetTtsCacheAndStart = async (id: string) => {
+    const project = projects.find(p => p.id === id);
+    if (!project) return;
+
+    if (project.isUploading) {
+      setError('Please wait for video upload to complete');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      'Clear all TTS cache (per-segment audio + combined track) and start processing?\n\n' +
+      'Transcription and translation caches are preserved and will be reused.'
+    );
+    if (!confirmed) return;
+
+    try {
+      const res = await api.resetTtsCache(id);
+      console.info(
+        `TTS cache reset: ${res.cache_files_removed} cache file(s), ` +
+        `${res.artifact_files_removed} artifact file(s), ${res.segments_cleared} segment(s) cleared`
+      );
+      setProjects(prev => prev.map(p =>
+        p.id === id
+          ? { ...p, segments: p.segments.map(s => ({ ...s, audioUrl: undefined })) }
+          : p
+      ));
+      await startProcessing();
+    } catch (err) {
+      console.error('Failed to reset TTS cache:', err);
+      setError(err instanceof Error ? err.message : 'Failed to reset TTS cache');
+    }
+  };
+
   const handleConfirmResetAndRestart = async () => {
     if (!pendingResetId) return;
     const id = pendingResetId;
@@ -800,9 +841,11 @@ const App: React.FC = () => {
         refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
         ttsSystem: presetFromApi?.ttsSystem ?? preset.ttsSystem,
         ttsModel: presetFromApi?.ttsModel ?? preset.ttsModel,
+        ttsStyle: (presetFromApi?.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'auto',
         ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
         voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
         enableEmotionEnrichment: presetFromApi?.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+        enableContentValidation: presetFromApi?.enableContentValidation ?? preset.enableContentValidation,
         dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
         backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
         useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
@@ -1379,6 +1422,7 @@ const App: React.FC = () => {
             onConfigChange={(newCfg) => updateActiveProject({ config: { ...activeProject.config, ...newCfg } })}
             onNext={startProcessing}
             onResetAndStart={() => handleResetAndRestart(activeProject.id)}
+            onResetTtsCacheAndStart={() => handleResetTtsCacheAndStart(activeProject.id)}
             onOpenSettings={() => setIsSettingsOpen(true)}
           />
         )}

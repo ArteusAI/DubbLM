@@ -163,6 +163,18 @@ class ApiClient {
     );
   }
 
+  async resetTtsCache(projectId: string): Promise<{
+    project_id: string;
+    cache_files_removed: number;
+    artifact_files_removed: number;
+    segments_cleared: number;
+  }> {
+    return this.request(
+      `/projects/${projectId}/process/reset-tts-cache`,
+      { method: 'POST' }
+    );
+  }
+
   // --- Segments ---
 
   async getSegments(projectId: string): Promise<SegmentResponse[]> {
@@ -484,9 +496,12 @@ export interface ProjectConfig {
   translationPromptPrefix?: string;
   ttsSystem?: string;
   ttsModel?: string;
+  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
+  resolvedTtsStyle?: 'podcast' | 'lecture' | 'gothic';
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableContentValidation?: boolean;
   dubbedVolume?: number;
   backgroundVolume?: number;
   keepOriginalAudioRanges?: string[];
@@ -675,9 +690,11 @@ export interface PresetDefaultsResponse {
   ttsSystem?: string;
   ttsModel?: string;
   ttsFallbackModel?: string;
+  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableContentValidation?: boolean;
   dubbedVolume?: number;
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;

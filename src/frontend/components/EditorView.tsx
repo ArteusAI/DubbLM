@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Play, Pause, Wand2, Volume2, VolumeX, 
-  ChevronRight, RefreshCw, ArrowRight, Loader2, Speaker, Sparkles, X, Clock, Pencil, Check
+  ChevronRight, ChevronDown, RefreshCw, ArrowRight, Loader2, Speaker, Sparkles, X, Clock, Pencil, Check, Eraser
 } from 'lucide-react';
 import { Segment, AppConfig, Project, SpeakerGender, SpeakerMetadata } from '../types';
 import { VoiceResponse } from '../api';
@@ -52,7 +52,23 @@ export const EditorView: React.FC<EditorViewProps> = ({
   });
   const [isDragging, setIsDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  
+
+  // Split-button menu next to "Start Final Dubbing".
+  const [showStartMenu, setShowStartMenu] = useState(false);
+  const [isResettingTtsCache, setIsResettingTtsCache] = useState(false);
+  const startMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showStartMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (startMenuRef.current && !startMenuRef.current.contains(e.target as Node)) {
+        setShowStartMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showStartMenu]);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   
@@ -207,6 +223,31 @@ export const EditorView: React.FC<EditorViewProps> = ({
 
   const handleUpdateSegment = (id: string, updates: Partial<Segment>) => {
     onUpdateSegments(segments.map(s => s.id === id ? { ...s, ...updates } : s));
+  };
+
+  const handleResetTtsCacheAndDub = async () => {
+    const ok = window.confirm(
+      'Clear all TTS cache (per-segment audio + combined track) and start dubbing from scratch?\n\n' +
+      'Transcription, translation, and speaker samples are preserved.'
+    );
+    if (!ok) return;
+    setIsResettingTtsCache(true);
+    try {
+      const res = await api.resetTtsCache(projectId);
+      // Optimistically drop audioUrl on all segments so the UI stops playing stale audio.
+      onUpdateSegments(segments.map(s => ({ ...s, audioUrl: undefined })));
+      console.info(
+        `TTS cache reset: ${res.cache_files_removed} cache file(s), ` +
+        `${res.artifact_files_removed} artifact file(s), ${res.segments_cleared} segment(s) cleared`
+      );
+      setShowStartMenu(false);
+      onContinue();
+    } catch (err) {
+      console.error('Failed to reset TTS cache:', err);
+      window.alert(`Failed to reset TTS cache: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setIsResettingTtsCache(false);
+    }
   };
 
   const handleGlobalVoiceChange = async (speakerName: string, newVoiceId: string) => {
@@ -933,14 +974,55 @@ export const EditorView: React.FC<EditorViewProps> = ({
             Re-translate
           </button>
         )}
-        <button 
-          onClick={onContinue}
-          disabled={genderInferenceEnabled && isGenderTranslationStale}
-          className="group flex items-center gap-2 px-6 py-2.5 bg-brand-600 hover:bg-brand-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none disabled:cursor-not-allowed rounded-lg text-white font-semibold transition-all shadow-lg shadow-brand-500/20"
-        >
-          Start Final Dubbing
-          <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-        </button>
+        <div className="relative" ref={startMenuRef}>
+          <div className="flex">
+            <button
+              onClick={onContinue}
+              disabled={(genderInferenceEnabled && isGenderTranslationStale) || isResettingTtsCache}
+              className="group flex items-center gap-2 pl-6 pr-4 py-2.5 bg-brand-600 hover:bg-brand-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none disabled:cursor-not-allowed rounded-l-lg text-white font-semibold transition-all shadow-lg shadow-brand-500/20"
+            >
+              {isResettingTtsCache ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Clearing TTS cache...
+                </>
+              ) : (
+                <>
+                  Start Final Dubbing
+                  <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowStartMenu(prev => !prev)}
+              disabled={(genderInferenceEnabled && isGenderTranslationStale) || isResettingTtsCache}
+              className="px-3 bg-brand-600 hover:bg-brand-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed rounded-r-lg border-l border-brand-400/40 transition-colors"
+              title="More dubbing options"
+            >
+              <ChevronDown className={`w-4 h-4 transition-transform ${showStartMenu ? 'rotate-180' : ''}`} />
+            </button>
+          </div>
+
+          {showStartMenu && !isResettingTtsCache && (
+            <div className="absolute right-0 bottom-full mb-2 w-72 bg-zinc-900 border border-zinc-700 rounded-lg shadow-2xl overflow-hidden z-30">
+              <button
+                type="button"
+                onClick={handleResetTtsCacheAndDub}
+                className="w-full px-4 py-3 text-left hover:bg-zinc-800 transition-colors"
+              >
+                <span className="flex items-center gap-2 text-sm text-white font-medium">
+                  <Eraser className="w-4 h-4 text-amber-400" />
+                  Clear TTS Cache & Re-dub
+                </span>
+                <span className="block mt-1 text-[11px] text-zinc-400">
+                  Wipe per-segment synthesized audio and the combined track,
+                  then run dubbing from scratch. Transcription and translation are kept.
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

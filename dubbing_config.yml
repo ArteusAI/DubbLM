@@ -33,9 +33,7 @@ presets:
     refinement_model_name: "gemini-2.5-pro"
     refinement_temperature: 1.0
     tts_system: "gemini"
-    tts_model: "gemini-2.5-flash-preview-tts"
-    tts_fallback_model: "gemini-2.5-flash-preview-tts"
-    tts_prompt_prefix: "Speak with natural conversational energy, clear articulation:"
+    tts_style: "podcast"
     keep_background: false
     pause_removal: "disabled"
     video_quality_preset: "1080p"
@@ -46,17 +44,20 @@ presets:
     use_two_pass_encoding: true
     max_workers: 4
   ultra:
-    llm_provider: "openrouter"
-    llm_model_name: "anthropic/claude-opus-4.6"
+    llm_provider: "gemini"
+    llm_model_name: "gemini-flash-latest"
     llm_temperature: 0.5
     refinement_llm_provider: "openrouter"
-    refinement_model_name: "anthropic/claude-opus-4.6"
-    refinement_temperature: 1.0
+    refinement_model_name: "openai/gpt-5.4"
+    refinement_temperature: 0.8
+    enable_llm_editor: true
+    editor_llm_provider: "openrouter"
+    editor_model_name: "openai/gpt-5.4"
+    editor_temperature: 1.0
+    editor_reasoning_effort: "xhigh"
     tts_system: "gemini"
-    tts_model: "gemini-2.5-pro-preview-tts"
-    tts_fallback_model: "gemini-2.5-pro-preview-tts"
-    tts_prompt_prefix: "Speak with natural conversational energy, clear articulation:"
-    keep_background: false
+    tts_style: "podcast"
+    keep_background: true
     pause_removal: "disabled"
     video_quality_preset: "original"
     video_minterpolate_threshold: 1.0
@@ -86,9 +87,10 @@ use_two_pass_encoding: true  # Use two-pass encoding for better video quality (s
 enable_emotion_analysis: false
 
 # Text-to-Speech settings
+# Default TTS model / fallback are owned by Python constants
+# (DEFAULT_GEMINI_TTS_MODEL / DEFAULT_GEMINI_TTS_FALLBACK_MODEL in
+# src/tts/gemini_tts_wrapper.py); override here only if you truly need to.
 tts_system: "gemini"  # TTS engine: coqui, openai, gemini, f5_tts
-tts_model: "gemini-2.5-flash-preview-tts"  # TTS model (for Gemini: gemini-2.5-pro-preview-tts or gemini-2.5-flash-preview-tts)
-tts_fallback_model: "gemini-2.5-flash-preview-tts"  # Fallback TTS model if primary fails
 tts_prompt_prefix: "Speak in Russian with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
 
 enable_emotion_enrichment: true
@@ -221,9 +223,6 @@ pricing:
           input_per_1m_tokens: 0.50
           output_per_1m_tokens: 10.00
         gemini-2.5-pro-preview-tts:
-          input_per_1m_tokens: 1.00
-          output_per_1m_tokens: 20.00
-        gemini-2.5-pro-tts:
           input_per_1m_tokens: 1.00
           output_per_1m_tokens: 20.00
       per_audio_min: null

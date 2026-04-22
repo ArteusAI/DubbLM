@@ -16,6 +16,14 @@ class TTSSegmentData(BaseModel):
     reference_audio_path: Optional[str] = Field(None, description="Path to a reference audio file for voice cloning for this specific segment/speaker.")
     reference_text: Optional[str] = Field(None, description="Text corresponding to the reference_audio_path, if required by the TTS system.")
     output_path: Optional[str] = Field(None, description="Path to save the synthesized audio for this specific segment.")
+    cohesion_with_prev: Optional[str] = Field(
+        None,
+        description=(
+            "Batcher hint from the LLM editor: one of 'tight' | 'normal' | 'loose'. "
+            "Controls whether splitting a multi-speaker TTS batch before this segment "
+            "hurts dialogue coherence. Unknown or missing values are treated as 'normal'."
+        ),
+    )
 
     @validator("voice", pre=True)
     def normalize_voice_override(cls, value: Optional[str]) -> Optional[str]:
@@ -30,6 +38,17 @@ class TTSSegmentData(BaseModel):
                 return None
             return normalized
         return value
+
+    @validator("cohesion_with_prev", pre=True)
+    def normalize_cohesion_hint(cls, value: Optional[str]) -> Optional[str]:
+        """Clamp cohesion_with_prev to the known vocabulary; None stays None."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"tight", "normal", "loose"}:
+                return normalized
+        return None
 
     class Config:
         extra = 'allow' # Allow other kwargs to be passed through if a TTS system needs them beyond this model

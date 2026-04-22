@@ -221,6 +221,89 @@ async def restart_processing(project_id: str, db: Session = Depends(get_db)):
     return _enqueue_transcription_job(db, project, allow_existing=False)
 
 
+@router.post("/{project_id}/process/reset-tts-cache", status_code=200)
+async def reset_tts_cache(project_id: str, db: Session = Depends(get_db)):
+    """Wipe only TTS-related caches/artifacts.
+
+    Clears per-segment synthesized audio and combined TTS audio so the next
+    dub run re-synthesizes everything, while preserving transcription,
+    translation, diarization, speaker samples, and uploaded source files.
+    """
+    db.expire_all()
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Refuse while a job is running to avoid racing with the worker.
+    active_job = db.query(Job).filter(
+        Job.project_id == project_id,
+        Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+    ).first()
+    if active_job:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot reset TTS cache while a job is running. Stop it first.",
+        )
+
+    pm = ProjectManager(project_id)
+
+    # Cache subdirs that store TTS outputs (per-input-hash subfolders).
+    tts_cache_subdirs = ("segment_synthesis", "synthesized_speech")
+    cache_files_removed = 0
+    if pm.cache_dir.exists():
+        for input_dir in pm.cache_dir.iterdir():
+            if not input_dir.is_dir():
+                continue
+            for name in tts_cache_subdirs:
+                target = input_dir / name
+                if target.exists():
+                    cache_files_removed += sum(1 for _ in target.rglob("*") if _.is_file())
+                    shutil.rmtree(target, ignore_errors=True)
+
+    # Artifact directories with rendered TTS audio.
+    artifact_subdirs = ("audio", "audio_chunks", "su_audio_chunks", "previews")
+    artifact_files_removed = 0
+    for name in artifact_subdirs:
+        target = pm.artifacts_dir / name
+        if target.exists():
+            artifact_files_removed += sum(1 for _ in target.rglob("*") if _.is_file())
+            shutil.rmtree(target, ignore_errors=True)
+
+    # Drop cached audio URLs on segments so the UI stops serving stale audio.
+    segments_cleared = (
+        db.query(Segment)
+        .filter(Segment.project_id == project_id, Segment.audio_url.isnot(None))
+        .update({Segment.audio_url: None}, synchronize_session=False)
+    )
+
+    # If the project was marked as dubbed, roll it back to transcribed.
+    if project.status == ProjectStatus.DUBBED:
+        project.status = ProjectStatus.TRANSCRIBED
+
+    config = dict(project.config or {})
+    config.pop("resultStats", None)
+    project.config = config
+    flag_modified(project, "config")
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    pm.ensure_directories()
+
+    logger.info(
+        "Reset TTS cache for %s: removed %s cache file(s), %s artifact file(s), "
+        "cleared audioUrl on %s segment(s)",
+        project_id, cache_files_removed, artifact_files_removed, segments_cleared,
+    )
+
+    return {
+        "project_id": project_id,
+        "cache_files_removed": cache_files_removed,
+        "artifact_files_removed": artifact_files_removed,
+        "segments_cleared": segments_cleared,
+    }
+
+
 @router.post("/{project_id}/process/dub", response_model=JobResponse, status_code=202)
 async def start_dubbing(project_id: str, db: Session = Depends(get_db)):
     """Start final dubbing pipeline."""

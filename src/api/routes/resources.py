@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from ..models.schemas import VoiceResponse, PersonaResponse
+from src.tts.gemini_voice_catalog import build_gemini_voice_entries
 from src.translation.prompts import get_available_personas
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -25,7 +26,7 @@ AUDIO_MEDIA_TYPES = {
 }
 
 # Predefined voices
-VOICES = [
+OPENAI_VOICES = [
     # OpenAI voices
     {"id": "alloy", "name": "Alloy", "provider": "openai", "gender": "neutral"},
     {"id": "echo", "name": "Echo", "provider": "openai", "gender": "male"},
@@ -36,45 +37,17 @@ VOICES = [
     {"id": "ash", "name": "Ash", "provider": "openai", "gender": "male"},
     {"id": "coral", "name": "Coral", "provider": "openai", "gender": "female"},
     {"id": "sage", "name": "Sage", "provider": "openai", "gender": "neutral"},
-    
-    # Gemini voices
-    {"id": "Zephyr", "name": "Zephyr", "provider": "gemini", "gender": "neutral"},
-    {"id": "Puck", "name": "Puck", "provider": "gemini", "gender": "male"},
-    {"id": "Charon", "name": "Charon", "provider": "gemini", "gender": "male"},
-    {"id": "Kore", "name": "Kore", "provider": "gemini", "gender": "female"},
-    {"id": "Fenrir", "name": "Fenrir", "provider": "gemini", "gender": "male"},
-    {"id": "Leda", "name": "Leda", "provider": "gemini", "gender": "female"},
-    {"id": "Orus", "name": "Orus", "provider": "gemini", "gender": "male"},
-    {"id": "Aoede", "name": "Aoede", "provider": "gemini", "gender": "female"},
-    {"id": "Callirrhoe", "name": "Callirrhoe", "provider": "gemini", "gender": "female"},
-    {"id": "Autonoe", "name": "Autonoe", "provider": "gemini", "gender": "female"},
-    {"id": "Enceladus", "name": "Enceladus", "provider": "gemini", "gender": "male"},
-    {"id": "Iapetus", "name": "Iapetus", "provider": "gemini", "gender": "male"},
-    {"id": "Umbriel", "name": "Umbriel", "provider": "gemini", "gender": "neutral"},
-    {"id": "Algieba", "name": "Algieba", "provider": "gemini", "gender": "male"},
-    {"id": "Despina", "name": "Despina", "provider": "gemini", "gender": "female"},
-    {"id": "Erinome", "name": "Erinome", "provider": "gemini", "gender": "female"},
-    {"id": "Gacrux", "name": "Gacrux", "provider": "gemini", "gender": "male"},
-    {"id": "Pulcherrima", "name": "Pulcherrima", "provider": "gemini", "gender": "female"},
-    {"id": "Achird", "name": "Achird", "provider": "gemini", "gender": "male"},
-    {"id": "Zubenelgenubi", "name": "Zubenelgenubi", "provider": "gemini", "gender": "male"},
-    {"id": "Vindemiatrix", "name": "Vindemiatrix", "provider": "gemini", "gender": "female"},
-    {"id": "Sadachbia", "name": "Sadachbia", "provider": "gemini", "gender": "male"},
-    {"id": "Sadaltager", "name": "Sadaltager", "provider": "gemini", "gender": "male"},
-    {"id": "Sulafat", "name": "Sulafat", "provider": "gemini", "gender": "female"},
-    {"id": "Laomedeia", "name": "Laomedeia", "provider": "gemini", "gender": "female"},
-    {"id": "Achernar", "name": "Achernar", "provider": "gemini", "gender": "male"},
-    {"id": "Alnilam", "name": "Alnilam", "provider": "gemini", "gender": "male"},
-    {"id": "Schedar", "name": "Schedar", "provider": "gemini", "gender": "female"},
-    {"id": "Rasalgethi", "name": "Rasalgethi", "provider": "gemini", "gender": "male"},
-    {"id": "Algenib", "name": "Algenib", "provider": "gemini", "gender": "male"},
-    
+]
+
+MINIMAX_VOICES = [
     # MiniMax voices
     {"id": "male-qn-qingse", "name": "Qingse (Male)", "provider": "minimax", "gender": "male"},
     {"id": "female-shaonv", "name": "Shaonv (Female)", "provider": "minimax", "gender": "female"},
     {"id": "male-qn-jingying", "name": "Jingying (Male)", "provider": "minimax", "gender": "male"},
     {"id": "female-yujie", "name": "Yujie (Female)", "provider": "minimax", "gender": "female"},
 ]
+
+VOICES = OPENAI_VOICES + build_gemini_voice_entries() + MINIMAX_VOICES
 
 
 def _find_voice_sample_path(provider: str, voice_id: str) -> Path | None:

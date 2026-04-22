@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, Any, Union, Callable, Optional, Type
+from typing import Dict, Any, List, Union, Callable, Optional, Type
 
 from .tts_interface import TTSInterface
 
@@ -28,6 +28,7 @@ class TTSConfig:
         voice_mapping: Optional[Dict[str, str]] = None,
         voice_prompt_mapping: Optional[Dict[str, str]] = None,
         prompt_prefix: Optional[str] = None,
+        blocked_voices: Optional[List[str]] = None,
         cost_tracker: Optional[Any] = None,
         translator: Optional[Any] = None,
         **kwargs: Any
@@ -38,6 +39,7 @@ class TTSConfig:
         self.voice_mapping = voice_mapping if voice_mapping is not None else {}
         self.voice_prompt_mapping = voice_prompt_mapping if voice_prompt_mapping is not None else {}
         self.prompt_prefix = prompt_prefix
+        self.blocked_voices = list(blocked_voices) if blocked_voices else []
         self.cost_tracker = cost_tracker
         self.translator = translator
         self.kwargs = kwargs # Store any additional provider-specific args
@@ -52,6 +54,7 @@ class TTSFactory:
         voice_config: Optional[Union[str, Dict[str, str]]] = None,
         voice_prompt: Optional[Dict[str, str]] = None,
         prompt_prefix: Optional[str] = None,
+        blocked_voices: Optional[List[str]] = None,
         **kwargs: Any # To catch any other potential args like model name for specific TTS
     ) -> TTSInterface:
         """
@@ -86,6 +89,7 @@ class TTSFactory:
             "provider": provider_name_lower,
             "voice_prompt_mapping": voice_prompt,
             "prompt_prefix": prompt_prefix,
+            "blocked_voices": blocked_voices,
         }
         # Provider-specific kwargs filtering (drop None values, but keep cost_tracker and translator separate)
         filtered_kwargs = {k: v for k, v in dict(kwargs).items() if v is not None and k not in ("cost_tracker", "translator")}
@@ -146,6 +150,8 @@ class TTSFactory:
         if provider_name_lower == "gemini":
             if config.prompt_prefix is not None:
                 init_args["prompt_prefix"] = config.prompt_prefix
+            if config.blocked_voices:
+                init_args["blocked_voices"] = list(config.blocked_voices)
             if config.translator is not None:
                 init_args["translator"] = config.translator
             # Allow passing fallback_model specifically for Gemini

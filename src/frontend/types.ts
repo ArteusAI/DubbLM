@@ -17,6 +17,8 @@ export enum TTSProvider {
 
 export type PresetId = 'fast' | 'hq' | 'ultra';
 export type VideoQualityPreset = '720p' | '1080p' | 'original';
+export type TtsStyleId = 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
+export type ResolvedTtsStyleId = 'podcast' | 'lecture' | 'gothic';
 
 export interface PresetConfig {
   id: PresetId;
@@ -38,10 +40,13 @@ export interface PresetConfig {
   ttsSystem: string;
   ttsModel?: string;
   ttsFallbackModel?: string;
+  ttsStyle?: TtsStyleId;
   ttsPromptPrefix?: string;
+  resolvedTtsStyle?: ResolvedTtsStyleId;
   voiceAutoSelection?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableContentValidation?: boolean;
   dubbedVolume?: number;
   backgroundVolume?: number;
   useTwoPassEncoding?: boolean;
@@ -158,7 +163,10 @@ export interface AppConfig {
   voiceAutoSelection?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableContentValidation?: boolean;
+  ttsStyle?: TtsStyleId;
   ttsPromptPrefix?: string;
+  resolvedTtsStyle?: ResolvedTtsStyleId;
   
   // Audio extras
   dubbedVolume?: number;

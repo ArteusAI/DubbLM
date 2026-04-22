@@ -164,13 +164,20 @@ Transcript (format: [HH:MM:SS] SPEAKER: text):
 
 IMPORTANT: Create the summary in "{target_language}" language.
 
+3. TTS Style Classification:
+   Pick the single best TTS delivery style for narrating this content. Choose exactly one of:
+   - "podcast": casual conversation, interviews, friendly chats, two or more hosts (default for most dialogue).
+   - "lecture": instructional / educational / e-learning / corporate training / tutorials / how-to explanations delivered by a clear single speaker.
+   - "gothic": dramatic storytelling, audiobook-style fiction, suspenseful or atmospheric narration, documentaries with a solemn tone.
+   When in doubt, use "podcast".
+
 Provide your analysis in JSON format with these keys:
-domain, terminology, tone, themes, chapters, overall_summary
+domain, terminology, tone, themes, chapters, overall_summary, tts_style
 
 For chapters, include title, summary, and start_time for each chapter.
 
 Example JSON output:
-{{"domain": "technology","terminology": ["API","LLM","vector database"],"tone": "informative","themes": ["artificial intelligence","software development"],"chapters": [],"overall_summary": ""}}
+{{"domain": "technology","terminology": ["API","LLM","vector database"],"tone": "informative","themes": ["artificial intelligence","software development"],"chapters": [],"overall_summary": "","tts_style": "podcast"}}
 """
 
 TRANSLATION_PROMPT_TEMPLATE = """
@@ -302,7 +309,8 @@ Schema (all keys required):
       "text": "refined line",
       "very_short": "very short variant",
       "short": "short variant",
-      "long": "long variant"
+      "long": "long variant",
+      "cohesion_with_prev": "tight" | "normal" | "loose"
     }
   ]
 }
@@ -310,14 +318,15 @@ Schema (all keys required):
 Rules:
 - The number of items in "translations" MUST equal the number of input lines.
 - "speaker" MUST exactly match the corresponding input speaker for that line.
-- All fields MUST be strings (use "" if absolutely necessary; do not omit keys).
+- All fields MUST be strings (use "" for text variants if absolutely necessary; do not omit keys).
+- "cohesion_with_prev" values: "tight" | "normal" | "loose" (see Cohesion rules below). The first item MUST be "normal".
 
 Few-shot examples (structure only):
 Example 1 output:
-{"translations":[{"speaker":"SPEAKER_A","text":"A.","very_short":"A.","short":"A.","long":"Well, A."}]}
+{"translations":[{"speaker":"SPEAKER_A","text":"A.","very_short":"A.","short":"A.","long":"Well, A.","cohesion_with_prev":"normal"}]}
 
 Example 2 output:
-{"translations":[{"speaker":"SPEAKER_A","text":"We ship tomorrow.","very_short":"Ship tomorrow.","short":"We ship tomorrow.","long":"Alright, we ship tomorrow."},{"speaker":"SPEAKER_B","text":"Got it.","very_short":"OK.","short":"Got it.","long":"Yep, got it."}]}
+{"translations":[{"speaker":"SPEAKER_A","text":"How many people are on the team?","very_short":"How many?","short":"How many on the team?","long":"So, how many people are on the team?","cohesion_with_prev":"normal"},{"speaker":"SPEAKER_B","text":"Three.","very_short":"Three.","short":"Just three.","long":"Just three people.","cohesion_with_prev":"tight"},{"speaker":"SPEAKER_A","text":"Anyway, let's talk about the roadmap.","very_short":"Roadmap next.","short":"Now, the roadmap.","long":"Anyway, let's move on to the roadmap.","cohesion_with_prev":"loose"}]}
 """
 
 JSON_OUTPUT_FORMAT_LONG_ONLY = r"""
@@ -329,7 +338,8 @@ Schema (all keys required):
     {
       "speaker": "SPEAKER_ID",
       "text": "refined line",
-      "long": "long variant"
+      "long": "long variant",
+      "cohesion_with_prev": "tight" | "normal" | "loose"
     }
   ]
 }
@@ -338,14 +348,15 @@ Rules:
 - The number of items in "translations" MUST equal the number of input lines.
 - "speaker" MUST exactly match the corresponding input speaker for that line.
 - "long" should be slightly longer than "text" while preserving ALL facts (no new claims).
-- All fields MUST be strings (use "" if absolutely necessary; do not omit keys).
+- All fields MUST be strings (use "" for text variants if absolutely necessary; do not omit keys).
+- "cohesion_with_prev" values: "tight" | "normal" | "loose" (see Cohesion rules below). The first item MUST be "normal".
 
 Few-shot examples (structure only):
 Example 1 output:
-{"translations":[{"speaker":"SPEAKER_A","text":"Got it.","long":"Yes, got it."}]}
+{"translations":[{"speaker":"SPEAKER_A","text":"Got it.","long":"Yes, got it.","cohesion_with_prev":"normal"}]}
 
 Example 2 output:
-{"translations":[{"speaker":"SPEAKER_A","text":"We start at nine.","long":"Alright, we start at nine."},{"speaker":"SPEAKER_B","text":"Perfect.","long":"Perfect, that works."}]}
+{"translations":[{"speaker":"SPEAKER_A","text":"We start at nine.","long":"Alright, we start at nine.","cohesion_with_prev":"normal"},{"speaker":"SPEAKER_B","text":"Perfect.","long":"Perfect, that works.","cohesion_with_prev":"tight"}]}
 """
 
 
@@ -364,6 +375,17 @@ Untranslated term handling:
 - If an untranslated technical/product term appears for the first time in this full dialogue and is listed below, briefly give its meaning in {target_language} the first time it appears in the main "text" version.
 - After the first explained occurrence, later mentions may use the untranslated term without repeating the explanation unless needed for clarity.
 - Do not invent meanings. Use established target-language equivalents or a short explanatory gloss.
+
+# Cohesion with previous line (TTS batching hint)
+For every output item you MUST emit a "cohesion_with_prev" label. It tells the downstream TTS batcher whether a multi-speaker batch boundary BEFORE this line would harm natural delivery.
+- "tight": this line is a direct continuation/reaction of the previous one and must stay in the same spoken batch. Use for direct Q->A pairs where the answer is meaningless without the question (e.g. "- How many? - Three."), short acknowledgements tied to the prior speaker's thought, or a sentence finished by the next speaker. Use sparingly: target at most ~20% of lines.
+- "loose": the previous exchange has ended and this line starts a new thought, topic, or dialogue block. Ideal place to split the batch. Use when the narrative clearly pivots.
+- "normal": default. Use when the line is neither a hard continuation nor a clear pivot.
+
+Rules:
+- The very first item of "translations" MUST have "cohesion_with_prev": "normal".
+- Do not chain many consecutive "tight" labels unless the content truly cannot be split anywhere; prefer "normal" when in doubt.
+- "cohesion_with_prev" must not change the text content; it is metadata only.
 
 Terms already explained earlier in the dialogue:
 {explained_terms_section}

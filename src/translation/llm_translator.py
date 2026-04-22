@@ -290,10 +290,14 @@ class LLMTranslator(TranslationInterface):
         return """
 # Gemini TTS delivery guidance
 - Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup directly in the output text.
-- Allowed Gemini-friendly markup includes emotion/style tags such as [happy], [sad], [angry], [surprised], [excited], [calm], [whispering], [shouting], [sarcasm], [sigh], [uhm].
+- Allowed Gemini-friendly markup includes tags such as [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
 - You MAY also insert pause markers [short pause], [medium pause], or [long pause] where they sound natural and improve delivery.
 - Insert tags and pauses only where context clearly supports them. Subtlety is mandatory.
 - Do not decorate every line. Many lines should stay untagged.
+- Treat filler/breath tags [uhm], [sigh], [sighs], and [gasp] as not a style default.
+- Across a whole video, target no more than 2 such filler/breath insertions per speaker in total. If recent context already shows one for that speaker, strongly prefer none; if it already shows two, add none.
+- Do not add [uhm] just to make the speech sound conversational. Use it only for an obvious hesitation, stumble, or self-interruption already implied by the line.
+- Prefer pause markers or ordinary expressive tags over filler/breath tags. Most explanatory lines should use zero non-speech sounds.
 - Preserve the exact factual meaning and keep the text natural in the target language.
 - Avoid turning tags into standalone content. They should support delivery, not replace wording.
 - For non-Gemini slots, do not add markup tags or pause markers.
@@ -431,17 +435,19 @@ class LLMTranslator(TranslationInterface):
 
         prompt = f"""You enhance translated dialogue lines with subtle markup tags for text-to-speech.
 Tags (use sparingly and only when they help delivery):
+- Expressive tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers]
 - Non-speech sounds: [sigh], [uhm]
-- Style modifiers: [sarcasm], [shouting], [whispering], [extremely fast]
 - Pauses: [short pause], [medium pause], [long pause]
 
 Rules:
 - Preserve the original words and meaning; only add lightweight tags.
 - Keep length close to the input; avoid doubling length.
 - Use tags sparingly - they work best when text content already implies the emotion/style.
+- Do not add [uhm] unless the line clearly implies hesitation, stumbling, or a self-interruption. Do not add filler sounds to neutral explanatory sentences.
+- Prefer [short pause], [medium pause], [long pause], or ordinary expressive tags over filler/breath tags.
 - The input may already contain markup tags from an earlier editing step; preserve good existing tags, improve them when useful, and avoid duplicating or stacking near-identical tags.
 - If a pause or emotion tag is already present, you may reposition, replace, or remove it to make the delivery better, but do not blindly add more tags on top.
-- Do NOT use emotional adjectives like "scared" or "curious" as tags (they get vocalized as words).
+- Use bracket tags exactly as provided (e.g. [whispers], not \"whispering\"). Do not invent new tag syntax.
 - Respect existing punctuation and speaker intent in {target_language}.
 - Return JSON with the same keys you received, enriched text as values.
 - Do NOT add explanations.
@@ -955,7 +961,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                             "start_time": "00:00:00"
                         }
                     ],
-                    "overall_summary": "A general conversation."
+                    "overall_summary": "A general conversation.",
+                    "tts_style": "podcast",
                 }
                 
             # Validate the structure
@@ -966,6 +973,11 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         combined_info[key] = "general" if key == "domain" else "neutral" if key == "tone" else "A conversation."
                     else:
                         combined_info[key] = [] if key in ["terminology", "themes"] else [{"title": "Conversation", "summary": "General discussion"}]
+
+            # TTS style picker — classify once so downstream Gemini TTS prompt can adapt.
+            allowed_tts_styles = {"podcast", "lecture", "gothic"}
+            raw_style = str(combined_info.get("tts_style", "") or "").strip().lower()
+            combined_info["tts_style"] = raw_style if raw_style in allowed_tts_styles else "podcast"
             
             # Create a text-only summary for easy passing to other methods
             text_summary = combined_info.get("overall_summary", "")
@@ -999,7 +1011,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         "start_time": "00:00:00"
                     }
                 ],
-                "overall_summary": "A general conversation."
+                "overall_summary": "A general conversation.",
+                "tts_style": "podcast",
             }
             # Create a text-only summary for the fallback case
             text_summary = "A general conversation.\n\nChapters:\n- Conversation: General discussion"
@@ -1306,6 +1319,12 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     variant_text = text
                 normalized[variant_key] = variant_text
 
+            cohesion_raw = pair.get("cohesion_with_prev")
+            if isinstance(cohesion_raw, str):
+                cohesion_clean = cohesion_raw.strip().lower()
+                if cohesion_clean in {"tight", "normal", "loose"}:
+                    normalized["cohesion_with_prev"] = cohesion_clean
+
             normalized_pairs.append(normalized)
 
         return normalized_pairs, errors
@@ -1316,7 +1335,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         edited_pairs: List[Dict[str, str]],
     ) -> List[Dict[str, Any]]:
         edited_segments: List[Dict[str, Any]] = []
-        for segment, pair in zip(segments, edited_pairs):
+        for idx, (segment, pair) in enumerate(zip(segments, edited_pairs)):
             segment_copy = segment.copy()
             segment_copy["speaker"] = segment.get("speaker", pair.get("speaker"))
             segment_copy["translation"] = pair["text"]
@@ -1326,8 +1345,26 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 segment_copy["short_translation"] = pair["short"]
             if "long" in pair:
                 segment_copy["long_translation"] = pair["long"]
+            segment_copy["cohesion_with_prev"] = self._normalize_cohesion_hint(
+                pair.get("cohesion_with_prev"), is_first=(idx == 0)
+            )
             edited_segments.append(segment_copy)
         return edited_segments
+
+    @staticmethod
+    def _normalize_cohesion_hint(value: Any, is_first: bool = False) -> str:
+        """Normalize cohesion_with_prev label from the editor output.
+
+        Unknown or missing values collapse to ``"normal"``. The first item of a
+        dialogue is always ``"normal"`` regardless of what the model emitted.
+        """
+        if is_first:
+            return "normal"
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"tight", "normal", "loose"}:
+                return normalized
+        return "normal"
 
     def _write_editor_debug_file(
         self,
@@ -1482,6 +1519,10 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             len(segments),
         )
 
+        if progress_callback:
+            preview_text = segments[0].get("translation", "") if segments else ""
+            progress_callback("editor", 0, 1, preview_text)
+
         session_dir = None
         if debug:
             debug_dir = "artifacts/debug/translation_editor"
@@ -1513,11 +1554,54 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             )
             return [segment.copy() for segment in segments]
 
+        if debug and session_dir:
+            self._write_editor_comparison_report(session_dir, segments, edited_segments)
+
         if progress_callback:
             preview_text = edited_segments[0].get("translation", "") if edited_segments else ""
             progress_callback("editor", 1, 1, preview_text)
 
         return edited_segments
+
+    def _write_editor_comparison_report(
+        self,
+        session_dir: str,
+        pre_edit_segments: List[Dict[str, Any]],
+        edited_segments: List[Dict[str, Any]],
+    ) -> None:
+        """Write a side-by-side comparison of pre-editor vs post-editor translations.
+
+        Mirrors the `comprehensive_refinement_comparison.txt` produced by the
+        refinement pass so the editor output can be inspected in the same way.
+        """
+        variant_labels = [
+            ("very_short_translation", "Very short"),
+            ("short_translation", "Short"),
+            ("long_translation", "Long"),
+        ]
+        report_path = os.path.join(session_dir, "comprehensive_editor_comparison.txt")
+        try:
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write("=== COMPREHENSIVE EDITOR COMPARISON REPORT ===\n")
+                handle.write(f"Processed {len(edited_segments)} segments\n\n")
+                handle.write("=== SIDE-BY-SIDE COMPARISON ===\n")
+                for idx, (pre_seg, post_seg) in enumerate(zip(pre_edit_segments, edited_segments), start=1):
+                    speaker = post_seg.get("speaker", pre_seg.get("speaker", "UNKNOWN"))
+                    pre_text = (pre_seg.get("translation") or "").strip()
+                    post_text = (post_seg.get("translation") or "").strip()
+                    handle.write(f"Line {idx} ({speaker}):\n")
+                    handle.write(f"  Pre-editor:  {pre_text}\n")
+                    handle.write(f"  Post-editor: {post_text}\n")
+                    for key, label in variant_labels:
+                        pre_variant = (pre_seg.get(key) or "").strip()
+                        post_variant = (post_seg.get(key) or "").strip()
+                        if pre_variant or post_variant:
+                            handle.write(f"  {label} (pre):  {pre_variant}\n")
+                            handle.write(f"  {label} (post): {post_variant}\n")
+                    handle.write("\n")
+            logger.info(f"Wrote comprehensive editor comparison report to {report_path}")
+        except Exception as exc:
+            logger.error(f"Error writing editor comparison report: {exc}")
 
     def translate(
         self,
@@ -1646,18 +1730,6 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             max_chars = 600
             logger.debug(f"Second optimization pass - merging translated segments (max_chars={max_chars})...")
             final_segments = self._optimize_segments(translated_segments, max_gap_seconds=0.3, max_chars=max_chars)
-
-        # 9. Optional emotion enrichment (kept alongside originals)
-        enrichment_enabled = kwargs.get("enable_emotion_enrichment", self.enable_emotion_enrichment)
-        if enrichment_enabled:
-            logger.info("Applying optional emotion enrichment to translated segments...")
-            final_segments = self._enrich_segments_with_emotion(
-                final_segments,
-                target_language=target_language,
-                debug=kwargs.get("debug", self.debug)
-            )
-        else:
-            logger.debug("Emotion enrichment disabled; skipping enrichment step.")
         
         # Report performance metrics
         elapsed_time = time.perf_counter() - start_time
@@ -2905,6 +2977,10 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         segment["short_translation"] = translated_pairs[i]["short"]
                     if "long" in translated_pairs[i]:
                         segment["long_translation"] = translated_pairs[i]["long"]
+                    segment["cohesion_with_prev"] = self._normalize_cohesion_hint(
+                        translated_pairs[i].get("cohesion_with_prev"),
+                        is_first=(len(all_segments) == 0),
+                    )
                     # Use the potentially modified speaker from translated_pairs
                     # This preserves any allowed speaker replacement that happened during validation
                     segment["speaker"] = translated_pairs[i]["speaker"]
