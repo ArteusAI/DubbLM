@@ -614,6 +614,16 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             
             # Process and organize transcription
             records = self._process_transcript(transcript)
+            if self.cost_tracker:
+                local_audio_seconds = max((row.get("end", 0.0) for row in records), default=0.0)
+                if local_audio_seconds:
+                    self.cost_tracker.add_transcription_usage(
+                        "whisper",
+                        float(local_audio_seconds),
+                        model=str(self.whisper_model or "whisper"),
+                        category="primary_transcription",
+                        count_cost=False,
+                    )
             
         elif self.transcription_system == "openai":
             # Check if OpenAI client is initialized
@@ -687,7 +697,12 @@ class PyAnnoteOpenAITranscriber(BaseTranscriber):
             # Convert OpenAI's format to our internal format
             records = self._process_transcript(transcript)
             if self.cost_tracker and converted_duration:
-                self.cost_tracker.add_transcription_actual("openai", float(converted_duration))
+                self.cost_tracker.add_transcription_usage(
+                    "openai",
+                    float(converted_duration),
+                    model="whisper-1",
+                    category="primary_transcription",
+                )
         
         else:
             raise ValueError(f"Unsupported transcription system: {self.transcription_system}")

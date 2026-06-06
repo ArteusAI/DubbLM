@@ -24,8 +24,9 @@ CONFIG_PATH = Path("dubbing_config.yml")
 
 DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
     "fast": {
+        "persona_id": "none",
         "llm_provider": "gemini",
-        "llm_model_name": "gemini-flash-lite-latest",
+        "llm_model_name": "gemini-flash-latest",
         "llm_temperature": 0.5,
         "enable_llm_editor": False,
         "editor_llm_provider": "openrouter",
@@ -41,7 +42,8 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "pause_removal": "disabled",
         "voice_auto_selection": True,
         "enable_emotion_enrichment": False,
-        "enable_content_validation": True,
+        "enable_content_validation": False,
+        "enable_llm_text_adjustment": False,
         "dubbed_volume": 1.0,
         "background_volume": 0.56,
         "use_two_pass_encoding": True,
@@ -49,11 +51,12 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "max_workers": 4,
     },
     "hq": {
+        "persona_id": "none",
         "llm_provider": "gemini",
         "llm_model_name": "gemini-flash-latest",
         "llm_temperature": 0.5,
         "refinement_llm_provider": "gemini",
-        "refinement_model_name": "gemini-2.5-pro",
+        "refinement_model_name": "gemini-flash-latest",
         "refinement_temperature": 1.0,
         "enable_llm_editor": False,
         "editor_llm_provider": "openrouter",
@@ -61,7 +64,7 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "editor_temperature": 1.0,
         "editor_reasoning_effort": "xhigh",
         "tts_system": "gemini",
-        "tts_model": DEFAULT_GEMINI_TTS_MODEL,
+        "tts_model": DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
         "tts_fallback_model": DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
         "tts_style": "podcast",
         "tts_prompt_prefix": None,
@@ -70,6 +73,7 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "voice_auto_selection": True,
         "enable_emotion_enrichment": False,
         "enable_content_validation": True,
+        "enable_llm_text_adjustment": False,
         "dubbed_volume": 1.0,
         "background_volume": 0.56,
         "use_two_pass_encoding": True,
@@ -77,6 +81,7 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "max_workers": 4,
     },
     "ultra": {
+        "persona_id": "normal",
         "llm_provider": "gemini",
         "llm_model_name": "gemini-flash-latest",
         "llm_temperature": 0.5,
@@ -98,6 +103,7 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
         "voice_auto_selection": True,
         "enable_emotion_enrichment": True,
         "enable_content_validation": True,
+        "enable_llm_text_adjustment": True,
         "dubbed_volume": 1.0,
         "background_volume": 0.56,
         "use_two_pass_encoding": True,
@@ -108,6 +114,7 @@ DEFAULT_PRESET_CONFIGS: Dict[PresetType, Dict[str, Any]] = {
 }
 
 CAMEL_TO_SNAKE_KEYS: Dict[str, str] = {
+    "personaId": "persona_id",
     "keepBackground": "keep_background",
     "llmProvider": "llm_provider",
     "llmModelName": "llm_model_name",
@@ -129,6 +136,7 @@ CAMEL_TO_SNAKE_KEYS: Dict[str, str] = {
     "voiceAutoSelection": "voice_auto_selection",
     "enableEmotionEnrichment": "enable_emotion_enrichment",
     "enableContentValidation": "enable_content_validation",
+    "enableLlmTextAdjustment": "enable_llm_text_adjustment",
     "dubbedVolume": "dubbed_volume",
     "backgroundVolume": "background_volume",
     "useTwoPassEncoding": "use_two_pass_encoding",

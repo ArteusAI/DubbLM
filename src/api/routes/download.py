@@ -1,10 +1,12 @@
 """Download routes for results."""
 
+import json
+import mimetypes
 from pathlib import Path
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import FileResponse, StreamingResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
 
 from ..database.session import get_db
@@ -253,3 +255,92 @@ async def get_project_stats(project_id: str, db: Session = Depends(get_db)):
         "processingTimeSec": result_stats.get("processingTimeSec", 0),
         "totalCost": result_stats.get("totalCost", 0),
     }
+
+
+def _resolve_report_paths(project_id: str) -> tuple[Path, Path]:
+    """Return (markdown_path, json_path) for the summary report."""
+    pm = ProjectManager(project_id)
+    md_path = pm.artifacts_dir / "report.md"
+    json_path = pm.artifacts_dir / "report.json"
+    return md_path, json_path
+
+
+@router.get("/{project_id}/report")
+async def get_project_report(project_id: str, db: Session = Depends(get_db)):
+    """Return the summary report markdown + structured JSON for a project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    md_path, json_path = _resolve_report_paths(project_id)
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Report not available yet")
+
+    markdown = md_path.read_text(encoding="utf-8")
+    report_json = None
+    if json_path.exists():
+        try:
+            report_json = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report_json = None
+
+    return JSONResponse({"markdown": markdown, "json": report_json})
+
+
+@router.get("/{project_id}/download/report")
+async def download_project_report(project_id: str, db: Session = Depends(get_db)):
+    """Download the summary report as Markdown."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    md_path, _ = _resolve_report_paths(project_id)
+    if not md_path.exists():
+        raise HTTPException(status_code=404, detail="Report not available yet")
+
+    pm = ProjectManager(project_id)
+    source = pm.get_source_video_path()
+    filename = f"{source.stem}_report.md" if source else f"{project_id}_report.md"
+    return FileResponse(
+        path=str(md_path),
+        media_type="text/markdown",
+        filename=filename,
+    )
+
+
+@router.get("/{project_id}/artifacts/{path:path}")
+async def get_project_artifact(
+    project_id: str,
+    path: str,
+    db: Session = Depends(get_db),
+):
+    """Serve any file stored under the project's base directory.
+
+    Used by links inside the markdown summary report. Path traversal is
+    strictly guarded — requests resolving outside the project root get 403.
+    """
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    pm = ProjectManager(project_id)
+    project_root = pm.base_dir.resolve()
+    try:
+        requested = (project_root / path).resolve()
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    try:
+        requested.relative_to(project_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if not requested.exists() or not requested.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    media_type = mimetypes.guess_type(requested.name)[0] or "application/octet-stream"
+    return FileResponse(
+        path=str(requested),
+        media_type=media_type,
+        filename=requested.name,
+    )

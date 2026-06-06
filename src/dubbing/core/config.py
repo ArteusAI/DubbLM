@@ -53,6 +53,7 @@ class DubbingConfig:
             'refinement_max_tokens': None,
             'refinement_persona': 'normal',
             'enable_llm_editor': False,
+            'enable_llm_text_adjustment': True,
             'editor_llm_provider': None,
             'editor_model_name': None,
             'editor_temperature': 1.0,
@@ -89,6 +90,11 @@ class DubbingConfig:
             'emotion_enrichment_model': 'gemini-2.5-pro',
             'emotion_enrichment_temperature': 0.7,
             'enable_content_validation': True,
+            'content_validator_provider': 'whisper',
+            'content_validator_whisper_model': 'base',
+            'content_validator_whisper_compute_type': 'int8',
+            'content_validator_whisper_cpu_threads': 2,
+            'content_validator_speech_model': 'nano',
             # Parallel ffmpeg workers for per-segment video speed adjustments.
             # None = auto: min(8, max(2, cpu_count//4)). x264 is cache/RAM-bandwidth
             # bound so oversubscribing CPU cores thrashes throughput and exhausts RAM.
@@ -111,7 +117,16 @@ class DubbingConfig:
                 'max_segment_before_translate_chars': 420,
                 'max_segment_duration': 60,
                 'min_segment_duration': 0.5,
-                'max_segment_to_synth_tokens': 2048,
+                'max_segment_to_synth_tokens': 1024,
+                # Repair diarization over-fragmentation before TTS voice assignment.
+                # auto: repair only when speakerCount is set and diarization
+                # produced more labels than expected. true/false forces behavior.
+                'repair_speaker_fragmentation': 'auto',
+                'speaker_fragment_expected_speaker_margin': 2,
+                'speaker_fragment_max_duration': 3.0,
+                'speaker_fragment_max_words': 10,
+                'speaker_fragment_max_gap': 0.75,
+                'speaker_fragment_repair_passes': 3,
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,
@@ -306,8 +321,9 @@ class DubbingConfig:
         parser.add_argument('--refinement_model_name', type=str, help='Model name for refinement')
         parser.add_argument('--refinement_temperature', type=float, help='Temperature for refinement')
         parser.add_argument('--refinement_max_tokens', type=int, help='Maximum tokens for OpenRouter refinement')
-        parser.add_argument('--refinement_persona', type=str, choices=['normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
+        parser.add_argument('--refinement_persona', type=str, choices=['none', 'normal', 'casual_manager', 'child', 'housewife'], help='Persona for refinement prompt')
         parser.add_argument('--enable_llm_editor', type=lambda x: (str(x).lower() == 'true'), help='Enable an additional LLM editor pass after refinement (True/False)')
+        parser.add_argument('--enable_llm_text_adjustment', type=lambda x: (str(x).lower() == 'true'), help='Enable LLM text rewrites during TTS timing/recovery (True/False)')
         parser.add_argument('--editor_llm_provider', type=str, choices=['gemini', 'openrouter'], help='LLM provider to use for the optional editor pass')
         parser.add_argument('--editor_model_name', type=str, help='Model name for the optional editor pass')
         parser.add_argument('--editor_temperature', type=float, help='Temperature for the optional editor pass')
@@ -323,6 +339,11 @@ class DubbingConfig:
         parser.add_argument('--watermark_path', type=str, help='Path to the watermark PNG image')
         parser.add_argument('--watermark_text', type=str, help='Text to display under the watermark')
         parser.add_argument('--voice_auto_selection', type=lambda x: (str(x).lower() == 'true'), help='Enable automatic voice selection for TTS (True/False)')
+        parser.add_argument('--content_validator_provider', type=str, choices=['whisper', 'assemblyai'], help='ASR provider for TTS content validation')
+        parser.add_argument('--content_validator_whisper_model', type=str, help='Local Whisper model for TTS content validation')
+        parser.add_argument('--content_validator_whisper_compute_type', type=str, help='faster-whisper compute type for TTS content validation')
+        parser.add_argument('--content_validator_whisper_cpu_threads', type=int, help='CPU threads for local Whisper TTS content validation')
+        parser.add_argument('--content_validator_speech_model', type=str, help='AssemblyAI speech model for TTS content validation')
         parser.add_argument('--enable_emotion_analysis', type=lambda x: (str(x).lower() == 'true'), help='Enable emotion analysis for speech synthesis (True/False)')
         parser.add_argument('--run_step', type=str, choices=['combine_video'], 
                             help='Run only a specific, advanced pipeline step. This is intended for debugging or resuming a failed run where prior steps have successfully created their expected output files in the default locations. \

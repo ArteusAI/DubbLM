@@ -17,19 +17,21 @@ export enum TTSProvider {
 
 export type PresetId = 'fast' | 'hq' | 'ultra';
 export type VideoQualityPreset = '720p' | '1080p' | 'original';
-export type TtsStyleId = 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
-export type ResolvedTtsStyleId = 'podcast' | 'lecture' | 'gothic';
+export type TtsStyleId = 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
+export type ResolvedTtsStyleId = 'podcast' | 'lecture' | 'gothic' | 'news';
 
 export interface PresetConfig {
   id: PresetId;
   name: string;
   description: string;
   icon: string;
+  personaId?: string;
   keepBackground?: boolean;
   llmProvider: LlmProvider;
   llmModelName: string;
   llmTemperature: number;
   enableLlmEditor?: boolean;
+  enableLlmTextAdjustment?: boolean;
   editorLlmProvider?: LlmProvider;
   editorModelName?: string;
   editorTemperature?: number;
@@ -142,6 +144,7 @@ export interface AppConfig {
   llmModelName?: string;
   llmTemperature?: number;
   enableLlmEditor?: boolean;
+  enableLlmTextAdjustment?: boolean;
   editorLlmProvider?: LlmProvider;
   editorModelName?: string;
   editorTemperature?: number;
@@ -164,6 +167,11 @@ export interface AppConfig {
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  contentValidatorProvider?: 'whisper' | 'assemblyai';
+  contentValidatorWhisperModel?: string;
+  contentValidatorWhisperComputeType?: string;
+  contentValidatorWhisperCpuThreads?: number;
+  contentValidatorSpeechModel?: string;
   ttsStyle?: TtsStyleId;
   ttsPromptPrefix?: string;
   resolvedTtsStyle?: ResolvedTtsStyleId;

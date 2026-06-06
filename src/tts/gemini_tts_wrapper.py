@@ -17,7 +17,9 @@ import threading
 from .models import (
     TTSSegmentData, 
     SegmentAlignment,
-    DiarizationSegment
+    DiarizationSegment,
+    SegmentSynthesisReport,
+    BatchSynthesisReport,
 )
 from .gemini_voice_catalog import (
     ALL_GEMINI_VOICES,
@@ -26,8 +28,9 @@ from .gemini_voice_catalog import (
 )
 from .voice_sample_manager import VoiceSampleManager, AudioFileUtils, TextAnalysisUtils, AudioValidator
 from src.tts.tts_interface import TTSInterface
-from src.utils.sent_split import greedy_sent_split
+from src.utils.sent_split import greedy_sent_split, split_at_sentence_midpoint
 from src.utils.audio_embedder import AudioEmbedder
+from src.utils.batch_alignment import find_temporal_conflicts
 from src.utils.speaker_gender import (
     build_effective_speaker_gender_map,
     normalize_speaker_metadata_map,
@@ -55,6 +58,13 @@ except Exception:
     DialogueLine = None  # type: ignore[assignment]
     SpeakerSegment = None  # type: ignore[assignment]
     DIARIZER_AVAILABLE = False
+
+try:
+    from src.tts.local_whisper_validator import LocalWhisperContentValidator
+    LOCAL_WHISPER_VALIDATOR_AVAILABLE = True
+except Exception:
+    LocalWhisperContentValidator = None  # type: ignore[assignment]
+    LOCAL_WHISPER_VALIDATOR_AVAILABLE = False
 
 # Optional imports for voice matching features
 try:
@@ -114,11 +124,14 @@ DURATION_STATS_FILE = DEFAULT_SAMPLES_DIR / "gemini_voice_stats.json"
 DURATION_ADJUSTMENTS_FILE = DEFAULT_SAMPLES_DIR / "gemini_duration_adjustments.json"
 MAX_CHAR_LIMIT_PER_REQUEST = 1024*30
 SAMPLE_RATE = 24000
+MAX_SENTENCE_SPLIT_DEPTH = 5
+MIN_CHARS_FOR_SENTENCE_SPLIT = 80
 
 # Single source of truth for default Gemini TTS model names used across the
 # backend, presets, and cost estimator. Bump here to roll out a new default.
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-pro-preview-tts"
 DEFAULT_GEMINI_TTS_FALLBACK_MODEL = "gemini-2.5-flash-preview-tts"
+EXPERIMENTAL_GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
 
 
 class GeminiTTSConfig(BaseModel):
@@ -189,8 +202,14 @@ class GeminiTTSConfig(BaseModel):
     # expected words. Catches segments where speech was truncated at the end,
     # or where the model swallowed a chunk of the prompt.
     enable_content_validation: bool = True
-    # AssemblyAI model used for the round-trip ASR ("nano" is cheap/fast and
-    # good enough for coverage checks; "best" matches the diarizer default).
+    # ASR provider used for single-speaker round-trip content validation.
+    # Keep AssemblyAI available for compatibility; local Whisper is the default
+    # because it is cheap and good enough for coverage checks.
+    content_validator_provider: str = "whisper"
+    content_validator_whisper_model: str = "base"
+    content_validator_whisper_compute_type: str = "int8"
+    content_validator_whisper_cpu_threads: int = 2
+    # AssemblyAI model used when content_validator_provider == "assemblyai".
     content_validator_speech_model: str = "nano"
     # Overall token_set_ratio (0..100) threshold for expected-vs-ASR.
     content_similarity_threshold: float = 70.0
@@ -593,6 +612,10 @@ class GeminiTTSWrapper(TTSInterface):
             config_kwargs["min_voice_validation_duration_seconds"] = kwargs["min_voice_validation_duration_seconds"]
         for _content_key in (
             "enable_content_validation",
+            "content_validator_provider",
+            "content_validator_whisper_model",
+            "content_validator_whisper_compute_type",
+            "content_validator_whisper_cpu_threads",
             "content_validator_speech_model",
             "content_similarity_threshold",
             "content_trailing_word_count",
@@ -642,7 +665,7 @@ class GeminiTTSWrapper(TTSInterface):
         # Emotion enricher (will be initialized after API client is ready)
         self.emotion_enricher: Optional[EmotionEnricher] = None
         self.diarizer: Optional[SpeakerSegmentDiarizer] = None
-        self._content_validator: Optional[SpeakerSegmentDiarizer] = None
+        self._content_validator: Optional[Any] = None
         self._content_validator_lock = threading.Lock()
 
         # Voice mappings
@@ -717,6 +740,19 @@ class GeminiTTSWrapper(TTSInterface):
             return len(encoding.encode(text))
         except Exception as exc:
             raise RuntimeError(f"Failed to tokenize text for model '{self.config.model}': {exc}")
+
+    def _build_tts_prompt(self, prompt_parts: List[str], transcript: str) -> str:
+        """Join style instructions with a clear transcript boundary."""
+        cleaned_transcript = transcript.strip()
+        cleaned_parts = [part.strip() for part in prompt_parts if part and part.strip()]
+        if not cleaned_parts:
+            return cleaned_transcript
+
+        return (
+            f"{' '.join(cleaned_parts)}\n\n"
+            "Transcript to synthesize starts below. Speak only the transcript text, not the instructions.\n"
+            f"{cleaned_transcript}"
+        )
 
     def set_voice_mapping(self, mapping: Dict[str, str]) -> None:
         """Set a mapping of speaker IDs to Gemini voice names."""
@@ -1435,6 +1471,98 @@ class GeminiTTSWrapper(TTSInterface):
             logger.error(f"Error rephrasing text: {e}")
             return None
 
+    def _synthesize_by_sentence_split(
+        self,
+        segment_data: TTSSegmentData,
+        temp_output_path: str,
+        language: str,
+        max_retries_per_model: int,
+        previous_segments: Optional[List[str]],
+        usage_tracker: Optional[Dict[str, Any]],
+        attempts_counter: List[int],
+        synth_start_ts: float,
+        report_segment_index: Optional[int],
+        report_group_id: Optional[str],
+        primary_model_name: str,
+        split_depth: int,
+    ) -> Optional[Tuple[Optional[str], Optional[str], bool]]:
+        """Synthesize by halving text at a sentence boundary when monolithic synthesis fails."""
+        if split_depth >= MAX_SENTENCE_SPLIT_DEPTH:
+            return None
+
+        text = (segment_data.text or "").strip()
+        if len(text) < MIN_CHARS_FOR_SENTENCE_SPLIT:
+            return None
+
+        parts = split_at_sentence_midpoint(text)
+        if not parts:
+            return None
+
+        first_text, second_text = parts
+        logger.warning(
+            f"All synthesis attempts failed for {segment_data.speaker}. "
+            f"Splitting at sentence boundary into two parts "
+            f"({len(first_text)} + {len(second_text)} chars, depth={split_depth + 1})..."
+        )
+
+        part_paths: List[str] = []
+        model_used: Optional[str] = None
+        try:
+            for part_index, part_text in enumerate((first_text, second_text)):
+                part_path = f"{temp_output_path}_split{split_depth}_part{part_index}.wav"
+                part_segment = segment_data.model_copy(update={"text": part_text})
+                try:
+                    part_text_used, part_model, part_ok = self._synthesize_single_segment(
+                        part_segment,
+                        part_path,
+                        language,
+                        max_retries_per_model=max_retries_per_model,
+                        previous_segments=previous_segments,
+                        usage_tracker=usage_tracker,
+                        _split_depth=split_depth + 1,
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        f"Sentence-split part {part_index + 1}/2 failed for {segment_data.speaker}."
+                    )
+                    return None
+
+                if not part_ok or not os.path.exists(part_path):
+                    logger.warning(
+                        f"Sentence-split part {part_index + 1}/2 did not pass validation for "
+                        f"{segment_data.speaker}."
+                    )
+                    return None
+
+                part_paths.append(part_path)
+                if part_model:
+                    model_used = part_model
+
+            combined_audio = AudioFileUtils.concatenate_audio_files(part_paths, sample_rate=SAMPLE_RATE)
+            AudioFileUtils.save_wave_file(temp_output_path, combined_audio, rate=SAMPLE_RATE)
+
+            self._record_segment_report(SegmentSynthesisReport(
+                segment_index=report_segment_index if report_segment_index is not None else -1,
+                speaker=segment_data.speaker,
+                text=text,
+                requested_model=primary_model_name,
+                actual_model=model_used or primary_model_name,
+                attempts=attempts_counter[0],
+                used_fallback=False,
+                success=True,
+                duration_seconds=time.perf_counter() - synth_start_ts,
+                output_path=temp_output_path,
+                group_id=report_group_id,
+            ))
+            return text, model_used or primary_model_name, True
+        finally:
+            for part_path in part_paths:
+                if part_path != temp_output_path and os.path.exists(part_path):
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+
     def _synthesize_single_segment(
         self,
         segment_data: TTSSegmentData,
@@ -1442,7 +1570,8 @@ class GeminiTTSWrapper(TTSInterface):
         language: str,
         max_retries_per_model: int = 3,
         previous_segments: Optional[List[str]] = None,
-        usage_tracker: Optional[Dict[str, Any]] = None
+        usage_tracker: Optional[Dict[str, Any]] = None,
+        _split_depth: int = 0,
     ) -> Tuple[Optional[str], Optional[str], bool]:
         """Synthesizes a single segment and saves it to a temporary path with validation and retry logic.
 
@@ -1464,6 +1593,13 @@ class GeminiTTSWrapper(TTSInterface):
 
         original_text = segment_data.text
         current_text = original_text
+
+        synth_start_ts = time.perf_counter()
+        attempts_counter: List[int] = [0]
+        report_segment_index = getattr(segment_data, "segment_index", None)
+        report_group_id = getattr(segment_data, "group_id", None)
+        primary_model_name = self.config.model
+        fallback_error: Optional[str] = None
 
         def _cleanup_paths(paths: List[Optional[str]]) -> None:
             for path in paths:
@@ -1493,17 +1629,44 @@ class GeminiTTSWrapper(TTSInterface):
                     if os.path.exists(cached_path):
                         shutil.copy(cached_path, temp_output_path)
                         logger.debug(f"  Gemini: Using cached audio for speaker {segment_data.speaker}")
+                        self._record_segment_report(SegmentSynthesisReport(
+                            segment_index=report_segment_index if report_segment_index is not None else -1,
+                            speaker=segment_data.speaker,
+                            text=current_text,
+                            requested_model=primary_model_name,
+                            actual_model=primary_model_name,
+                            attempts=0,
+                            used_fallback=False,
+                            success=True,
+                            duration_seconds=time.perf_counter() - synth_start_ts,
+                            output_path=temp_output_path,
+                            group_id=report_group_id,
+                        ))
                         return None, None, True
 
                 success, best_silence, best_similarity, best_path, best_text, model_used, best_content_valid = self._attempt_segment_synthesis(
                     segment_data, temp_output_path, language, primary_model_retries, max_silence_ratio=0.2,  # was 0.02 — 10x relaxed
                     previous_segments=previous_segments,
-                    usage_tracker=usage_tracker
+                    usage_tracker=usage_tracker,
+                    attempts_counter=attempts_counter,
                 )
 
                 if success:
                     if best_path:
                         shutil.move(best_path, temp_output_path)
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=report_segment_index if report_segment_index is not None else -1,
+                        speaker=segment_data.speaker,
+                        text=best_text or current_text,
+                        requested_model=primary_model_name,
+                        actual_model=model_used or primary_model_name,
+                        attempts=attempts_counter[0],
+                        used_fallback=bool(model_used and model_used != primary_model_name),
+                        success=True,
+                        duration_seconds=time.perf_counter() - synth_start_ts,
+                        output_path=temp_output_path,
+                        group_id=report_group_id,
+                    ))
                     return best_text, model_used, True
 
                 if best_path:
@@ -1589,12 +1752,26 @@ class GeminiTTSWrapper(TTSInterface):
                     self.config.fallback_model_max_retries, max_silence_ratio=0.2,
                     previous_segments=previous_segments,
                     usage_tracker=usage_tracker,
+                    attempts_counter=attempts_counter,
                 )
 
                 if success and fb_path:
                     if primary_best is not None:
                         _cleanup_paths([primary_best["path"]])
                     shutil.move(fb_path, temp_output_path)
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=report_segment_index if report_segment_index is not None else -1,
+                        speaker=segment_data.speaker,
+                        text=fb_text or current_text,
+                        requested_model=primary_model_name,
+                        actual_model=fb_model_used or fallback_model,
+                        attempts=attempts_counter[0],
+                        used_fallback=True,
+                        success=True,
+                        duration_seconds=time.perf_counter() - synth_start_ts,
+                        output_path=temp_output_path,
+                        group_id=report_group_id,
+                    ))
                     return fb_text, fb_model_used, True
 
                 if fb_path:
@@ -1614,7 +1791,40 @@ class GeminiTTSWrapper(TTSInterface):
                     else:
                         _cleanup_paths([fb_path])
 
+            split_result = self._synthesize_by_sentence_split(
+                segment_data=segment_data,
+                temp_output_path=temp_output_path,
+                language=language,
+                max_retries_per_model=max_retries_per_model,
+                previous_segments=previous_segments,
+                usage_tracker=usage_tracker,
+                attempts_counter=attempts_counter,
+                synth_start_ts=synth_start_ts,
+                report_segment_index=report_segment_index,
+                report_group_id=report_group_id,
+                primary_model_name=primary_model_name,
+                split_depth=_split_depth,
+            )
+            if split_result is not None:
+                if primary_best is not None:
+                    _cleanup_paths([primary_best["path"]])
+                return split_result
+
             if primary_best is None:
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index if report_segment_index is not None else -1,
+                    speaker=segment_data.speaker,
+                    text=current_text,
+                    requested_model=primary_model_name,
+                    actual_model=None,
+                    attempts=attempts_counter[0],
+                    used_fallback=bool(self.config.fallback_model and self.config.fallback_model != primary_model_name),
+                    success=False,
+                    duration_seconds=time.perf_counter() - synth_start_ts,
+                    output_path=None,
+                    group_id=report_group_id,
+                    error="all attempts failed",
+                ))
                 raise RuntimeError(
                     f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts."
                 )
@@ -1628,6 +1838,20 @@ class GeminiTTSWrapper(TTSInterface):
                 f"content_valid: {primary_best['content_valid']})"
             )
             shutil.move(primary_best["path"], temp_output_path)
+            self._record_segment_report(SegmentSynthesisReport(
+                segment_index=report_segment_index if report_segment_index is not None else -1,
+                speaker=segment_data.speaker,
+                text=primary_best["text"] or current_text,
+                requested_model=primary_model_name,
+                actual_model=primary_best["model"] or primary_model_name,
+                attempts=attempts_counter[0],
+                used_fallback=bool(primary_best["model"] and primary_best["model"] != primary_model_name),
+                success=False,
+                duration_seconds=time.perf_counter() - synth_start_ts,
+                output_path=temp_output_path,
+                group_id=report_group_id,
+                error=f"validation failed (silence={primary_best['silence']:.2f}, content_valid={primary_best['content_valid']})",
+            ))
             return primary_best["text"], primary_best["model"], False
         finally:
             # Always restore primary model so subsequent segments start fresh.
@@ -1637,7 +1861,8 @@ class GeminiTTSWrapper(TTSInterface):
     def _attempt_segment_synthesis(self, segment_data: TTSSegmentData, temp_output_path: str,
                                  language: str, max_retries: int, max_silence_ratio: float = 0.2,  # was 0.02 — 10x relaxed
                                  previous_segments: Optional[List[str]] = None,
-                                 usage_tracker: Optional[Dict[str, Any]] = None) -> Tuple[bool, float, Optional[float], Optional[str], Optional[str], Optional[str], bool]:
+                                 usage_tracker: Optional[Dict[str, Any]] = None,
+                                 attempts_counter: Optional[List[int]] = None) -> Tuple[bool, float, Optional[float], Optional[str], Optional[str], Optional[str], bool]:
         """
         Attempt segment synthesis with the current model.
         Returns a tuple of
@@ -1645,6 +1870,10 @@ class GeminiTTSWrapper(TTSInterface):
          best_attempt_text, model_used, best_content_valid).
         ``best_content_valid`` refers to the best_attempt picked (True when
         content validation was skipped/disabled or passed, False on mismatch).
+
+        If ``attempts_counter`` is provided, each TTS call increments
+        ``attempts_counter[0]`` so callers can aggregate per-segment telemetry
+        across primary + fallback passes.
         """
         best_attempt_path: Optional[str] = None
         best_attempt_text: Optional[str] = None
@@ -1684,6 +1913,8 @@ class GeminiTTSWrapper(TTSInterface):
 
         for attempt in range(max_retries):
             temp_attempt_path = f"{temp_output_path}_attempt_{self.api_client.current_model}_{attempt}.wav"
+            if attempts_counter is not None:
+                attempts_counter[0] += 1
 
             try:
                 logger.debug(f"  Gemini: Synthesizing segment for {speaker_id} (attempt {attempt + 1}/{max_retries}) with model {self.api_client.current_model}")
@@ -1698,7 +1929,7 @@ class GeminiTTSWrapper(TTSInterface):
                 if style_hint:
                     prompt_parts.append(style_hint)
                 if prompt_parts:
-                    final_text = f"{' '.join(prompt_parts)}\n\n{text_to_synthesize}"
+                    final_text = self._build_tts_prompt(prompt_parts, text_to_synthesize)
 
                 logger.debug(f"  TTS Synthesis for [{speaker_id}]:")
                 logger.debug(f"    Voice: {voice_name}")
@@ -1890,22 +2121,33 @@ class GeminiTTSWrapper(TTSInterface):
         cleaned = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
         return re.sub(r"\s+", " ", cleaned).strip().lower()
 
-    def _get_content_validator(self) -> Optional["SpeakerSegmentDiarizer"]:
-        """Return a diarizer for round-trip ASR checks (reuse or lazy-init)."""
+    def _get_content_validator(self) -> Optional[Any]:
+        """Return an ASR helper for round-trip content checks (reuse or lazy-init)."""
         if not self.config.enable_content_validation:
             return None
-        if not DIARIZER_AVAILABLE or SpeakerSegmentDiarizer is None:
-            return None
-        if self.diarizer is not None:
+        provider = str(self.config.content_validator_provider or "whisper").lower()
+        if provider == "assemblyai" and self.diarizer is not None:
             return self.diarizer
         with self._content_validator_lock:
             if self._content_validator is not None:
                 return self._content_validator
             try:
-                self._content_validator = SpeakerSegmentDiarizer(
-                    language_code=self.target_language,
-                    speech_model=self.config.content_validator_speech_model,
-                )
+                if provider == "assemblyai":
+                    if not DIARIZER_AVAILABLE or SpeakerSegmentDiarizer is None:
+                        return None
+                    self._content_validator = SpeakerSegmentDiarizer(
+                        language_code=self.target_language,
+                        speech_model=self.config.content_validator_speech_model,
+                    )
+                else:
+                    if not LOCAL_WHISPER_VALIDATOR_AVAILABLE or LocalWhisperContentValidator is None:
+                        return None
+                    self._content_validator = LocalWhisperContentValidator(
+                        language_code=self.target_language,
+                        model_name=self.config.content_validator_whisper_model,
+                        compute_type=self.config.content_validator_whisper_compute_type,
+                        cpu_threads=self.config.content_validator_whisper_cpu_threads,
+                    )
             except Exception as exc:
                 logger.warning(f"Content validator init failed: {exc}. Content checks disabled.")
                 self.config.enable_content_validation = False
@@ -1937,6 +2179,21 @@ class GeminiTTSWrapper(TTSInterface):
         validator = self._get_content_validator()
         if validator is None:
             return True, "Content validator unavailable", None
+
+        validation_audio_seconds = AudioFileUtils.get_audio_duration_seconds(Path(audio_path)) or 0.0
+        if self.cost_tracker and validation_audio_seconds > 0:
+            provider = str(self.config.content_validator_provider or "whisper").lower()
+            model_name = (
+                self.config.content_validator_speech_model
+                if provider == "assemblyai"
+                else self.config.content_validator_whisper_model
+            )
+            self.cost_tracker.add_transcription_usage(
+                provider,
+                float(validation_audio_seconds),
+                model=str(model_name),
+                category="tts_content_validation",
+            )
 
         try:
             asr_text = validator.transcribe_text(audio_path)
@@ -1982,6 +2239,13 @@ class GeminiTTSWrapper(TTSInterface):
             grouped[idx].sort(key=lambda s: s.start_ms)
         return grouped
 
+    @staticmethod
+    def _find_temporal_conflicts(
+        best_per_line: Dict[int, SpeakerSegment],
+        overlap_tolerance_ms: int = 120,
+    ) -> Dict[int, str]:
+        return find_temporal_conflicts(best_per_line, overlap_tolerance_ms)
+
     def _build_multi_speaker_prompt(
         self,
         batch: List[TTSSegmentData],
@@ -1989,6 +2253,9 @@ class GeminiTTSWrapper(TTSInterface):
     ) -> str:
         """Build the multi-speaker transcript prompt (Speaker: line per turn)."""
         preamble_parts: List[str] = []
+        if self.config.prompt_prefix:
+            preamble_parts.append(self.config.prompt_prefix)
+
         if len(speakers) == 2:
             preamble_parts.append(f"TTS the following conversation between {speakers[0]} and {speakers[1]}:")
         else:
@@ -2003,7 +2270,7 @@ class GeminiTTSWrapper(TTSInterface):
             preamble_parts.append("\n".join(style_lines))
 
         transcript_lines = [f"{seg.speaker}: {seg.text.strip()}" for seg in batch]
-        return "\n\n".join([p for p in preamble_parts if p.strip()] + ["\n".join(transcript_lines)])
+        return self._build_tts_prompt(preamble_parts, "\n".join(transcript_lines))
 
     def _synthesize_multi_speaker_batch(
         self,
@@ -2011,18 +2278,19 @@ class GeminiTTSWrapper(TTSInterface):
         batch_indices: List[int],
         language: str,
         usage_tracker: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Dict[int, SegmentAlignment], List[int]]:
+    ) -> Tuple[Dict[int, SegmentAlignment], List[int], int]:
         """Synthesize a 2-speaker batch, diarize, slice, validate.
 
-        Returns a tuple ``(alignments_by_global_index, invalid_global_indices)`` with
-        a best-effort partial result. The caller is expected to re-synthesize the
-        invalid indices via single-speaker synthesis. Raises only when no attempt
-        produced a usable API response at all (e.g. empty audio, diarizer crash).
+        Returns ``(alignments_by_global_index, invalid_global_indices, attempts_used)``
+        with a best-effort partial result. The caller is expected to
+        re-synthesize the invalid indices via single-speaker synthesis. Raises
+        only when no attempt produced a usable API response at all (e.g. empty
+        audio, diarizer crash).
         """
         if not DIARIZER_AVAILABLE or not self.diarizer or DialogueLine is None or SpeakerSegment is None:
             raise RuntimeError("SpeakerSegmentDiarizer not initialized.")
         if not batch:
-            return {}, []
+            return {}, [], 0
 
         speakers = sorted({str(s.speaker) for s in batch if s.speaker})
         if len(speakers) != 2:
@@ -2046,8 +2314,10 @@ class GeminiTTSWrapper(TTSInterface):
         best_alignments: Dict[int, SegmentAlignment] = {}
         best_invalid_global: Optional[List[int]] = None
         last_err: Optional[Exception] = None
+        attempts_used = 0
         max_attempts = max(1, int(self.config.multi_speaker_retries) + 1)
         for attempt in range(max_attempts):
+            attempts_used = attempt + 1
             tmp_dir = tempfile.mkdtemp(prefix="gemini_multi_speaker_")
             batch_wav_path = os.path.join(tmp_dir, f"batch_attempt_{attempt}.wav")
             try:
@@ -2067,14 +2337,21 @@ class GeminiTTSWrapper(TTSInterface):
                 batch_duration = AudioFileUtils.get_audio_duration_seconds(Path(batch_wav_path)) or 0.0
                 if batch_duration:
                     self._register_usage(usage_tracker, self.api_client.current_model, audio_seconds=batch_duration)
+                    if self.cost_tracker:
+                        diarizer_model = getattr(self.diarizer, "_speech_model", "best") or "best"
+                        self.cost_tracker.add_transcription_usage(
+                            "assemblyai",
+                            float(batch_duration),
+                            model=str(diarizer_model),
+                            category="tts_batch_alignment",
+                        )
 
-                diar = self.diarizer.diarize(batch_wav_path, expected_lines)
+                diar = self.diarizer.align_by_text(batch_wav_path, expected_lines)
                 grouped = self._group_segments_by_matched_line(diar.segments)
 
-                # Pre-select a single best-scoring ASR utterance per expected line, then
-                # detect when two expected lines ended up pointing at the same utterance.
-                # Without this step the old code used min..max of the whole group which
-                # caused slices to bleed across utterances and duplicate audio on the timeline.
+                # Pre-select a single best-scoring text span per expected line.
+                # The alignment itself is text-only; speaker identity comes from
+                # the known batch line, not from ASR speaker labels.
                 best_per_line: Dict[int, SpeakerSegment] = {}
                 for local_i in range(len(batch)):
                     group = grouped.get(local_i)
@@ -2083,8 +2360,8 @@ class GeminiTTSWrapper(TTSInterface):
                     if len(group) > 1:
                         logger.debug(
                             f"Gemini MS slice #{batch_indices[local_i] + 1} "
-                            f"({batch[local_i].speaker}): diarizer grouped {len(group)} ASR "
-                            f"utterances to this line; keeping best-scoring one "
+                            f"({batch[local_i].speaker}): text aligner returned {len(group)} ASR "
+                            f"span candidates for this line; keeping best-scoring one "
                             f"(scores: {[round(float(g.fuzzy_score), 1) for g in group]})"
                         )
                     best_per_line[local_i] = max(
@@ -2100,23 +2377,35 @@ class GeminiTTSWrapper(TTSInterface):
                         colliding.add(local_i)
                     else:
                         utt_owner[key] = local_i
+                temporal_conflicts = self._find_temporal_conflicts(best_per_line)
 
-                alignments: Dict[int, SegmentAlignment] = {}
+                candidate_alignments: Dict[int, SegmentAlignment] = {}
+                candidate_slice_paths: Dict[int, str] = {}
+                candidate_durations: Dict[int, float] = {}
                 invalid_local_indices: List[int] = []
                 for local_i, seg in enumerate(batch):
                     global_i = batch_indices[local_i]
                     if local_i not in best_per_line:
                         logger.info(
-                            f"Gemini MS slice #{global_i + 1} ({seg.speaker}): diarizer found "
-                            f"no matching segment for this line (attempt {attempt + 1}/{max_attempts})"
+                            f"Gemini MS slice #{global_i + 1} ({seg.speaker}): text aligner found "
+                            f"no matching ASR span for this line (attempt {attempt + 1}/{max_attempts})"
                         )
                         invalid_local_indices.append(local_i)
                         continue
                     if local_i in colliding:
                         logger.info(
-                            f"Gemini MS slice #{global_i + 1} ({seg.speaker}): diarizer assigned "
-                            f"the same ASR utterance to multiple lines in this batch — "
+                            f"Gemini MS slice #{global_i + 1} ({seg.speaker}): text aligner assigned "
+                            f"the same ASR span to multiple lines in this batch — "
                             f"marking invalid to avoid duplicate audio on the timeline "
+                            f"(attempt {attempt + 1}/{max_attempts})"
+                        )
+                        invalid_local_indices.append(local_i)
+                        continue
+                    if local_i in temporal_conflicts:
+                        logger.info(
+                            f"Gemini MS slice #{global_i + 1} ({seg.speaker}): "
+                            f"{temporal_conflicts[local_i]} — marking invalid to avoid "
+                            f"overlapping or repeated audio on the timeline "
                             f"(attempt {attempt + 1}/{max_attempts})"
                         )
                         invalid_local_indices.append(local_i)
@@ -2150,7 +2439,7 @@ class GeminiTTSWrapper(TTSInterface):
                     }
                     is_valid, audio_reason, _silence_ratio = AudioValidator.validate_audio_sample(
                         slice_path,
-                        expected_min_duration=0.2,  # diarizer already validated text match; keep a tiny floor only
+                        expected_min_duration=0.2,  # text aligner already matched content; keep a tiny floor only
                         max_silence_ratio=0.5,  # was 0.05 — temporarily 10x to stop MS slice false-positives
                         trailing_silence_grace_ratio=self.config.trailing_silence_grace_ratio,
                         fade_detection_config=fade_config,
@@ -2188,19 +2477,51 @@ class GeminiTTSWrapper(TTSInterface):
                         text=str(seg.text),
                         confidence=1.0,
                     )
-                    alignments[global_i] = SegmentAlignment(
+                    candidate_alignments[local_i] = SegmentAlignment(
                         original_segment=seg,
                         diarized_segment=diarized_segment,
                         alignment_confidence=1.0,
                     )
+                    candidate_slice_paths[local_i] = slice_path
+                    candidate_durations[local_i] = duration
 
+                alignments: Dict[int, SegmentAlignment] = {
+                    batch_indices[local_i]: alignment
+                    for local_i, alignment in candidate_alignments.items()
+                    if local_i not in invalid_local_indices
+                }
+                for local_i in sorted(candidate_alignments):
+                    if local_i in invalid_local_indices:
+                        continue
+                    seg = batch[local_i]
+                    global_i = batch_indices[local_i]
+                    slice_path = candidate_slice_paths[local_i]
+                    duration = candidate_durations.get(local_i, 0.0)
                     if seg.output_path:
                         os.makedirs(os.path.dirname(seg.output_path), exist_ok=True)
                         shutil.copy(slice_path, seg.output_path)
 
-                    # Populate wrapper-level audio cache so a subsequent single-segment
-                    # synthesize() call for the same payload short-circuits instead of
-                    # re-hitting the model.
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=(
+                            getattr(seg, "segment_index", None)
+                            if getattr(seg, "segment_index", None) is not None
+                            else global_i
+                        ),
+                        speaker=seg.speaker,
+                        text=seg.text,
+                        requested_model=self.config.model,
+                        actual_model=self.config.model,
+                        attempts=attempt + 1,
+                        used_fallback=False,
+                        success=True,
+                        duration_seconds=duration,
+                        output_path=seg.output_path or slice_path,
+                        group_id=getattr(seg, "group_id", None),
+                    ))
+
+                    # Populate wrapper-level audio cache only after all batch
+                    # validations have passed; otherwise a contaminated slice can
+                    # be reused by the single-speaker fallback in the same run.
                     if self._cache_dir:
                         try:
                             cache_key = self._get_cache_key(seg, language)
@@ -2215,7 +2536,7 @@ class GeminiTTSWrapper(TTSInterface):
 
                 invalid_global = [batch_indices[i] for i in invalid_local_indices]
                 if not invalid_global:
-                    return alignments, []
+                    return alignments, [], attempts_used
 
                 if best_invalid_global is None or len(invalid_global) < len(best_invalid_global):
                     best_alignments = alignments
@@ -2252,12 +2573,12 @@ class GeminiTTSWrapper(TTSInterface):
                 if batch_indices else "#?"
             )
             logger.warning(
-                f"Gemini batch {idx_range}: multi-speaker after {max_attempts} attempt(s) "
+                f"Gemini batch {idx_range}: multi-speaker after {attempts_used} attempt(s) "
                 f"— kept {len(best_alignments)} valid slice(s), {len(best_invalid_global)} "
                 f"slice(s) need single-speaker fallback "
                 f"(global indices: {[g + 1 for g in best_invalid_global]})"
             )
-            return best_alignments, best_invalid_global
+            return best_alignments, best_invalid_global, attempts_used
 
         raise RuntimeError(f"Multi-speaker batch failed after retries: {last_err}")
 
@@ -2288,6 +2609,13 @@ class GeminiTTSWrapper(TTSInterface):
         """
         segment_file_path = os.path.join(temp_dir, f"segment_{segment_index}_{segment.speaker}.wav")
 
+        report_segment_index = (
+            getattr(segment, "segment_index", None)
+            if getattr(segment, "segment_index", None) is not None
+            else segment_index
+        )
+        report_group_id = getattr(segment, "group_id", None)
+
         # Check if we already have this segment in cache
         cache_key = self._get_cache_key(segment, language)
         if cache_key in self._audio_cache:
@@ -2301,6 +2629,20 @@ class GeminiTTSWrapper(TTSInterface):
                     os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
                     shutil.copy(segment_file_path, segment.output_path)
                     logger.debug(f"Saved segment audio to {segment.output_path}")
+
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index,
+                    speaker=segment.speaker,
+                    text=segment.text,
+                    requested_model=self.config.model,
+                    actual_model=self.config.model,
+                    attempts=0,
+                    used_fallback=False,
+                    success=True,
+                    duration_seconds=0.0,
+                    output_path=segment.output_path or segment_file_path,
+                    group_id=report_group_id,
+                ))
 
                 # Create alignment using cached duration
                 diarized = DiarizationSegment(
@@ -2385,6 +2727,20 @@ class GeminiTTSWrapper(TTSInterface):
 
         except Exception as e_segment:
             logger.error(f"Error synthesizing segment {segment_index+1} for speaker '{segment.speaker}': {e_segment}")
+            self._record_segment_report(SegmentSynthesisReport(
+                segment_index=report_segment_index,
+                speaker=segment.speaker,
+                text=segment.text,
+                requested_model=self.config.model,
+                actual_model=None,
+                attempts=0,
+                used_fallback=False,
+                success=False,
+                duration_seconds=0.0,
+                output_path=None,
+                group_id=report_group_id,
+                error=str(e_segment),
+            ))
             return None
 
     def synthesize(
@@ -2464,7 +2820,7 @@ class GeminiTTSWrapper(TTSInterface):
         results: Dict[int, Optional[SegmentAlignment]] = {}
         results_lock = threading.Lock()
 
-        def process_batch(batch: List[TTSSegmentData]) -> None:
+        def process_batch(batch_idx: int, batch: List[TTSSegmentData]) -> None:
             batch_indices = [seg_to_index[id(seg)] for seg in batch]
             unique_speakers = sorted({str(s.speaker) for s in batch if s.speaker})
             if batch_indices:
@@ -2474,40 +2830,86 @@ class GeminiTTSWrapper(TTSInterface):
                 )
             else:
                 idx_range = "#-"
+
+            batch_started = time.perf_counter()
+            batch_mode = "single_segment" if len(batch) <= 1 else "single_speaker"
+            batch_attempts = 0
+            batch_success = True
+            batch_fallback_count = 0
+            batch_reason = ""
+            max_ms_attempts = max(1, int(self.config.multi_speaker_retries) + 1)
+
             invalid_after_ms: Optional[List[int]] = None
             if multi_speaker_mode and len(unique_speakers) == 2:
+                batch_mode = "multi_speaker"
                 logger.info(
                     f"Gemini batch {idx_range}: multi-speaker synth "
                     f"({len(batch)} lines, speakers: {' + '.join(unique_speakers)})"
                 )
                 try:
-                    batch_alignments, invalid_global = self._synthesize_multi_speaker_batch(
+                    batch_alignments, invalid_global, ms_attempts = self._synthesize_multi_speaker_batch(
                         batch=batch,
                         batch_indices=batch_indices,
                         language=language,
                         usage_tracker=usage_tracker,
                     )
+                    batch_attempts = ms_attempts
                     with results_lock:
                         for idx, alignment in batch_alignments.items():
                             results[idx] = alignment
                     if not invalid_global:
+                        batch_reason = (
+                            f"multi-speaker ok in {ms_attempts}/{max_ms_attempts} attempt(s)"
+                        )
+                        self._record_batch_report(BatchSynthesisReport(
+                            batch_index=batch_idx,
+                            mode=batch_mode,
+                            segment_indices=list(batch_indices),
+                            speakers=list(unique_speakers),
+                            attempts=batch_attempts,
+                            success=True,
+                            fallback_segment_count=0,
+                            duration_seconds=time.perf_counter() - batch_started,
+                            reason=batch_reason,
+                        ))
                         return
                     invalid_after_ms = invalid_global
+                    batch_success = False
+                    batch_fallback_count = len(invalid_global)
+                    batch_reason = (
+                        f"partial multi-speaker: {len(invalid_global)}/{len(batch)} "
+                        f"slice(s) fell back to single-speaker after "
+                        f"{ms_attempts}/{max_ms_attempts} attempt(s)"
+                    )
                     logger.info(
                         f"Gemini batch {idx_range}: re-synth {len(invalid_global)} slice(s) "
                         f"via single-speaker "
                         f"(global indices: {[g + 1 for g in invalid_global]})"
                     )
                 except Exception as exc:
+                    batch_attempts = max_ms_attempts
+                    batch_success = False
+                    batch_fallback_count = len(batch)
+                    batch_reason = (
+                        f"multi-speaker raised {type(exc).__name__}: {exc}"
+                    )[:240]
                     logger.warning(
                         f"Gemini batch {idx_range}: multi-speaker failed, falling back to single-speaker "
                         f"synthesis ({len(batch)} segment(s)). Error: {exc}"
                     )
             elif len(batch) > 1:
+                batch_attempts = 1
+                batch_reason = (
+                    f"single-speaker run of {len(batch)} segment(s) "
+                    f"(speaker: {unique_speakers[0] if unique_speakers else '?'})"
+                )
                 logger.info(
                     f"Gemini batch {idx_range}: single-speaker run "
                     f"({len(batch)} lines, speaker: {unique_speakers[0] if unique_speakers else '?'})"
                 )
+            else:
+                batch_attempts = 1
+                batch_reason = "single-segment synthesis"
 
             for idx, seg in zip(batch_indices, batch):
                 if invalid_after_ms is not None and idx not in invalid_after_ms:
@@ -2524,6 +2926,18 @@ class GeminiTTSWrapper(TTSInterface):
                 with results_lock:
                     results[idx] = alignment
 
+            self._record_batch_report(BatchSynthesisReport(
+                batch_index=batch_idx,
+                mode=batch_mode,
+                segment_indices=list(batch_indices),
+                speakers=list(unique_speakers),
+                attempts=batch_attempts,
+                success=batch_success,
+                fallback_segment_count=batch_fallback_count,
+                duration_seconds=time.perf_counter() - batch_started,
+                reason=batch_reason,
+            ))
+
         total_segments = len(valid_segments)
         completed_segments = 0
         progress_lock = threading.Lock()
@@ -2538,7 +2952,10 @@ class GeminiTTSWrapper(TTSInterface):
             max_workers = min(self.config.max_workers, max(1, len(batches)))
             logger.debug(f"Gemini: Starting batch synthesis with {max_workers} workers for {len(batches)} batches")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_batch = {executor.submit(process_batch, b): b for b in batches}
+                future_to_batch = {
+                    executor.submit(process_batch, i, b): b
+                    for i, b in enumerate(batches)
+                }
                 for future in as_completed(future_to_batch):
                     future.result()
                     if progress_callback:

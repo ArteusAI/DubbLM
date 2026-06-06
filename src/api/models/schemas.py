@@ -38,6 +38,7 @@ class ProjectConfig(BaseModel):
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
     enableLlmEditor: Optional[bool] = None
+    enableLlmTextAdjustment: Optional[bool] = None
     editorLlmProvider: Optional[str] = None
     editorModelName: Optional[str] = None
     editorTemperature: Optional[float] = None
@@ -57,6 +58,11 @@ class ProjectConfig(BaseModel):
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
     enableContentValidation: Optional[bool] = None
+    contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
+    contentValidatorWhisperModel: Optional[str] = None
+    contentValidatorWhisperComputeType: Optional[str] = None
+    contentValidatorWhisperCpuThreads: Optional[int] = None
+    contentValidatorSpeechModel: Optional[str] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None
@@ -65,6 +71,7 @@ class ProjectConfig(BaseModel):
     maxWorkers: Optional[int] = None
     postDiarizationMergeGap: Optional[float] = None
     postTranslationMergeGap: Optional[float] = None
+    repairSpeakerFragmentation: Optional[bool] = None
     maxSegmentDuration: Optional[float] = None
     minSegmentDuration: Optional[float] = None
     comfortMinAdjustmentRatio: Optional[float] = None
@@ -94,6 +101,7 @@ class ProjectConfigUpdate(BaseModel):
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
     enableLlmEditor: Optional[bool] = None
+    enableLlmTextAdjustment: Optional[bool] = None
     editorLlmProvider: Optional[str] = None
     editorModelName: Optional[str] = None
     editorTemperature: Optional[float] = None
@@ -113,6 +121,11 @@ class ProjectConfigUpdate(BaseModel):
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
     enableContentValidation: Optional[bool] = None
+    contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
+    contentValidatorWhisperModel: Optional[str] = None
+    contentValidatorWhisperComputeType: Optional[str] = None
+    contentValidatorWhisperCpuThreads: Optional[int] = None
+    contentValidatorSpeechModel: Optional[str] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None
@@ -121,6 +134,7 @@ class ProjectConfigUpdate(BaseModel):
     maxWorkers: Optional[int] = None
     postDiarizationMergeGap: Optional[float] = None
     postTranslationMergeGap: Optional[float] = None
+    repairSpeakerFragmentation: Optional[bool] = None
     maxSegmentDuration: Optional[float] = None
     minSegmentDuration: Optional[float] = None
     comfortMinAdjustmentRatio: Optional[float] = None
@@ -269,6 +283,15 @@ class JobResponse(BaseModel):
     type: Optional[str] = None
     progress: int = 0
     currentStep: Optional[str] = None
+
+
+class ExternalTranslateResponse(BaseModel):
+    """Schema for one-shot external translate response."""
+    projectId: str
+    jobId: str
+    status: str
+    pollUrl: str
+    downloadUrl: str
 
 
 # --- Resource Schemas ---

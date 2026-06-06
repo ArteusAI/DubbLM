@@ -11,6 +11,8 @@ import {
   WHISPER_MODELS,
   TTS_STYLES,
   GEMINI_DEFAULT_TTS_MODEL,
+  GEMINI_EXPERIMENTAL_TTS_MODEL,
+  GEMINI_TTS_MODEL_OPTIONS,
 } from '../constants';
 import api, { VoiceResponse } from '../api';
 
@@ -127,6 +129,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
   const [newSpeakerVoiceId, setNewSpeakerVoiceId] = useState('');
   const [playingSampleKey, setPlayingSampleKey] = useState<string | null>(null);
   const [showStartMenu, setShowStartMenu] = useState(false);
+  const [useCustomTtsModel, setUseCustomTtsModel] = useState(false);
   const [originalAudioRanges, setOriginalAudioRanges] = useState<TimeRangeRow[]>(
     () => (config.keepOriginalAudioRanges || []).map(parseTimeRange)
   );
@@ -384,12 +387,13 @@ export const UploadView: React.FC<UploadViewProps> = ({
                     const presetFromApi = await api.getPreset(preset.id).catch(() => null);
                     const updates: Partial<AppConfig> = { 
                       preset: preset.id as PresetId,
-                      personaId: preset.id === 'fast' ? 'none' : 'normal',
+                      personaId: presetFromApi?.personaId ?? preset.personaId ?? (preset.id === 'ultra' ? 'normal' : 'none'),
                       keepBackground: presetFromApi?.keepBackground ?? preset.keepBackground ?? false,
                       llmProvider: (presetFromApi?.llmProvider as LlmProvider) ?? preset.llmProvider,
                       llmModelName: presetFromApi?.llmModelName ?? preset.llmModelName,
                       llmTemperature: presetFromApi?.llmTemperature ?? preset.llmTemperature,
                       enableLlmEditor: presetFromApi?.enableLlmEditor ?? preset.enableLlmEditor,
+                      enableLlmTextAdjustment: presetFromApi?.enableLlmTextAdjustment ?? preset.enableLlmTextAdjustment,
                       editorLlmProvider: (presetFromApi?.editorLlmProvider as LlmProvider | undefined) ?? preset.editorLlmProvider,
                       editorModelName: presetFromApi?.editorModelName ?? preset.editorModelName,
                       editorTemperature: presetFromApi?.editorTemperature ?? preset.editorTemperature,
@@ -849,15 +853,57 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Model
-                            <InfoTip text={`TTS model name (e.g., ${GEMINI_DEFAULT_TTS_MODEL})`} />
+                            <InfoTip text={`TTS model name. Experimental option: ${GEMINI_EXPERIMENTAL_TTS_MODEL}`} />
                           </label>
-                          <input 
-                            type="text"
-                            value={config.ttsModel || currentPreset.ttsModel || ''}
-                            onChange={(e) => onConfigChange({ ttsModel: e.target.value || undefined })}
-                            className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                            placeholder="Default model"
-                          />
+                          {selectedTtsProvider === 'gemini' ? (() => {
+                            const modelValue = config.ttsModel || currentPreset.ttsModel || '';
+                            const isKnownGeminiModel = GEMINI_TTS_MODEL_OPTIONS.includes(modelValue);
+                            const selectValue = useCustomTtsModel || !isKnownGeminiModel ? 'custom' : modelValue;
+                            return (
+                              <div className="space-y-1">
+                                <div className="relative">
+                                  <select
+                                    value={selectValue}
+                                    onChange={(e) => {
+                                      const value = e.target.value;
+                                      if (value === 'custom') {
+                                        setUseCustomTtsModel(true);
+                                        return;
+                                      }
+                                      setUseCustomTtsModel(false);
+                                      onConfigChange({ ttsModel: value });
+                                    }}
+                                    className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 pr-6 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                  >
+                                    {GEMINI_TTS_MODEL_OPTIONS.map((model) => (
+                                      <option key={model} value={model}>
+                                        {model === GEMINI_EXPERIMENTAL_TTS_MODEL ? `${model} (experimental)` : model}
+                                      </option>
+                                    ))}
+                                    <option value="custom">Custom model...</option>
+                                  </select>
+                                  <ChevronDown className="absolute right-2 top-1.5 w-3.5 h-3.5 text-zinc-500 pointer-events-none" />
+                                </div>
+                                {selectValue === 'custom' && (
+                                  <input
+                                    type="text"
+                                    value={modelValue}
+                                    onChange={(e) => onConfigChange({ ttsModel: e.target.value || undefined })}
+                                    className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                                    placeholder="Custom Gemini model"
+                                  />
+                                )}
+                              </div>
+                            );
+                          })() : (
+                            <input
+                              type="text"
+                              value={config.ttsModel || currentPreset.ttsModel || ''}
+                              onChange={(e) => onConfigChange({ ttsModel: e.target.value || undefined })}
+                              className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                              placeholder="Default model"
+                            />
+                          )}
                         </div>
                       </div>
                       <div className="grid grid-cols-2 gap-3">

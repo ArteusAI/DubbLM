@@ -169,6 +169,7 @@ IMPORTANT: Create the summary in "{target_language}" language.
    - "podcast": casual conversation, interviews, friendly chats, two or more hosts (default for most dialogue).
    - "lecture": instructional / educational / e-learning / corporate training / tutorials / how-to explanations delivered by a clear single speaker.
    - "gothic": dramatic storytelling, audiobook-style fiction, suspenseful or atmospheric narration, documentaries with a solemn tone.
+   - "news": news reports, current-affairs episodes, narrated headlines, magazine-style news explainers, or factual updates needing energetic broadcast narration.
    When in doubt, use "podcast".
 
 Provide your analysis in JSON format with these keys:
@@ -367,6 +368,10 @@ You are running a dedicated clarity-editing pass over an already translated dial
 Editor-only goals:
 - You MAY redistribute meaning between nearby lines in the full dialogue if that improves clarity or makes the speakers' thoughts easier to follow.
 - You MAY rewrite sentences aggressively, including changing where information is expressed between consecutive replies.
+- You SHOULD remove accidental same-speaker repetitions caused by hesitation, stuttering, or restarting a phrase, keeping the cleanest complete version.
+- You MUST preserve deliberate repetition when it is used for emphasis, contrast, rhythm, comedy, escalation, or a clearly intentional rhetorical effect.
+- You SHOULD repair obvious transcription speaker-split artifacts: when a speaker's phrase is accidentally split and the next speaker only contains the final 1-2 words of that phrase, move that short ending back into the original speaker's line and make the next line a natural non-empty continuation or reaction.
+- Do NOT merge real turn-taking, interruptions, sentence-completion jokes, or cases where the second speaker intentionally finishes the thought.
 - You MUST keep the exact same number of output items and preserve the original speaker assigned to each slot.
 - You MUST keep each output line non-empty and natural for dubbing.
 - You MUST preserve all concrete facts, names, numbers, and technical details across the full dialogue.

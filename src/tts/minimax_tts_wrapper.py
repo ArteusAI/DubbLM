@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 import numpy as np
 
-from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment
+from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment, SegmentSynthesisReport
 from .voice_sample_manager import VoiceSampleManager, AudioFileUtils
 from src.tts.tts_interface import TTSInterface
 from src.utils.audio_embedder import AudioEmbedder
@@ -580,6 +580,12 @@ class MinimaxTTSWrapper(TTSInterface):
                      raise RuntimeError(f"Minimax voice clone failed: {result.get('base_resp', {}).get('status_msg')}")
                 
                 logger.info(f"Successfully cloned voice {voice_id} using file {file_id} with model {self.model}")
+                if self.cost_tracker and hasattr(self.cost_tracker, "add_voice_clone_actual"):
+                    self.cost_tracker.add_voice_clone_actual(
+                        "minimax",
+                        model=self.model,
+                        voice_count=1,
+                    )
                 return voice_id
                 
             except Exception as e:
@@ -616,6 +622,9 @@ class MinimaxTTSWrapper(TTSInterface):
         alignments = []
         
         for segment in segments_data:
+            segment_start_ts = time.perf_counter()
+            report_segment_index = getattr(segment, "segment_index", None)
+            report_group_id = getattr(segment, "group_id", None)
             # Determine voice
             voice_id = segment.voice or self.voice_mapping.get(segment.speaker, self.default_voice)
 
@@ -663,12 +672,41 @@ class MinimaxTTSWrapper(TTSInterface):
                 
                 result = response.json()
                 if result.get("base_resp", {}).get("status_code") != 0:
-                     logger.error(f"Minimax synthesis failed: {result.get('base_resp', {}).get('status_msg')}")
+                     minimax_err = result.get("base_resp", {}).get("status_msg")
+                     logger.error(f"Minimax synthesis failed: {minimax_err}")
+                     self._record_segment_report(SegmentSynthesisReport(
+                         segment_index=report_segment_index if report_segment_index is not None else -1,
+                         speaker=segment.speaker,
+                         text=segment.text,
+                         requested_model=self.model,
+                         actual_model=None,
+                         attempts=1,
+                         used_fallback=False,
+                         success=False,
+                         duration_seconds=time.perf_counter() - segment_start_ts,
+                         output_path=None,
+                         group_id=report_group_id,
+                         error=str(minimax_err),
+                     ))
                      continue
                 
                 audio_hex = result.get("data", {}).get("audio")
                 if not audio_hex:
                     logger.error("Minimax response missing audio data")
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=report_segment_index if report_segment_index is not None else -1,
+                        speaker=segment.speaker,
+                        text=segment.text,
+                        requested_model=self.model,
+                        actual_model=None,
+                        attempts=1,
+                        used_fallback=False,
+                        success=False,
+                        duration_seconds=time.perf_counter() - segment_start_ts,
+                        output_path=None,
+                        group_id=report_group_id,
+                        error="response missing audio data",
+                    ))
                     continue
                     
                 audio_bytes = bytes.fromhex(audio_hex)
@@ -704,10 +742,46 @@ class MinimaxTTSWrapper(TTSInterface):
                     diarized_segment=diarized,
                     alignment_confidence=1.0
                 ))
-                
+
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index if report_segment_index is not None else -1,
+                    speaker=segment.speaker,
+                    text=segment.text,
+                    requested_model=self.model,
+                    actual_model=self.model,
+                    attempts=1,
+                    used_fallback=False,
+                    success=True,
+                    duration_seconds=time.perf_counter() - segment_start_ts,
+                    output_path=final_path,
+                    group_id=report_group_id,
+                ))
+                if self.cost_tracker:
+                    self.cost_tracker.add_tts_actual(
+                        "minimax",
+                        model=self.model,
+                        input_characters=len(segment.text or ""),
+                        audio_seconds=duration,
+                        category="tts_synthesis",
+                    )
+
             except Exception as e:
                 logger.error(f"Error synthesizing segment for speaker {segment.speaker}: {e}")
-                
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index if report_segment_index is not None else -1,
+                    speaker=segment.speaker,
+                    text=segment.text,
+                    requested_model=self.model,
+                    actual_model=None,
+                    attempts=1,
+                    used_fallback=False,
+                    success=False,
+                    duration_seconds=time.perf_counter() - segment_start_ts,
+                    output_path=None,
+                    group_id=report_group_id,
+                    error=str(e),
+                ))
+
         return alignments
 
     def estimate_audio_segment_length(

@@ -1,8 +1,49 @@
+from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field, validator
 from src.dubbing.core.log_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class SegmentSynthesisReport:
+    """Per-segment telemetry captured by TTS wrappers for the summary report."""
+
+    segment_index: int
+    speaker: Optional[str]
+    text: str
+    requested_model: Optional[str]
+    actual_model: Optional[str]
+    attempts: int
+    used_fallback: bool
+    success: bool
+    duration_seconds: float
+    output_path: Optional[str] = None
+    group_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class BatchSynthesisReport:
+    """Per-batch telemetry captured by TTS wrappers for the summary report.
+
+    A "batch" here means one scheduling unit handed to the provider (Gemini
+    multi-speaker groups, single-speaker consecutive runs, or a solo segment).
+    The report records whether the batch-level path succeeded or had to fall
+    through to per-segment re-synthesis, so readers see *why* batching either
+    paid off or got bypassed.
+    """
+
+    batch_index: int
+    mode: str  # "multi_speaker" | "single_speaker" | "single_segment"
+    segment_indices: List[int]
+    speakers: List[str]
+    attempts: int
+    success: bool
+    fallback_segment_count: int
+    duration_seconds: float
+    reason: str
 
 class TTSSegmentData(BaseModel):
     """Data model for a single text segment to be synthesized."""
@@ -23,6 +64,14 @@ class TTSSegmentData(BaseModel):
             "Controls whether splitting a multi-speaker TTS batch before this segment "
             "hurts dialogue coherence. Unknown or missing values are treated as 'normal'."
         ),
+    )
+    segment_index: Optional[int] = Field(
+        None,
+        description="0-based index of this segment in the pipeline (used for telemetry/reports).",
+    )
+    group_id: Optional[str] = Field(
+        None,
+        description="Identifier of the speaker group this segment belongs to; None for ungrouped segments.",
     )
 
     @validator("voice", pre=True)

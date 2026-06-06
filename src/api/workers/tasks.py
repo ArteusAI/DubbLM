@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal, cast
@@ -18,7 +19,9 @@ from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, J
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
 from ..services.preset_service import get_preset_config
+from ..services.segment_optimization_config import apply_segment_optimization_config
 from src.dubbing.tts_styles import get_blocked_voices_for_style, resolve_tts_prompt_prefix
+from src.dubbing.debug.cost_ledger import import_cost_snapshots, write_cost_snapshot_from_tracker
 from src.dubbing.audio.speaker_gender_inferencer import SpeakerGenderInferencer
 from src.utils.speaker_gender import (
     SPEAKER_GENDER_SIGNATURE_CONFIG_KEY,
@@ -70,6 +73,27 @@ def _resolve_editor_runtime_config(config_data: Dict[str, Any], preset_config: D
         resolved["editor_reasoning_effort"] = "none"
 
     return resolved
+
+
+def _resolve_refinement_persona(config_data: Dict[str, Any], preset_config: Dict[str, Any]) -> str:
+    """Resolve refinement persona, allowing presets to disable refinement."""
+    value = config_data.get("personaId")
+    if value is None or str(value).strip() == "":
+        value = preset_config.get("persona_id", "normal")
+    return str(value or "normal")
+
+
+def _resolve_bool_config(
+    config_data: Dict[str, Any],
+    config_key: str,
+    preset_config: Dict[str, Any],
+    preset_key: str,
+    default: bool,
+) -> bool:
+    value = config_data.get(config_key)
+    if value is None:
+        value = preset_config.get(preset_key, default)
+    return normalize_bool(value)
 
 
 def _apply_api_keys(project_api_keys: Optional[Dict[str, str]] = None) -> None:
@@ -410,9 +434,18 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
             editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
+            refinement_persona = _resolve_refinement_persona(config_data, preset_config)
+            enable_llm_text_adjustment = _resolve_bool_config(
+                config_data,
+                "enableLlmTextAdjustment",
+                preset_config,
+                "enable_llm_text_adjustment",
+                True,
+            )
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
+                "project_id": project_id,
                 "input": str(source_file),
                 "source_language": source_lang,
                 "target_language": target_lang,
@@ -443,6 +476,11 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
+                "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
+                "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
+                "content_validator_whisper_cpu_threads": config_data.get("contentValidatorWhisperCpuThreads", 2),
+                "content_validator_speech_model": config_data.get("contentValidatorSpeechModel", "nano"),
                 # Transcription settings
                 "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
@@ -456,10 +494,11 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "editor_model_name": editor_runtime["editor_model_name"],
                 "editor_temperature": editor_runtime["editor_temperature"],
                 "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
+                "enable_llm_text_adjustment": enable_llm_text_adjustment,
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
-                "refinement_persona": config_data.get("personaId", "normal"),
+                "refinement_persona": refinement_persona,
                 "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
                 "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
@@ -477,24 +516,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "duration": config_data.get("duration"),
             })
             
-            # Apply segment optimization settings if provided
             segments_opt = dubbing_config.config.get("segments_optimization", {})
-            if config_data.get("postDiarizationMergeGap") is not None:
-                segments_opt["post_diarization_merge_gap"] = config_data["postDiarizationMergeGap"]
-            if config_data.get("postTranslationMergeGap") is not None:
-                segments_opt["post_translation_merge_gap"] = config_data["postTranslationMergeGap"]
-            if config_data.get("maxSegmentDuration") is not None:
-                segments_opt["max_segment_duration"] = config_data["maxSegmentDuration"]
-            if config_data.get("minSegmentDuration") is not None:
-                segments_opt["min_segment_duration"] = config_data["minSegmentDuration"]
-            if config_data.get("minPauseDuration") is not None:
-                segments_opt["min_pause_duration"] = config_data["minPauseDuration"]
-            if config_data.get("preservePauseDuration") is not None:
-                segments_opt["preserve_pause_duration"] = config_data["preservePauseDuration"]
-            if config_data.get("comfortMinAdjustmentRatio") is not None:
-                segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
-            if config_data.get("comfortMaxAdjustmentRatio") is not None:
-                segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            segments_opt = apply_segment_optimization_config(segments_opt, config_data)
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -596,6 +619,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Save segments to database
             _save_segments_to_db(project_id, translated_segments)
             _save_translation_gender_signature(project_id, translated_segments, speaker_metadata)
+            write_cost_snapshot_from_tracker(pm.debug_dir, "transcription", dubber.cost_tracker)
+            write_cost_snapshot_from_tracker(pm.debug_dir, "llm", dubber.cost_tracker)
 
             # If requested, continue straight into final dubbing in the same job.
             # This keeps the SSE stream alive and avoids a "pause" between stages.
@@ -673,9 +698,18 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
             editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
+            refinement_persona = _resolve_refinement_persona(config_data, preset_config)
+            enable_llm_text_adjustment = _resolve_bool_config(
+                config_data,
+                "enableLlmTextAdjustment",
+                preset_config,
+                "enable_llm_text_adjustment",
+                True,
+            )
 
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
+                "project_id": project_id,
                 "input": str(source_file),
                 "source_language": config_data.get("sourceLang", "en"),
                 "target_language": config_data.get("targetLang", "ru"),
@@ -701,6 +735,11 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
+                "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
+                "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
+                "content_validator_whisper_cpu_threads": config_data.get("contentValidatorWhisperCpuThreads", 2),
+                "content_validator_speech_model": config_data.get("contentValidatorSpeechModel", "nano"),
                 "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
                 "translator_type": "llm",
@@ -712,10 +751,11 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "editor_model_name": editor_runtime["editor_model_name"],
                 "editor_temperature": editor_runtime["editor_temperature"],
                 "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
+                "enable_llm_text_adjustment": enable_llm_text_adjustment,
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
-                "refinement_persona": config_data.get("personaId", "normal"),
+                "refinement_persona": refinement_persona,
                 "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
                 "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
@@ -731,22 +771,7 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             })
 
             segments_opt = dubbing_config.config.get("segments_optimization", {})
-            if config_data.get("postDiarizationMergeGap") is not None:
-                segments_opt["post_diarization_merge_gap"] = config_data["postDiarizationMergeGap"]
-            if config_data.get("postTranslationMergeGap") is not None:
-                segments_opt["post_translation_merge_gap"] = config_data["postTranslationMergeGap"]
-            if config_data.get("maxSegmentDuration") is not None:
-                segments_opt["max_segment_duration"] = config_data["maxSegmentDuration"]
-            if config_data.get("minSegmentDuration") is not None:
-                segments_opt["min_segment_duration"] = config_data["minSegmentDuration"]
-            if config_data.get("minPauseDuration") is not None:
-                segments_opt["min_pause_duration"] = config_data["minPauseDuration"]
-            if config_data.get("preservePauseDuration") is not None:
-                segments_opt["preserve_pause_duration"] = config_data["preservePauseDuration"]
-            if config_data.get("comfortMinAdjustmentRatio") is not None:
-                segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
-            if config_data.get("comfortMaxAdjustmentRatio") is not None:
-                segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            segments_opt = apply_segment_optimization_config(segments_opt, config_data)
             dubbing_config.config["segments_optimization"] = segments_opt
 
             if config_data.get("segmentStretch"):
@@ -795,6 +820,7 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             update_job_progress(job_id, 35, "saving", "Saving refreshed translations")
             _update_translated_segments_in_db(project_id, translated_segments)
             _save_translation_gender_signature(project_id, translated_segments, speaker_metadata)
+            write_cost_snapshot_from_tracker(pm.debug_dir, "llm", dubber.cost_tracker)
 
             update_job_progress(job_id, 100, "complete", f"Translation refreshed: {len(translated_segments)} segments")
 
@@ -906,11 +932,20 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
             editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
+            refinement_persona = _resolve_refinement_persona(config_data, preset_config)
+            enable_llm_text_adjustment = _resolve_bool_config(
+                config_data,
+                "enableLlmTextAdjustment",
+                preset_config,
+                "enable_llm_text_adjustment",
+                True,
+            )
             max_output_height = VIDEO_QUALITY_MAX_HEIGHT[video_quality_preset]
             logger.info(f"[DEBUG DUB] videoQualityPreset: {video_quality_preset} -> max_output_height={max_output_height}")
             
             dubbing_config = DubbingConfig()
             dubbing_config.config.update({
+                "project_id": project_id,
                 "input": str(source_file),
                 "source_language": config_data.get("sourceLang", "en"),
                 "target_language": target_lang,
@@ -933,6 +968,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
+                "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
+                "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
+                "content_validator_whisper_cpu_threads": config_data.get("contentValidatorWhisperCpuThreads", 2),
+                "content_validator_speech_model": config_data.get("contentValidatorSpeechModel", "nano"),
                 "max_workers": config_data.get("maxWorkers", 4),
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
@@ -954,31 +994,16 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "editor_model_name": editor_runtime["editor_model_name"],
                 "editor_temperature": editor_runtime["editor_temperature"],
                 "editor_reasoning_effort": editor_runtime["editor_reasoning_effort"],
+                "enable_llm_text_adjustment": enable_llm_text_adjustment,
                 "refinement_llm_provider": config_data.get("refinementLlmProvider") or preset_config.get("refinement_llm_provider"),
                 "refinement_model_name": config_data.get("refinementModelName") or preset_config.get("refinement_model_name"),
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
-                "refinement_persona": config_data.get("personaId", "normal"),
+                "refinement_persona": refinement_persona,
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
             })
             
-            # Apply segment optimization settings if provided
             segments_opt = dubbing_config.config.get("segments_optimization", {})
-            if config_data.get("postDiarizationMergeGap") is not None:
-                segments_opt["post_diarization_merge_gap"] = config_data["postDiarizationMergeGap"]
-            if config_data.get("postTranslationMergeGap") is not None:
-                segments_opt["post_translation_merge_gap"] = config_data["postTranslationMergeGap"]
-            if config_data.get("maxSegmentDuration") is not None:
-                segments_opt["max_segment_duration"] = config_data["maxSegmentDuration"]
-            if config_data.get("minSegmentDuration") is not None:
-                segments_opt["min_segment_duration"] = config_data["minSegmentDuration"]
-            if config_data.get("minPauseDuration") is not None:
-                segments_opt["min_pause_duration"] = config_data["minPauseDuration"]
-            if config_data.get("preservePauseDuration") is not None:
-                segments_opt["preserve_pause_duration"] = config_data["preservePauseDuration"]
-            if config_data.get("comfortMinAdjustmentRatio") is not None:
-                segments_opt["comfort_min_adjustment_ratio"] = config_data["comfortMinAdjustmentRatio"]
-            if config_data.get("comfortMaxAdjustmentRatio") is not None:
-                segments_opt["comfort_max_adjustment_ratio"] = config_data["comfortMaxAdjustmentRatio"]
+            segments_opt = apply_segment_optimization_config(segments_opt, config_data)
             dubbing_config.config["segments_optimization"] = segments_opt
             
             # Apply segment_stretch mode
@@ -995,6 +1020,10 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             # Initialize SmartDubbing
             dubber = SmartDubbing(dubbing_config)
+            imported_cost_rows = import_cost_snapshots(pm.debug_dir, dubber.cost_tracker)
+            if imported_cost_rows:
+                logger.info("Imported %d API cost row(s) from previous pipeline stages", imported_cost_rows)
+            dubber.performance_tracker.start_timing("total")
             
             # Extract audio
             audio_file = dubber.audio_processor.extract_audio(
@@ -1124,6 +1153,24 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             update_job_progress(job_id, 100, "complete", "Dubbing complete")
             
+            # This task drives the low-level pipeline directly instead of going
+            # through SmartDubbing.dub_video(), so it must finalize the summary
+            # artifacts explicitly before the UI requests them.
+            total_started_at = dubber.performance_tracker._start_times.get("total")
+            total_elapsed = (
+                time.perf_counter() - total_started_at
+                if total_started_at is not None
+                else dubber.performance_tracker.get_metric("total")
+            )
+            dubber.performance_tracker.record_metric("total", total_elapsed)
+            write_cost_snapshot_from_tracker(pm.debug_dir, "dub", dubber.cost_tracker)
+            dubber.performance_tracker.set_costs(dubber.cost_tracker.get_costs_by_step())
+            dubber.performance_tracker.write_performance_summary(
+                dubber.audio_processor.get_total_duration()
+            )
+            dubber.cost_tracker.write_cost_summary()
+            dubber._build_summary_report()
+
             # Collect stats from dubber
             total_cost = dubber.cost_tracker.actual.get("total", 0.0)
             

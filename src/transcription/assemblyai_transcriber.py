@@ -294,7 +294,14 @@ class AssemblyAITranscriber(BaseTranscriber):
                 if not audio_seconds and transcription:
                     audio_seconds = max((seg.get("end", 0.0) for seg in transcription), default=0.0)
                 if audio_seconds:
-                    self.cost_tracker.add_transcription_actual("assemblyai", float(audio_seconds))
+                    speech_model = getattr(self, "speech_model", None) or "best"
+                    self.cost_tracker.add_transcription_usage(
+                        "assemblyai",
+                        float(audio_seconds),
+                        model=str(speech_model),
+                        category="primary_transcription",
+                        speaker_diarization=True,
+                    )
             
             logger.info(f"AssemblyAI transcription completed successfully")
             logger.debug(f"Identified {len(set(speakers_rolls.values()))} speakers")

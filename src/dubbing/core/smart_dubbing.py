@@ -40,6 +40,7 @@ from ..debug.performance_tracker import PerformanceTracker
 from ..debug.debug_generator import DebugGenerator
 from ..debug.reporter import SpeakerReporter
 from ..debug.cost_tracker import CostTracker
+from ..debug.report_builder import ReportBuilder
 from ..utils.subtitle_utils import SubtitleManager
 from .log_config import get_logger
 from .cost_estimator import CostEstimator
@@ -139,6 +140,10 @@ class SmartDubbing:
         
         # Initialize pause adjustments for subtitle timing
         self.pause_adjustments = []
+
+        # Populated at the end of synthesize_speech so the report builder can
+        # correlate drained TTS telemetry with the final chosen_text/group_id.
+        self._last_synthesis_segments_metadata: List[Dict[str, Any]] = []
         
         # Initialize translator
         self._initialize_translator()
@@ -185,6 +190,24 @@ class SmartDubbing:
             logger.debug(f"Speaker filter applied: muted={sorted(self.muted_speakers)} removed={removed} kept={len(filtered)}")
         return filtered
     
+    def _segment_normalization_cache_suffix(self) -> str:
+        """Return a cache suffix for settings that change segment identity."""
+        opt_cfg = self.config.get('segments_optimization', {}) or {}
+        mode = opt_cfg.get('repair_speaker_fragmentation', 'auto')
+        if mode in (False, 'false', 'off', 'disabled', 'none', '0'):
+            return "segfix_off"
+
+        parts = [
+            "segfix_v4",
+            f"m{mode}",
+            f"e{opt_cfg.get('speaker_fragment_expected_speaker_margin', 2)}",
+            f"d{opt_cfg.get('speaker_fragment_max_duration', 3.0)}",
+            f"w{opt_cfg.get('speaker_fragment_max_words', 10)}",
+            f"g{opt_cfg.get('speaker_fragment_max_gap', 0.75)}",
+            f"p{opt_cfg.get('speaker_fragment_repair_passes', 3)}",
+        ]
+        return "_".join(str(part).replace(" ", "") for part in parts)
+
     def _initialize_translator(self) -> None:
         """Initialize translator based on configuration."""
         self.translator = None
@@ -246,8 +269,13 @@ class SmartDubbing:
                 voice_similarity_relaxed_threshold=self.config.get('voice_similarity_relaxed_threshold'),
                 min_voice_validation_duration_seconds=self.config.get('min_voice_validation_duration_seconds'),
                 enable_content_validation=self.config.get('enable_content_validation', True),
+                content_validator_provider=self.config.get('content_validator_provider', 'whisper'),
+                content_validator_whisper_model=self.config.get('content_validator_whisper_model', 'base'),
+                content_validator_whisper_compute_type=self.config.get('content_validator_whisper_compute_type', 'int8'),
+                content_validator_whisper_cpu_threads=self.config.get('content_validator_whisper_cpu_threads', 2),
+                content_validator_speech_model=self.config.get('content_validator_speech_model', 'nano'),
                 cost_tracker=self.cost_tracker,
-                translator=self.translator,
+                translator=self.translator if self.config.get('enable_llm_text_adjustment', True) else None,
                 target_language=self.config.get('target_language', 'en'),  # Pass target language for language-specific TTS configuration
                 speaker_metadata=self.config.get('speaker_metadata'),
             )
@@ -371,6 +399,7 @@ class SmartDubbing:
                     self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
                     self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
                     self.cost_tracker.write_cost_summary()
+                    self._build_summary_report()
                     return ""
             else:
                 logger.info("All segments filtered by mute_speakers; generating silent audio track...")
@@ -497,7 +526,8 @@ class SmartDubbing:
             # Write performance summary
             self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
             self.cost_tracker.write_cost_summary()
-            
+            self._build_summary_report()
+
         except Exception as e:
             logger.error(f"Error in dubbing pipeline: {e}", exc_info=True)
             raise
@@ -577,7 +607,8 @@ class SmartDubbing:
         self.performance_tracker.set_costs(self.cost_tracker.get_costs_by_step())
         self.performance_tracker.write_performance_summary(self.audio_processor.get_total_duration())
         self.cost_tracker.write_cost_summary()
-        
+        self._build_summary_report()
+
         return debug_video_path
     
     def generate_diarization_report(self) -> Tuple[str, str]:
@@ -632,14 +663,18 @@ class SmartDubbing:
         )
         
         # Perform diarization and transcription
+        self.performance_tracker.start_timing("diarization")
         speakers_rolls, transcription = self.transcriber.diarize_and_transcribe(
             audio_file=audio_file,
             cache_key=cache_key,
             use_cache=self.cache_manager.use_cache
         )
+        self.performance_tracker.end_timing("diarization")
 
         # Optimize segments after diarization
+        self.performance_tracker.start_timing("segment_normalization")
         transcription = self.segment_optimizer.optimize_post_diarization(transcription)
+        self.performance_tracker.end_timing("segment_normalization")
 
         # Store for debug
         self.debug_data["diarization"] = speakers_rolls
@@ -849,6 +884,7 @@ class SmartDubbing:
         ).hexdigest()[:12]
         cache_key = (
             f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
+            f"_{self._segment_normalization_cache_suffix()}"
             f"_{self.config.get('target_language')}_gender_{speaker_metadata_hash}_keep_{int(preserve_segment_boundaries)}"
             f"_editor_{editor_signature}"
         )
@@ -907,6 +943,26 @@ class SmartDubbing:
 
         return translated_segments
 
+    @staticmethod
+    def _build_segment_cache_key(
+        base_cache_prefix: str,
+        tts_system: str,
+        segment_index: int,
+        speaker: str,
+        text_value: str,
+        voice_prompt_hash: str,
+    ) -> str:
+        """Canonical segment cache-key used by prepass and main synthesis pass.
+
+        Keep the ingredient order and hashing identical in both call sites,
+        otherwise main-pass will miss the keys seeded by the prepass.
+        """
+        text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
+        return (
+            f"{base_cache_prefix}_{tts_system}_{segment_index}_"
+            f"{speaker}_{text_hash}_{voice_prompt_hash}"
+        )
+
     def _run_batched_synthesis_prepass(
         self,
         segments: List[Dict],
@@ -930,6 +986,10 @@ class SmartDubbing:
 
         batches_by_tts: Dict[str, List[TTSSegmentData]] = {}
         index_by_id: Dict[int, int] = {}
+        # Parallel list of metadata needed to persist prepass outputs into the
+        # pipeline-level segment cache so a restart mid-prewarm doesn't redo the
+        # work. Keyed identically to ``batches_by_tts``.
+        cache_tasks_by_tts: Dict[str, List[Dict[str, object]]] = {}
 
         for segment_index, segment_dict in enumerate(segments):
             speaker = segment_dict.get("speaker")
@@ -955,8 +1015,9 @@ class SmartDubbing:
 
             def make_cache_key(text_value: str, _tts=tts_system, _spk=speaker,
                                _idx=segment_index, _vph=voice_prompt_hash) -> str:
-                text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
-                return f"{base_cache_prefix}_{_tts}_{_idx}_{_spk}_{text_hash}_{_vph}"
+                return self._build_segment_cache_key(
+                    base_cache_prefix, _tts, _idx, _spk, text_value, _vph
+                )
 
             if self.cache_manager.use_cache and not segment_dict.get("force_resynthesize", False):
                 candidates: List[str] = []
@@ -994,6 +1055,8 @@ class SmartDubbing:
                 "reference_text": None,
                 "voice": voice_name,
                 "speed": 1.0,
+                "segment_index": segment_index,
+                "group_id": segment_dict.get("group_id"),
             }
             potential_ref_audio = f"artifacts/speakers_audio/{speaker}.wav"
             if os.path.exists(potential_ref_audio):
@@ -1029,6 +1092,12 @@ class SmartDubbing:
 
             batches_by_tts.setdefault(tts_system, []).append(final_segment_data)
             index_by_id[id(final_segment_data)] = segment_index
+            cache_tasks_by_tts.setdefault(tts_system, []).append({
+                "segment_data": final_segment_data,
+                "segment_index": segment_index,
+                "speaker": speaker,
+                "voice_prompt_hash": voice_prompt_hash,
+            })
 
         if not batches_by_tts:
             return
@@ -1093,7 +1162,80 @@ class SmartDubbing:
                         )
                     except Exception:
                         pass
+            finally:
+                # Persist whatever segments actually produced audio, so that a
+                # restart of the process (or a crash mid-batch) can reuse them
+                # via the pipeline cache on the next run instead of re-synthesizing.
+                self._persist_prepass_to_cache(
+                    tts_system=tts_system,
+                    tts_instance=tts_instance,
+                    tasks=cache_tasks_by_tts.get(tts_system, []),
+                    segment_cache_path=segment_cache_path,
+                    base_cache_prefix=base_cache_prefix,
+                )
             completed_before_batch += len(batch)
+
+    def _persist_prepass_to_cache(
+        self,
+        tts_system: str,
+        tts_instance,
+        tasks: List[Dict[str, object]],
+        segment_cache_path,
+        base_cache_prefix: str,
+    ) -> None:
+        """Copy prepass output files into the pipeline-level segment cache.
+
+        Mirrors the main-pass caching policy in ``_process_single_segment``:
+        only cache if caching is enabled, the audio is non-empty, and the
+        wrapper did not mark the output as produced by a fallback model.
+        """
+        if not tasks or not self.cache_manager.use_cache:
+            return
+
+        persisted = 0
+        skipped_fallback = 0
+        for task in tasks:
+            segment_data = task["segment_data"]
+            output_path = getattr(segment_data, "output_path", None)
+            if not output_path or not os.path.exists(output_path):
+                continue
+
+            is_fallback = (
+                hasattr(tts_instance, "is_fallback_output")
+                and tts_instance.is_fallback_output(output_path)
+            )
+            if is_fallback:
+                skipped_fallback += 1
+                continue
+
+            text_value = getattr(segment_data, "text", "") or ""
+            cache_key = self._build_segment_cache_key(
+                base_cache_prefix,
+                tts_system,
+                task["segment_index"],
+                task["speaker"],
+                text_value,
+                task["voice_prompt_hash"],
+            )
+            cache_path = segment_cache_path / f"{cache_key}.wav"
+            if cache_path.exists():
+                continue
+
+            try:
+                os.makedirs(cache_path.parent, exist_ok=True)
+                shutil.copy(output_path, cache_path)
+                persisted += 1
+            except Exception as copy_exc:
+                logger.warning(
+                    f"Prepass ({tts_system}): failed to persist segment "
+                    f"{task['segment_index'] + 1} to cache: {copy_exc}"
+                )
+
+        if persisted or skipped_fallback:
+            logger.info(
+                f"Prepass ({tts_system}): persisted {persisted} segment(s) to pipeline cache"
+                + (f", skipped {skipped_fallback} fallback-model output(s)" if skipped_fallback else "")
+            )
 
     def synthesize_speech(
         self, 
@@ -1124,7 +1266,11 @@ class SmartDubbing:
         # Start timing
         self.performance_tracker.start_timing("speech_synthesis")
         
-        cache_key = f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}_{self.config.get('target_language')}_{self.config.get('tts_system')}"
+        cache_key = (
+            f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
+            f"_{self._segment_normalization_cache_suffix()}"
+            f"_{self.config.get('target_language')}_{self.config.get('tts_system')}"
+        )
         step_name = "synthesized_speech"
         
         # Check for editable segments file first
@@ -1437,8 +1583,14 @@ class SmartDubbing:
             voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
 
             def make_cache_key(text_value: str) -> str:
-                text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
-                return f"{base_cache_prefix}_{tts_system}_{segment_index}_{speaker}_{text_hash}_{voice_prompt_hash}"
+                return self._build_segment_cache_key(
+                    base_cache_prefix,
+                    tts_system,
+                    segment_index,
+                    speaker,
+                    text_value,
+                    voice_prompt_hash,
+                )
 
             # Default cache key/path (used when saving new audio)
             segment_cache_key = make_cache_key(preferred_text)
@@ -1506,6 +1658,8 @@ class SmartDubbing:
                 "voice": voice_name,
                 "speed": 1.0,
                 "cohesion_with_prev": segment_dict.get("cohesion_with_prev", "normal"),
+                "segment_index": segment_index,
+                "group_id": segment_dict.get("group_id"),
             }
 
             potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"
@@ -1801,11 +1955,29 @@ class SmartDubbing:
         )
         logger.info(f"Updated segments file with synthesis results: {updated_path}")
 
+        # Stash metadata so the final ReportBuilder can correlate telemetry
+        # against chosen_text/group_id picked during this synthesis pass.
+        self._last_synthesis_segments_metadata = list(segments_metadata)
+
         # End timing
         self.performance_tracker.end_timing("speech_synthesis")
 
         return output_path
     
+    def _build_summary_report(self) -> None:
+        """Write artifacts/report.{md,json} with stages, costs, segments, artifacts."""
+        try:
+            ReportBuilder(
+                performance_tracker=self.performance_tracker,
+                cost_tracker=self.cost_tracker,
+                tts_systems=self.tts_systems,
+                segments_metadata=self._last_synthesis_segments_metadata,
+                config=self.config.config if hasattr(self.config, "config") else self.config,
+                project_id=self.config.get("project_id"),
+            ).build_and_write()
+        except Exception as exc:
+            logger.warning(f"Failed to build summary report: {exc}", exc_info=True)
+
     def _save_transcription_file(self, transcription: List[Dict]) -> None:
         """Save transcription to a readable text file."""
         from src.utils.time_utils import format_seconds_to_hms
@@ -2033,7 +2205,13 @@ class SmartDubbing:
         try:
             LLM_DEVIATION_THRESHOLD = 0.15
             # Compute absolute deviation key for comparison
-            if self.translator and self.translator.is_available() and deviation_key(current_deviation) > deviation_key(0.0) and abs(current_deviation) > LLM_DEVIATION_THRESHOLD:
+            if (
+                self.config.get('enable_llm_text_adjustment', True)
+                and self.translator
+                and self.translator.is_available()
+                and deviation_key(current_deviation) > deviation_key(0.0)
+                and abs(current_deviation) > LLM_DEVIATION_THRESHOLD
+            ):
                 baseline_text = metadata.get("chosen_text") or segment_dict.get("translation", "")
                 if baseline_text:
                     # Aim for center of comfort zone (prefer near 1.0), compute duration factor
@@ -2332,6 +2510,16 @@ class SmartDubbing:
             for group_idx, group in enumerate(speaker_groups):
                 group_start = group[0][1]["start"]
                 group_end = group[-1][1]["end"]
+
+                # Stamp group_id on each segment dict so the report builder can
+                # cluster segments in the summary table. Singleton groups stay
+                # ungrouped (None) since the UI only renders a group header when
+                # there is actual grouping.
+                group_label: Optional[str] = (
+                    f"{speaker}_g{group_idx}" if len(group) > 1 else None
+                )
+                for _orig_idx, _seg in group:
+                    _seg["group_id"] = group_label
                 
                 # Combine audio for this group
                 combined_group_audio = AudioSegment.empty()

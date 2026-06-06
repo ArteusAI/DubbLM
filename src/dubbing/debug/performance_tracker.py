@@ -1,11 +1,33 @@
 """Performance tracking for the Smart Dubbing system."""
 
+import sys
 import time
 from typing import Dict, Optional
 
 from ..core.log_config import get_logger
 
 logger = get_logger(__name__)
+
+try:
+    import resource as _resource
+except ImportError:
+    _resource = None
+
+
+def _current_peak_memory_mb() -> float:
+    """Return the current process peak resident-set-size in MiB.
+
+    Uses ``resource.getrusage`` which returns ru_maxrss in KiB on Linux and
+    bytes on macOS. Returns 0.0 when the ``resource`` module is unavailable
+    (e.g. Windows) so the tracker stays optional.
+    """
+    if _resource is None:
+        return 0.0
+    try:
+        ru = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+    except (OSError, ValueError):
+        return 0.0
+    return ru / 1024.0 if sys.platform.startswith("linux") else ru / (1024.0 * 1024.0)
 
 
 class PerformanceTracker:
@@ -18,6 +40,7 @@ class PerformanceTracker:
             "diarization": 0.0,
             "speaker_audio": 0.0,
             "transcription": 0.0,
+            "segment_normalization": 0.0,
             "context_analysis": 0.0,
             "translation": 0.0,
             "emotion_analysis": 0.0,
@@ -29,7 +52,17 @@ class PerformanceTracker:
         }
         # Track associated monetary costs for each step (default to zero)
         self.costs = {key: 0.0 for key in self.metrics}
-        self._start_times = {}
+        # Peak process RSS (MiB) observed at the end of each step and the
+        # delta vs. the baseline captured at start_timing. Memory-intensive
+        # steps (e.g. background audio separation) benefit the most from
+        # these numbers surfacing in the summary report.
+        self.memory_peak_mb: Dict[str, float] = {}
+        self.memory_delta_mb: Dict[str, float] = {}
+        # Error / warning note per step (e.g. "separator OOM"). Surfaced as
+        # plain text in the report so users see why a step produced no output.
+        self.step_errors: Dict[str, str] = {}
+        self._start_times: Dict[str, float] = {}
+        self._start_memory: Dict[str, float] = {}
     
     def start_timing(self, step_name: str) -> None:
         """Start timing a step.
@@ -38,6 +71,7 @@ class PerformanceTracker:
             step_name: Name of the step to time
         """
         self._start_times[step_name] = time.perf_counter()
+        self._start_memory[step_name] = _current_peak_memory_mb()
     
     def end_timing(self, step_name: str) -> float:
         """End timing a step and record the duration.
@@ -52,8 +86,20 @@ class PerformanceTracker:
             duration = time.perf_counter() - self._start_times[step_name]
             self.metrics[step_name] = duration
             del self._start_times[step_name]
+
+            peak_now = _current_peak_memory_mb()
+            baseline = self._start_memory.pop(step_name, peak_now)
+            if peak_now > 0:
+                self.memory_peak_mb[step_name] = peak_now
+                self.memory_delta_mb[step_name] = max(0.0, peak_now - baseline)
             return duration
         return 0.0
+
+    def record_error(self, step_name: str, message: str) -> None:
+        """Attach an error/warning note to a step for the summary report."""
+        if not message:
+            return
+        self.step_errors[step_name] = str(message)
     
     def record_metric(self, step_name: str, duration: float) -> None:
         """Record a metric directly.
@@ -126,9 +172,10 @@ class PerformanceTracker:
         
         # Sort metrics: First key processing steps in pipeline order, then total at end
         step_order = [
-            "extract_audio", "diarization", "speaker_audio", "transcription", 
-            "context_analysis", "translation", "emotion_analysis", "speech_synthesis", 
-            "background_audio", "audio_normalization", "video_creation"
+            "extract_audio", "diarization", "speaker_audio", "transcription",
+            "segment_normalization", "context_analysis", "translation",
+            "emotion_analysis", "speech_synthesis", "background_audio",
+            "audio_normalization", "video_creation",
         ]
         
         for step in step_order:
@@ -161,7 +208,10 @@ class PerformanceTracker:
             summary_lines.append(f"\nProcessing speed:")
             summary_lines.append(f" - Video duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
             summary_lines.append(f" - Processing-to-video ratio: {speed_ratio:.2f}x (higher means slower)")
-            summary_lines.append(f" - Real-time factor: {1/speed_ratio:.2f}x (how many seconds of video processed per second)")
+            if speed_ratio > 0:
+                summary_lines.append(f" - Real-time factor: {1/speed_ratio:.2f}x (how many seconds of video processed per second)")
+            else:
+                summary_lines.append(" - Real-time factor: n/a (total processing time is zero)")
 
         # Log all lines
         for line in summary_lines:
@@ -209,6 +259,10 @@ class PerformanceTracker:
             summary_lines.append(f"\nProcessing speed relative to video/segment duration:")
             summary_lines.append(f" - Video/Segment duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
             summary_lines.append(f" - Processing-to-duration ratio: {speed_ratio:.2f}x (higher means slower)")
+            if speed_ratio > 0:
+                summary_lines.append(f" - Real-time factor: {1/speed_ratio:.2f}x")
+            else:
+                summary_lines.append(" - Real-time factor: n/a (total processing time is zero)")
     
         for line in summary_lines:
             logger.info(line)

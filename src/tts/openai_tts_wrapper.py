@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 from collections import Counter
 
-from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment 
+from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment, SegmentSynthesisReport
 from .voice_sample_manager import VoiceSampleManager, AudioFileUtils, AudioValidator
 from src.tts.tts_interface import TTSInterface
 from src.utils.sent_split import greedy_sent_split
@@ -120,7 +120,8 @@ class OpenAITTSWrapper(TTSInterface):
         model_name: str,
         input_tokens: float = 0.0,
         audio_seconds: float = 0.0,
-        output_tokens: float = 0.0
+        output_tokens: float = 0.0,
+        input_characters: float = 0.0,
     ) -> None:
         """Accumulate token/audio usage in a simple dictionary tracker."""
         if usage_tracker is None or not model_name:
@@ -133,6 +134,8 @@ class OpenAITTSWrapper(TTSInterface):
             model_usage["input_tokens"] = model_usage.get("input_tokens", 0.0) + float(input_tokens)
         if output_tokens:
             model_usage["output_tokens"] = model_usage.get("output_tokens", 0.0) + float(output_tokens)
+        if input_characters:
+            model_usage["input_characters"] = model_usage.get("input_characters", 0.0) + float(input_characters)
         if audio_seconds:
             model_usage["audio_seconds"] = model_usage.get("audio_seconds", 0.0) + float(audio_seconds)
 
@@ -339,6 +342,11 @@ class OpenAITTSWrapper(TTSInterface):
         if not self.client:
             raise RuntimeError("OpenAI client not initialized.")
 
+        synth_start_ts = time.perf_counter()
+        report_segment_index = getattr(segment_data, "segment_index", None)
+        report_group_id = getattr(segment_data, "group_id", None)
+        total_attempts = 0
+
         # Check cache first
         cache_key = self._get_cache_key(segment_data, language)
         if cache_key in self._audio_cache:
@@ -346,6 +354,19 @@ class OpenAITTSWrapper(TTSInterface):
             if os.path.exists(cached_path):
                 shutil.copy(cached_path, temp_output_path)
                 logger.debug(f"  OpenAI: Using cached audio for speaker {segment_data.speaker}")
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index if report_segment_index is not None else -1,
+                    speaker=segment_data.speaker,
+                    text=segment_data.text,
+                    requested_model=self.model,
+                    actual_model=self.model,
+                    attempts=0,
+                    used_fallback=False,
+                    success=True,
+                    duration_seconds=time.perf_counter() - synth_start_ts,
+                    output_path=temp_output_path,
+                    group_id=report_group_id,
+                ))
                 return
 
         speaker_id = segment_data.speaker
@@ -378,6 +399,7 @@ class OpenAITTSWrapper(TTSInterface):
         best_silence_ratio = float('inf')
         
         for validation_attempt in range(max_validation_retries):
+            total_attempts += 1
             segment_audio_files = []
             temp_dir_for_chunks = tempfile.mkdtemp(prefix="openai_chunks_")
             temp_attempt_path = f"{temp_output_path}_attempt_{validation_attempt}.mp3"
@@ -396,7 +418,12 @@ class OpenAITTSWrapper(TTSInterface):
                             )
                             response.write_to_file(chunk_file_path)
                             token_count = self._count_tokens(chunk_text)
-                            self._register_usage(usage_tracker, self.model, input_tokens=token_count)
+                            self._register_usage(
+                                usage_tracker,
+                                self.model,
+                                input_tokens=token_count,
+                                input_characters=len(chunk_text or ""),
+                            )
                             segment_audio_files.append(chunk_file_path)
                             if len(text_chunks_for_openai) > 1:
                                 logger.debug(f"    OpenAI: Synthesized chunk {i+1}/{len(text_chunks_for_openai)} for {speaker_id}")
@@ -461,6 +488,19 @@ class OpenAITTSWrapper(TTSInterface):
                             os.remove(best_attempt_path)
                         except OSError:
                             pass
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=report_segment_index if report_segment_index is not None else -1,
+                        speaker=segment_data.speaker,
+                        text=segment_data.text,
+                        requested_model=self.model,
+                        actual_model=self.model,
+                        attempts=total_attempts,
+                        used_fallback=False,
+                        success=True,
+                        duration_seconds=time.perf_counter() - synth_start_ts,
+                        output_path=temp_output_path,
+                        group_id=report_group_id,
+                    ))
                     return
                 else:
                     logger.warning(f"  OpenAI: Audio validation failed for speaker {speaker_id} (attempt {validation_attempt + 1}/{max_validation_retries}): {reason}")
@@ -474,6 +514,19 @@ class OpenAITTSWrapper(TTSInterface):
                         os.remove(temp_attempt_path)
                     except OSError:
                         pass
+                self._record_segment_report(SegmentSynthesisReport(
+                    segment_index=report_segment_index if report_segment_index is not None else -1,
+                    speaker=segment_data.speaker,
+                    text=segment_data.text,
+                    requested_model=self.model,
+                    actual_model=self.model,
+                    attempts=total_attempts,
+                    used_fallback=False,
+                    success=True,
+                    duration_seconds=time.perf_counter() - synth_start_ts,
+                    output_path=temp_output_path,
+                    group_id=report_group_id,
+                ))
                 return
 
         # All validation attempts failed, use the best one
@@ -484,7 +537,35 @@ class OpenAITTSWrapper(TTSInterface):
                 os.remove(best_attempt_path)
             except OSError:
                 pass
+            self._record_segment_report(SegmentSynthesisReport(
+                segment_index=report_segment_index if report_segment_index is not None else -1,
+                speaker=segment_data.speaker,
+                text=segment_data.text,
+                requested_model=self.model,
+                actual_model=self.model,
+                attempts=total_attempts,
+                used_fallback=False,
+                success=False,
+                duration_seconds=time.perf_counter() - synth_start_ts,
+                output_path=temp_output_path,
+                group_id=report_group_id,
+                error=f"validation failed (silence_ratio={best_silence_ratio:.2f})",
+            ))
         else:
+            self._record_segment_report(SegmentSynthesisReport(
+                segment_index=report_segment_index if report_segment_index is not None else -1,
+                speaker=segment_data.speaker,
+                text=segment_data.text,
+                requested_model=self.model,
+                actual_model=None,
+                attempts=total_attempts,
+                used_fallback=False,
+                success=False,
+                duration_seconds=time.perf_counter() - synth_start_ts,
+                output_path=None,
+                group_id=report_group_id,
+                error="all attempts failed",
+            ))
             raise RuntimeError(f"OpenAI TTS failed to generate valid audio for speaker {speaker_id} after {max_validation_retries} attempts")
 
     def synthesize(
@@ -608,14 +689,16 @@ class OpenAITTSWrapper(TTSInterface):
                 for model_name, metrics in models_usage.items():
                     input_tok = metrics.get("input_tokens", 0.0)
                     output_tok = metrics.get("output_tokens", 0.0)
+                    input_chars = metrics.get("input_characters", 0.0)
                     audio_sec = metrics.get("audio_seconds", 0.0)
-                    if input_tok or output_tok or audio_sec:
+                    if input_tok or output_tok or input_chars or audio_sec:
                         self.cost_tracker.add_tts_actual(
                             "openai",
                             model=model_name,
                             input_tokens=input_tok,
                             output_tokens=output_tok,
-                            audio_seconds=audio_sec
+                            audio_seconds=audio_sec,
+                            input_characters=input_chars,
                         )
             return alignments
 

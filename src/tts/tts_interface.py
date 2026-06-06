@@ -1,18 +1,77 @@
 from abc import ABC, abstractmethod
+import threading
 from typing import Optional, Dict, Any, List
 
-from .models import TTSSegmentData, SegmentAlignment # Import the Pydantic models
+from .models import (
+    TTSSegmentData,
+    SegmentAlignment,
+    SegmentSynthesisReport,
+    BatchSynthesisReport,
+)
 
 class TTSInterface(ABC):
     """
     Abstract base class for text-to-speech systems.
     All TTS implementations should inherit from this class.
     """
-    
+
+    # Per-segment telemetry collected by concrete wrappers for the summary report.
+    # Subclasses should append ``SegmentSynthesisReport`` instances via
+    # ``_record_segment_report`` and the orchestrator drains them with
+    # ``drain_segment_reports()`` between batches.
+    segment_reports: List[SegmentSynthesisReport]
+
+    # Per-batch telemetry (multi-speaker / single-speaker / solo) for the
+    # summary report. Populated via ``_record_batch_report`` and drained with
+    # ``drain_batch_reports()``.
+    batch_reports: List[BatchSynthesisReport]
+
     @abstractmethod
     def __init__(self, **kwargs: Any) -> None:
         """Initialize the TTS system with provider-specific arguments."""
         pass # Specific implementation in derived classes
+
+    def _ensure_segment_report_state(self) -> None:
+        """Lazily initialize telemetry buffer + lock for subclasses."""
+        if not hasattr(self, "segment_reports") or self.segment_reports is None:
+            self.segment_reports = []
+        if not hasattr(self, "_segment_reports_lock") or self._segment_reports_lock is None:
+            self._segment_reports_lock = threading.Lock()
+
+    def _record_segment_report(self, report: SegmentSynthesisReport) -> None:
+        """Thread-safe append of a per-segment telemetry entry."""
+        self._ensure_segment_report_state()
+        with self._segment_reports_lock:
+            self.segment_reports.append(report)
+
+    def drain_segment_reports(self) -> List[SegmentSynthesisReport]:
+        """Return and clear collected per-segment telemetry."""
+        self._ensure_segment_report_state()
+        with self._segment_reports_lock:
+            drained = list(self.segment_reports)
+            self.segment_reports = []
+            return drained
+
+    def _ensure_batch_report_state(self) -> None:
+        """Lazily initialize batch telemetry buffer + lock for subclasses."""
+        if not hasattr(self, "batch_reports") or self.batch_reports is None:
+            self.batch_reports = []
+        if not hasattr(self, "_batch_reports_lock") or self._batch_reports_lock is None:
+            self._batch_reports_lock = threading.Lock()
+
+    def _record_batch_report(self, report: BatchSynthesisReport) -> None:
+        """Thread-safe append of a per-batch telemetry entry."""
+        self._ensure_batch_report_state()
+        with self._batch_reports_lock:
+            self.batch_reports.append(report)
+
+    def drain_batch_reports(self) -> List[BatchSynthesisReport]:
+        """Return and clear collected per-batch telemetry."""
+        self._ensure_batch_report_state()
+        with self._batch_reports_lock:
+            drained = list(self.batch_reports)
+            self.batch_reports = []
+            return drained
     
     @abstractmethod
     def initialize(self) -> None:

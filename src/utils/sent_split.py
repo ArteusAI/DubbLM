@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import List, Optional, Tuple
 
 import nltk
 nltk.download("punkt_tab", quiet=True)
@@ -70,3 +70,35 @@ def greedy_sent_split(text: str, max_chunk_size: int) -> List[str]:
             final.extend(_greedy_pack(c.split()))
 
     return [chunk.strip() for chunk in final if chunk.strip()]
+
+
+def split_at_sentence_midpoint(text: str, min_part_chars: int = 20) -> Optional[Tuple[str, str]]:
+    """Split text into two parts at a sentence boundary near the middle.
+
+    Returns None when the text cannot be split into two non-trivial parts.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    sentences = [sentence.strip() for sentence in sent_tokenize(cleaned) if sentence.strip()]
+    if len(sentences) < 2:
+        return None
+
+    best_idx = 1
+    best_delta = float("inf")
+    for split_at in range(1, len(sentences)):
+        first_part = " ".join(sentences[:split_at]).strip()
+        second_part = " ".join(sentences[split_at:]).strip()
+        if len(first_part) < min_part_chars or len(second_part) < min_part_chars:
+            continue
+        delta = abs(len(first_part) - len(second_part))
+        if delta < best_delta:
+            best_delta = delta
+            best_idx = split_at
+
+    first_part = " ".join(sentences[:best_idx]).strip()
+    second_part = " ".join(sentences[best_idx:]).strip()
+    if len(first_part) < min_part_chars or len(second_part) < min_part_chars:
+        return None
+    return first_part, second_part

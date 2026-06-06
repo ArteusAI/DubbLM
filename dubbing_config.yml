@@ -10,8 +10,9 @@ default_preset: "hq"  # Default UI preset: fast, hq, ultra
 # UI/API preset defaults (source of truth for preset values)
 presets:
   fast:
+    persona_id: "none"
     llm_provider: "gemini"
-    llm_model_name: "gemini-flash-lite-latest"
+    llm_model_name: "gemini-flash-latest"
     llm_temperature: 0.5
     tts_system: "openai"
     tts_model: "gpt-4o-mini-tts"
@@ -21,29 +22,36 @@ presets:
     video_quality_preset: "720p"
     voice_auto_selection: true
     enable_emotion_enrichment: false
+    enable_content_validation: false
+    enable_llm_text_adjustment: false
     dubbed_volume: 1.0
     background_volume: 0.56
     use_two_pass_encoding: true
     max_workers: 4
   hq:
+    persona_id: "none"
     llm_provider: "gemini"
     llm_model_name: "gemini-flash-latest"
     llm_temperature: 0.5
     refinement_llm_provider: "gemini"
-    refinement_model_name: "gemini-2.5-pro"
+    refinement_model_name: "gemini-flash-latest"
     refinement_temperature: 1.0
     tts_system: "gemini"
+    tts_model: "gemini-2.5-flash-preview-tts"
+    tts_fallback_model: "gemini-2.5-flash-preview-tts"
     tts_style: "podcast"
     keep_background: false
     pause_removal: "disabled"
     video_quality_preset: "1080p"
     voice_auto_selection: true
     enable_emotion_enrichment: false
+    enable_llm_text_adjustment: false
     dubbed_volume: 1.0
     background_volume: 0.56
     use_two_pass_encoding: true
     max_workers: 4
   ultra:
+    persona_id: "normal"
     llm_provider: "gemini"
     llm_model_name: "gemini-flash-latest"
     llm_temperature: 0.5
@@ -63,6 +71,7 @@ presets:
     video_minterpolate_threshold: 1.0
     voice_auto_selection: true
     enable_emotion_enrichment: true
+    enable_llm_text_adjustment: true
     dubbed_volume: 1.0
     background_volume: 0.56
     use_two_pass_encoding: true

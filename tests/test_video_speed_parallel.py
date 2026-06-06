@@ -25,7 +25,7 @@ def _install_fakes(monkeypatch, captured):
 
     class DummyExecutor:
         def __init__(self, max_workers):
-            captured["max_workers"] = max_workers
+            captured.setdefault("executor_max_workers", []).append(max_workers)
 
         def __enter__(self):
             return self
@@ -40,6 +40,9 @@ def _install_fakes(monkeypatch, captured):
         # All submit() calls complete synchronously in the dummy executor, so
         # every future is already done by the time wait() is invoked.
         return set(futures), set()
+
+    def fake_as_completed(futures):
+        return list(futures)
 
     def fake_run(cmd, *args, **kwargs):
         if "-vf" in cmd:
@@ -56,6 +59,7 @@ def _install_fakes(monkeypatch, captured):
 
     monkeypatch.setattr("src.dubbing.video.video_processor.ThreadPoolExecutor", DummyExecutor)
     monkeypatch.setattr("src.dubbing.video.video_processor.wait", fake_wait)
+    monkeypatch.setattr("src.dubbing.video.video_processor.as_completed", fake_as_completed)
     monkeypatch.setattr("src.dubbing.video.video_processor.subprocess.run", fake_run)
 
 
@@ -99,21 +103,22 @@ def test_run_ffmpeg_with_progress_emits_final_100(monkeypatch):
     assert "Encoding final stretched video: 100%" in log_events
 
 
-def test_minterpolate_segments_run_sequentially_with_full_cpu(monkeypatch, tmp_path):
+def test_minterpolate_segments_run_in_bounded_parallel_pool(monkeypatch, tmp_path):
     vp = _build_video_processor(monkeypatch)
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 64 * 1024**3)
 
     input_video = tmp_path / "input.mp4"
     output_video = tmp_path / "output.mp4"
     input_video.write_bytes(b"dummy")
 
-    captured = {"max_workers": None, "segment_cmds": [], "concat_cmds": []}
+    captured = {"executor_max_workers": [], "segment_cmds": [], "concat_cmds": []}
     _install_fakes(monkeypatch, captured)
 
     speed_segments = [
         # Plain: speed >= threshold (0.75) → runs in parallel pool.
         {"original_start": 0.0, "original_end": 2.0, "video_speed": 1.0, "use_minterpolate": False},
         {"original_start": 2.0, "original_end": 5.0, "video_speed": 0.8, "use_minterpolate": True},
-        # Minterpolate: speed < threshold → sequential phase with -threads=cpu-1.
+        # Minterpolate: speed < threshold → dedicated bounded parallel pool.
         {"original_start": 5.0, "original_end": 8.0, "video_speed": 0.4, "use_minterpolate": True},
         {"original_start": 8.0, "original_end": 11.0, "video_speed": 0.1, "use_minterpolate": True},
     ]
@@ -133,17 +138,18 @@ def test_minterpolate_segments_run_sequentially_with_full_cpu(monkeypatch, tmp_p
     assert len(minterpolate_cmds) == 2
     assert len(plain_cmds) == 2
 
-    # Minterpolate → threads == cpu_count - 1 == 7.
+    # Minterpolate → per-job threads stay at 1; host-level parallelism comes
+    # from distributing different segments across the bounded pool.
     for cmd in minterpolate_cmds:
-        assert _extract_threads(cmd) == "7"
+        assert _extract_threads(cmd) == "1"
 
     # Plain → threads == 1 (queue is deeper than pool at submit time).
     for cmd in plain_cmds:
         assert _extract_threads(cmd) == "1"
 
-    # Plain pool is bounded by the number of pending plain segments (2 here),
-    # so max_workers is capped at min(segment_workers, 2).
-    assert captured["max_workers"] == 2
+    # Two executors are created: minterpolate phase and plain phase. Both are
+    # capped by the amount of work available in this test fixture.
+    assert captured["executor_max_workers"] == [2, 2]
 
     # Common ffmpeg invariants.
     for cmd in captured["segment_cmds"]:
@@ -174,17 +180,18 @@ def test_chronological_order_is_preserved_across_phases(monkeypatch, tmp_path):
     in the original input order regardless of processing order.
     """
     vp = _build_video_processor(monkeypatch)
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 64 * 1024**3)
 
     input_video = tmp_path / "input.mp4"
     output_video = tmp_path / "output.mp4"
     input_video.write_bytes(b"dummy")
 
-    captured = {"max_workers": None, "segment_cmds": [], "concat_cmds": []}
+    captured = {"executor_max_workers": [], "segment_cmds": [], "concat_cmds": []}
     _install_fakes(monkeypatch, captured)
 
-    # Index 0: plain. 1: heavy minterpolate (0.1x). 2: plain. 3: light minterpolate
-    # (0.5x). 4: plain. Heavy runs before light in phase 1, and both run before
-    # plain segments in phase 2.
+    # Index 0: plain. 1: heavy minterpolate (0.1x). 2: plain. 3: light
+    # minterpolate (0.5x). 4: plain. Heavy is submitted before light in phase 1,
+    # and both minterpolate tasks run before the plain phase.
     speed_segments = [
         {"original_start": 0.0, "original_end": 2.0, "video_speed": 1.0, "use_minterpolate": False},
         {"original_start": 2.0, "original_end": 5.0, "video_speed": 0.1, "use_minterpolate": True},
@@ -199,8 +206,8 @@ def test_chronological_order_is_preserved_across_phases(monkeypatch, tmp_path):
         str(output_video),
     )
 
-    # Processing order: index 1 (heaviest minterpolate) → 3 (lighter minterpolate)
-    # → 0/2/4 via pool.
+    # Submission order for the minterpolate phase is still heaviest-first, then
+    # the plain phase follows.
     processed_order = []
     for cmd in captured["segment_cmds"]:
         out_path = cmd[-1]
@@ -222,13 +229,14 @@ def test_chronological_order_is_preserved_across_phases(monkeypatch, tmp_path):
 
 def test_source_start_offset_is_used_only_for_extraction(monkeypatch, tmp_path):
     vp = _build_video_processor(monkeypatch)
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 64 * 1024**3)
     vp.video_segment_seek_padding = 0.0
 
     input_video = tmp_path / "input.mp4"
     output_video = tmp_path / "output.mp4"
     input_video.write_bytes(b"dummy")
 
-    captured = {"max_workers": None, "segment_cmds": [], "concat_cmds": []}
+    captured = {"executor_max_workers": [], "segment_cmds": [], "concat_cmds": []}
     _install_fakes(monkeypatch, captured)
 
     result_path, timing_adjustments = vp._apply_per_segment_video_speed(
@@ -264,12 +272,13 @@ def test_source_start_offset_is_used_only_for_extraction(monkeypatch, tmp_path):
 
 def test_all_plain_segments_skip_sequential_phase(monkeypatch, tmp_path):
     vp = _build_video_processor(monkeypatch)
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 64 * 1024**3)
 
     input_video = tmp_path / "input.mp4"
     output_video = tmp_path / "output.mp4"
     input_video.write_bytes(b"dummy")
 
-    captured = {"max_workers": None, "segment_cmds": [], "concat_cmds": []}
+    captured = {"executor_max_workers": [], "segment_cmds": [], "concat_cmds": []}
     _install_fakes(monkeypatch, captured)
 
     speed_segments = [
@@ -289,6 +298,16 @@ def test_all_plain_segments_skip_sequential_phase(monkeypatch, tmp_path):
         assert "minterpolate=" not in " ".join(cmd)
         assert _extract_threads(cmd) == "1"
 
-    assert captured["max_workers"] == 2
+    assert captured["executor_max_workers"] == [2]
     assert result_path == str(output_video)
     assert len(timing_adjustments) == 2
+
+
+def test_minterpolate_workers_are_capped_by_memory_budget(monkeypatch):
+    vp = _build_video_processor(monkeypatch)
+
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 64 * 1024**3)
+    assert vp._resolve_minterpolate_workers(cpu_total=32, segment_count=20) == 8
+
+    monkeypatch.setattr(vp, "_get_total_memory_bytes", lambda: 16 * 1024**3)
+    assert vp._resolve_minterpolate_workers(cpu_total=32, segment_count=20) == 2

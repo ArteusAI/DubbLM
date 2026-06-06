@@ -81,6 +81,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             # Segment optimization
             postDiarizationMergeGap=config.get("postDiarizationMergeGap"),
             postTranslationMergeGap=config.get("postTranslationMergeGap"),
+            repairSpeakerFragmentation=config.get("repairSpeakerFragmentation"),
             maxSegmentDuration=config.get("maxSegmentDuration"),
             minSegmentDuration=config.get("minSegmentDuration"),
             comfortMinAdjustmentRatio=config.get("comfortMinAdjustmentRatio"),

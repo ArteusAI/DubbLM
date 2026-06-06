@@ -210,12 +210,18 @@ class AudioProcessor:
             # If background audio processing takes too long, skip it and continue
             log("Background audio separation timed out - continuing without background audio")
             logger.warning("Background audio separation exceeded time limit - skipping background audio")
+            self.performance_tracker.record_error(
+                "background_audio", "timed out (Celery soft time limit) — skipped"
+            )
             self.performance_tracker.end_timing("background_audio")
             return None
         except Exception as e:
             # If background audio processing fails for any reason, log and continue without it
             log(f"Background audio separation failed: {str(e)} - continuing without background audio")
             logger.warning(f"Background audio separation failed: {e} - skipping background audio")
+            self.performance_tracker.record_error(
+                "background_audio", f"{type(e).__name__}: {e}"
+            )
             self.performance_tracker.end_timing("background_audio")
             return None
     

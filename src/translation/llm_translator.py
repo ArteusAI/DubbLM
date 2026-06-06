@@ -289,19 +289,84 @@ class LLMTranslator(TranslationInterface):
 
         return """
 # Gemini TTS delivery guidance
-- Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup directly in the output text.
+- Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup and pause markers directly in the output text.
 - Allowed Gemini-friendly markup includes tags such as [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
-- You MAY also insert pause markers [short pause], [medium pause], or [long pause] where they sound natural and improve delivery.
-- Insert tags and pauses only where context clearly supports them. Subtlety is mandatory.
-- Do not decorate every line. Many lines should stay untagged.
+- Pause markers: [short pause] (~0.3-0.5s), [medium pause] (~0.7-1.0s), [long pause] (~1.5-2.0s). Use them actively to break monotony and help the listener absorb information.
+- You SHOULD insert pause markers wherever they improve pacing and comprehension. Uninterrupted continuous speech is hard to follow in dubbing.
+- Good pause locations: after a completed clause or phrase; before an important term, number, or contrast; between list items or sequential steps; after a rhetorical setup and before the payoff; between distinct ideas inside a longer `long` variant.
+- For explanatory, instructional, or multi-clause lines, include at least one pause unless the line is very short (roughly under ~8 words).
+- Prefer one or two well-placed pauses per line over stacking many. Do not put a pause after every comma.
+- Insert expressive emotion tags only where context clearly supports them; many lines should stay without emotion tags even when they include pauses.
+- Do not decorate every line with emotion tags.
 - Treat filler/breath tags [uhm], [sigh], [sighs], and [gasp] as not a style default.
 - Across a whole video, target no more than 2 such filler/breath insertions per speaker in total. If recent context already shows one for that speaker, strongly prefer none; if it already shows two, add none.
 - Do not add [uhm] just to make the speech sound conversational. Use it only for an obvious hesitation, stumble, or self-interruption already implied by the line.
-- Prefer pause markers or ordinary expressive tags over filler/breath tags. Most explanatory lines should use zero non-speech sounds.
+- Prefer pause markers over filler/breath tags for pacing and clarity. Most explanatory lines should use zero filler sounds, but pauses are encouraged.
 - Preserve the exact factual meaning and keep the text natural in the target language.
 - Avoid turning tags into standalone content. They should support delivery, not replace wording.
 - For non-Gemini slots, do not add markup tags or pause markers.
-- For very short variants, prefer fewer tags unless a tag or pause materially helps the delivery.
+- For very short variants (`very_short`), use fewer pauses; for `long` variants, use pauses more generously when the content has multiple beats.
+""".strip()
+
+    def _build_refinement_tts_guidance(self, translated_pairs: List[Dict[str, Any]]) -> str:
+        """Build TTS markup guidance for the refinement pass."""
+        pseudo_segments = [{"speaker": pair.get("speaker")} for pair in translated_pairs]
+        editor_guidance = self._build_editor_tts_guidance(pseudo_segments)
+        if not editor_guidance:
+            return ""
+
+        return (
+            f"{editor_guidance}\n\n"
+            "# Refinement-specific markup rules\n"
+            "- CRITICAL: Input translations may already include TTS markup tags in square brackets "
+            "(e.g. [excited], [short pause], [sigh]). You MUST preserve every existing tag when rephrasing.\n"
+            "- Do NOT strip, normalize away, or rewrite markup tags as plain words while improving flow, persona, or grammar.\n"
+            "- You SHOULD enhance delivery: keep existing tags, reposition them only when it clearly improves pacing, "
+            "add pause markers where comprehension or rhythm improves, and strengthen expressive tags when context supports them.\n"
+            "- Carry markup tags through to all required output variants (`text`, `long`, and shorter variants when present). "
+            "Shorter variants may use fewer pauses but must not drop intentional emotion tags without reason.\n"
+            "- If an input line has no tags yet, you MAY add subtle Gemini-friendly markup following the rules above."
+        )
+
+    def _translation_tts_guidance_signature(self) -> str:
+        if self.enable_llm_editor or self.enable_emotion_enrichment:
+            return "off"
+        configured_systems = {self.tts_system or ""}
+        configured_systems.update(self.tts_system_mapping.values())
+        if "gemini" not in configured_systems:
+            return "off"
+        return f"on|{self._editor_tts_signature()}"
+
+    def _build_translation_tts_guidance(self, speakers: Optional[List[str]]) -> str:
+        if self.enable_llm_editor or self.enable_emotion_enrichment:
+            return ""
+
+        normalized_speakers = [str(speaker).strip() for speaker in speakers or [] if str(speaker).strip()]
+        gemini_speakers = [
+            speaker
+            for speaker in normalized_speakers
+            if self._resolve_tts_system_for_speaker(speaker) == "gemini"
+        ]
+
+        if not gemini_speakers and self._resolve_tts_system_for_speaker("*") != "gemini":
+            return ""
+
+        if gemini_speakers:
+            speaker_scope = ", ".join(gemini_speakers)
+        else:
+            speaker_scope = "all speakers in this chunk"
+
+        return f"""
+# Gemini TTS delivery guidance
+Gemini TTS speakers in this chunk: {speaker_scope}.
+- You MAY add subtle expressive markup directly in translated text for Gemini TTS speakers only.
+- Allowed Gemini-friendly markup includes [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
+- You MAY insert pause markers [short pause], [medium pause], or [long pause] where they sound natural and improve delivery.
+- Insert tags only where context clearly supports them; many lines should stay untagged.
+- Do not add [uhm] just to sound conversational. Use it only for obvious hesitation, stumbling, or self-interruption already implied by the source.
+- Prefer pause markers or ordinary expressive tags over filler or breath tags.
+- Preserve exact meaning, facts, names, numbers, and natural target-language wording.
+- Do not add markup for non-Gemini speakers.
 """.strip()
 
     def _normalize_term_key(self, term: str) -> str:
@@ -468,7 +533,8 @@ Rules:
                 self.refinement_model_name,
                 prompt,
                 response_text,
-                response
+                response,
+                category="emotion_enrichment",
             )
 
             if not response_text:
@@ -688,6 +754,8 @@ Rules:
         prompt_text: Optional[str],
         response_text: Optional[str],
         llm_result: Optional[Any] = None,
+        *,
+        category: str = "translation",
     ) -> None:
         """Record usage metrics for a single LLM call via the cost tracker."""
         if not self.cost_tracker:
@@ -717,6 +785,7 @@ Rules:
                 float(input_tokens or 0.0),
                 float(output_tokens or 0.0),
                 float(reasoning_tokens or 0.0),
+                category=category,
             )
         except Exception as exc:
             logger.warning(f"Failed to record translation cost for provider {provider}: {exc}")
@@ -863,7 +932,8 @@ Rules:
             f"{self.model_name}|{self.temperature}|{(self.prompt_prefix or '')}|"
             f"{self.last_speaker_metadata_cache_signature}|editor={int(self.enable_llm_editor)}|"
             f"{self.editor_llm_provider}|{self.editor_model_name}|{self.editor_temperature}|{self.editor_reasoning_effort}|"
-            f"{self._editor_tts_signature() if self.enable_llm_editor else ''}|{EDITOR_SCHEMA_VERSION}"
+            f"{self._editor_tts_signature() if self.enable_llm_editor else ''}|"
+            f"translation_tts_guidance={self._translation_tts_guidance_signature()}|{EDITOR_SCHEMA_VERSION}"
         )
         # Create a hash of this data
         return hashlib.md5(cache_data.encode("utf-8")).hexdigest()
@@ -942,7 +1012,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             else:
                 response_text = str(result)
             
-            self._record_llm_cost(self.llm_provider, self.model_name, combined_prompt, response_text, result)
+            self._record_llm_cost(
+                self.llm_provider,
+                self.model_name,
+                combined_prompt,
+                response_text,
+                result,
+                category="context_analysis",
+            )
             
             # Extract JSON from the response
             try:
@@ -975,7 +1052,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         combined_info[key] = [] if key in ["terminology", "themes"] else [{"title": "Conversation", "summary": "General discussion"}]
 
             # TTS style picker — classify once so downstream Gemini TTS prompt can adapt.
-            allowed_tts_styles = {"podcast", "lecture", "gothic"}
+            allowed_tts_styles = {"podcast", "lecture", "gothic", "news"}
             raw_style = str(combined_info.get("tts_style", "") or "").strip().lower()
             combined_info["tts_style"] = raw_style if raw_style in allowed_tts_styles else "podcast"
             
@@ -1250,6 +1327,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 prompt,
                 response_text,
                 payload_json,
+                category="editor_pass",
             )
             return response_text, payload_json
 
@@ -1269,6 +1347,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             prompt,
             response_text,
             editor_response,
+            category="editor_pass",
         )
         return response_text, editor_response
 
@@ -2090,11 +2169,21 @@ CRITICAL: You MUST use the translations from the glossary for all listed terms.
 IMPORTANT: The glossary provides base forms of translations. When using a term from the glossary, you MUST adapt it to fit the grammatical context (e.g., case, gender, number, verb conjugation) of the sentence in the target language "{target_language}". For example, if the glossary says "cat" -> "кошка", and the sentence requires the genitive case, you should use "кошки", not "кошка". Do not just insert the glossary term verbatim if it violates grammatical rules.
 """
         
-        # Optional additional context section for translation prompt
-        custom_section = f"""
+        # Optional additional context sections for the translation prompt.
+        custom_sections = []
+        if self.prompt_prefix:
+            custom_sections.append(f"""
 # Additional context (optional):
 {self.prompt_prefix}
-""" if self.prompt_prefix else ""
+""".strip())
+
+        translation_tts_guidance = self._build_translation_tts_guidance(
+            [pair.get("speaker", "") for pair in original_speaker_texts]
+        )
+        if translation_tts_guidance:
+            custom_sections.append(translation_tts_guidance)
+
+        custom_section = "\n\n".join(custom_sections)
 
         # Build prompt with context information
         prompt = TRANSLATION_PROMPT_TEMPLATE.format(
@@ -2130,7 +2219,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 else:
                     translation_text = str(translation).strip()
 
-                self._record_llm_cost(self.llm_provider, self.model_name, prompt, translation_text, translation)
+                self._record_llm_cost(
+                    self.llm_provider,
+                    self.model_name,
+                    prompt,
+                    translation_text,
+                    translation,
+                    category="translation",
+                )
                 
                 # Check if translation is empty
                 if not translation_text:
@@ -2627,6 +2723,10 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     f"{refinement_prompt}"
                 )
 
+            refinement_tts_guidance = self._build_refinement_tts_guidance(all_translated_pairs)
+            if refinement_tts_guidance:
+                refinement_prompt = f"{refinement_tts_guidance}\n\n{refinement_prompt}"
+
             # Start timer for batch refinement
             batch_start_time = time.perf_counter()
 
@@ -2649,7 +2749,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     else: # openrouter
                         llm_response_text = str(refinement_response).strip()
 
-                    self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, effective_refinement_prompt, llm_response_text, refinement_response)
+                    self._record_llm_cost(
+                        self.refinement_llm_provider,
+                        self.refinement_model_name,
+                        effective_refinement_prompt,
+                        llm_response_text,
+                        refinement_response,
+                        category="refinement",
+                    )
 
                     if not llm_response_text:
                         if attempt < max_attempts - 1:
@@ -3274,7 +3381,14 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
                 logger.debug(f"Attempt {attempt + 1}/{max_attempts}: Calling refinement LLM...")
                 response = self.refinement_llm.complete(prompt)
                 response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
-                self._record_llm_cost(self.refinement_llm_provider, self.refinement_model_name, prompt, response_text, response)
+                self._record_llm_cost(
+                    self.refinement_llm_provider,
+                    self.refinement_model_name,
+                    prompt,
+                    response_text,
+                    response,
+                    category="refinement",
+                )
                 
                 if not response_text:
                     logger.warning(f"Attempt {attempt + 1}: Empty response from LLM")

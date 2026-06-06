@@ -3,66 +3,66 @@
     "voice_stats": {
       "Achernar": {
         "voice_name": "Achernar",
-        "words_per_minute": 100.35750766087845,
-        "characters_per_second": 12.155260469867212,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 78.32
+        "words_per_minute": 132.0252224715974,
+        "characters_per_second": 16.091488260937563,
+        "total_samples": 25,
+        "total_words": 1534,
+        "total_characters": 10531,
+        "total_duration_seconds": 619.127458333333
       },
       "Achird": {
         "voice_name": "Achird",
-        "words_per_minute": 133.31071913161463,
-        "characters_per_second": 16.146540027137043,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 58.96
+        "words_per_minute": 119.97933392335719,
+        "characters_per_second": 15.840826093005957,
+        "total_samples": 246,
+        "total_words": 15121,
+        "total_characters": 101570,
+        "total_duration_seconds": 5413.47608333333
       },
       "Algenib": {
         "voice_name": "Algenib",
-        "words_per_minute": 126.85603615235635,
-        "characters_per_second": 15.364751452550031,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 61.96
+        "words_per_minute": 142.45632672166107,
+        "characters_per_second": 15.722446533267176,
+        "total_samples": 46,
+        "total_words": 5845,
+        "total_characters": 37442,
+        "total_duration_seconds": 2153.0995000000003
       },
       "Algieba": {
         "voice_name": "Algieba",
-        "words_per_minute": 131.35026737967914,
-        "characters_per_second": 15.909090909090908,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 59.84
+        "words_per_minute": 126.75760619017093,
+        "characters_per_second": 14.905092164296509,
+        "total_samples": 427,
+        "total_words": 29257,
+        "total_characters": 190533,
+        "total_duration_seconds": 11524.908250000004
       },
       "Alnilam": {
         "voice_name": "Alnilam",
-        "words_per_minute": 299.2710351870627,
-        "characters_per_second": 35.79127566311546,
-        "total_samples": 266,
-        "total_words": 26949,
-        "total_characters": 177446,
-        "total_duration_seconds": 10856.097000000002
+        "words_per_minute": 159.00327084474293,
+        "characters_per_second": 17.56455280707782,
+        "total_samples": 302,
+        "total_words": 28610,
+        "total_characters": 188529,
+        "total_duration_seconds": 11521.855750000004
       },
       "Aoede": {
         "voice_name": "Aoede",
-        "words_per_minute": 128.93700787401573,
-        "characters_per_second": 15.616797900262467,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 60.96
+        "words_per_minute": 168.11231055847176,
+        "characters_per_second": 19.185562622723285,
+        "total_samples": 65,
+        "total_words": 8773,
+        "total_characters": 57875,
+        "total_duration_seconds": 3011.788166666667
       },
       "Autonoe": {
         "voice_name": "Autonoe",
-        "words_per_minute": 130.56478405315613,
-        "characters_per_second": 15.813953488372093,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 60.2
+        "words_per_minute": 163.16998873919994,
+        "characters_per_second": 18.035651182714346,
+        "total_samples": 24,
+        "total_words": 6874,
+        "total_characters": 46160,
+        "total_duration_seconds": 2618.9400833333334
       },
       "Callirrhoe": {
         "voice_name": "Callirrhoe",
@@ -75,12 +75,12 @@
       },
       "Charon": {
         "voice_name": "Charon",
-        "words_per_minute": 121.44622991347342,
-        "characters_per_second": 14.709517923362176,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 64.72
+        "words_per_minute": 185.29855408984955,
+        "characters_per_second": 20.28591220292387,
+        "total_samples": 233,
+        "total_words": 6418,
+        "total_characters": 45180,
+        "total_duration_seconds": 2579.057500000001
       },
       "Despina": {
         "voice_name": "Despina",
@@ -93,12 +93,12 @@
       },
       "Enceladus": {
         "voice_name": "Enceladus",
-        "words_per_minute": 199.76681696935597,
-        "characters_per_second": 21.684537355835605,
-        "total_samples": 259,
-        "total_words": 39181,
-        "total_characters": 252289,
-        "total_duration_seconds": 15473.062000000004
+        "words_per_minute": 157.8095220805763,
+        "characters_per_second": 17.1273415803982,
+        "total_samples": 699,
+        "total_words": 83308,
+        "total_characters": 536440,
+        "total_duration_seconds": 32606.84733333331
       },
       "Erinome": {
         "voice_name": "Erinome",
@@ -111,39 +111,39 @@
       },
       "Fenrir": {
         "voice_name": "Fenrir",
-        "words_per_minute": 125.07956715467854,
-        "characters_per_second": 15.149586250795672,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 62.84
+        "words_per_minute": 315.8715088953094,
+        "characters_per_second": 36.04687117457324,
+        "total_samples": 36,
+        "total_words": 741,
+        "total_characters": 5064,
+        "total_duration_seconds": 225.79195833333338
       },
       "Gacrux": {
         "voice_name": "Gacrux",
-        "words_per_minute": 128.59947643979058,
-        "characters_per_second": 15.575916230366493,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 61.12
+        "words_per_minute": 173.07927667928845,
+        "characters_per_second": 18.694592995217928,
+        "total_samples": 53,
+        "total_words": 5619,
+        "total_characters": 36513,
+        "total_duration_seconds": 2129.5562916666663
       },
       "Iapetus": {
         "voice_name": "Iapetus",
-        "words_per_minute": 133.5825968728756,
-        "characters_per_second": 16.179469748470428,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 58.84
+        "words_per_minute": 143.7982297018475,
+        "characters_per_second": 16.86608257568473,
+        "total_samples": 25,
+        "total_words": 1192,
+        "total_characters": 8475,
+        "total_duration_seconds": 517.1289583333333
       },
       "Kore": {
         "voice_name": "Kore",
-        "words_per_minute": 130.2186878727634,
-        "characters_per_second": 15.772034459907223,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 60.36
+        "words_per_minute": 213.63492217254984,
+        "characters_per_second": 24.072221923052453,
+        "total_samples": 11,
+        "total_words": 663,
+        "total_characters": 4403,
+        "total_duration_seconds": 241.63766666666666
       },
       "Laomedeia": {
         "voice_name": "Laomedeia",
@@ -165,21 +165,21 @@
       },
       "Orus": {
         "voice_name": "Orus",
-        "words_per_minute": 131.35026737967914,
-        "characters_per_second": 15.909090909090908,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 59.84
+        "words_per_minute": 139.56486657759558,
+        "characters_per_second": 16.23168301093559,
+        "total_samples": 81,
+        "total_words": 8501,
+        "total_characters": 55958,
+        "total_duration_seconds": 3126.514791666668
       },
       "Puck": {
         "voice_name": "Puck",
-        "words_per_minute": 182.92950291357988,
-        "characters_per_second": 20.45975638329493,
-        "total_samples": 31,
-        "total_words": 6371,
-        "total_characters": 43573,
-        "total_duration_seconds": 2446.1868749999994
+        "words_per_minute": 165.7178022716908,
+        "characters_per_second": 15.718240950486427,
+        "total_samples": 273,
+        "total_words": 18076,
+        "total_characters": 119196,
+        "total_duration_seconds": 6706.7307499999915
       },
       "Pulcherrima": {
         "voice_name": "Pulcherrima",
@@ -201,12 +201,12 @@
       },
       "Sadachbia": {
         "voice_name": "Sadachbia",
-        "words_per_minute": 122.42990654205607,
-        "characters_per_second": 14.82866043613707,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 64.2
+        "words_per_minute": 151.87613408620382,
+        "characters_per_second": 17.444989045699373,
+        "total_samples": 9,
+        "total_words": 426,
+        "total_characters": 2926,
+        "total_duration_seconds": 190.66695833333335
       },
       "Sadaltager": {
         "voice_name": "Sadaltager",
@@ -219,30 +219,30 @@
       },
       "Schedar": {
         "voice_name": "Schedar",
-        "words_per_minute": 214.6331860566773,
-        "characters_per_second": 28.40448707872253,
-        "total_samples": 385,
-        "total_words": 33103,
-        "total_characters": 220109,
-        "total_duration_seconds": 17556.719250000013
+        "words_per_minute": 150.0008381028744,
+        "characters_per_second": 16.21296485911567,
+        "total_samples": 821,
+        "total_words": 97586,
+        "total_characters": 648122,
+        "total_duration_seconds": 41202.36758333339
       },
       "Sulafat": {
         "voice_name": "Sulafat",
-        "words_per_minute": 548.000821253116,
-        "characters_per_second": 65.98476540448873,
-        "total_samples": 296,
-        "total_words": 13447,
-        "total_characters": 86164,
-        "total_duration_seconds": 5254.395000000002
+        "words_per_minute": 154.6859153695683,
+        "characters_per_second": 16.345041349272087,
+        "total_samples": 304,
+        "total_words": 13595,
+        "total_characters": 87113,
+        "total_duration_seconds": 5316.333000000003
       },
       "Umbriel": {
         "voice_name": "Umbriel",
-        "words_per_minute": 182.06267806495703,
-        "characters_per_second": 19.89455810190259,
-        "total_samples": 689,
-        "total_words": 92339,
-        "total_characters": 601257,
-        "total_duration_seconds": 39854.54899999996
+        "words_per_minute": 201.14964297601688,
+        "characters_per_second": 21.810442282713776,
+        "total_samples": 2002,
+        "total_words": 156168,
+        "total_characters": 1016112,
+        "total_duration_seconds": 63085.800166666544
       },
       "Vindemiatrix": {
         "voice_name": "Vindemiatrix",
@@ -264,12 +264,12 @@
       },
       "Zubenelgenubi": {
         "voice_name": "Zubenelgenubi",
-        "words_per_minute": 122.58265751715533,
-        "characters_per_second": 14.8471615720524,
-        "total_samples": 1,
-        "total_words": 131,
-        "total_characters": 952,
-        "total_duration_seconds": 64.12
+        "words_per_minute": 158.70387279237548,
+        "characters_per_second": 17.32675972179713,
+        "total_samples": 618,
+        "total_words": 34856,
+        "total_characters": 229155,
+        "total_duration_seconds": 13795.069333333327
       }
     }
   },

@@ -149,6 +149,9 @@ class CostEstimator:
         except ValueError as exc:
             logger.warning("Skipping translation cost estimation: %s", exc)
 
+        if self._config.get("refinement_persona", "normal") == "none":
+            return
+
         refinement_provider = self._resolve_refinement_provider(provider)
         refinement_model = self._resolve_refinement_model_name(
             refinement_provider, model_name
@@ -387,6 +390,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             tone=tone,
             themes=themes,
             terminology=terminology,
+            speaker_grammar_section="",
             context_before="",
             text_to_translate="",
             context_after="",

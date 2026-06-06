@@ -38,6 +38,7 @@ class WhisperXTranscriber(BaseTranscriber):
         super().__init__(source_language, device, **kwargs)
         self.whisperx_model = whisperx_model
         self.cache_manager = cache_manager
+        self.cost_tracker = kwargs.get("cost_tracker")
         
         # Lazy loading of whisperx to avoid initial import overhead
         self._whisperx = None
@@ -148,6 +149,23 @@ class WhisperXTranscriber(BaseTranscriber):
             # Process the result into our expected output formats
             speakers_rolls = self._process_diarization_result(result)
             transcription = self._process_whisperx_transcript(result)
+            if self.cost_tracker:
+                audio_seconds = max((seg.get("end", 0.0) for seg in transcription), default=0.0)
+                if audio_seconds <= 0:
+                    try:
+                        import soundfile as sf
+                        info = sf.info(audio_file)
+                        audio_seconds = float(info.frames) / float(info.samplerate or 1)
+                    except Exception:
+                        audio_seconds = 0.0
+                if audio_seconds > 0:
+                    self.cost_tracker.add_transcription_usage(
+                        "whisperx",
+                        float(audio_seconds),
+                        model=str(self.whisperx_model or "whisperx"),
+                        category="primary_transcription",
+                        count_cost=False,
+                    )
             
             # Store for debug
             self.debug_data["diarization"] = speakers_rolls

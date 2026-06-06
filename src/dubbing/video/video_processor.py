@@ -7,7 +7,7 @@ import tempfile
 import shutil
 import threading
 from typing import Optional, List, Tuple, Dict, Any
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 
 from ..debug.performance_tracker import PerformanceTracker
 from ..audio.audio_processor import AudioProcessor
@@ -37,6 +37,42 @@ class VideoProcessor:
             0.0,
             float(self.config.get('video_segment_seek_padding', 1.0))
         )
+
+    def _get_total_memory_bytes(self) -> Optional[int]:
+        """Best-effort host RAM detection without extra dependencies."""
+        try:
+            if hasattr(os, "sysconf"):
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                phys_pages = os.sysconf("SC_PHYS_PAGES")
+                if isinstance(page_size, int) and isinstance(phys_pages, int):
+                    total_bytes = int(page_size) * int(phys_pages)
+                    if total_bytes > 0:
+                        return total_bytes
+        except (ValueError, OSError, AttributeError):
+            pass
+        return None
+
+    def _resolve_minterpolate_workers(
+        self,
+        cpu_total: int,
+        segment_count: int,
+    ) -> int:
+        """Return a safe level of parallelism for heavy minterpolate renders."""
+        if segment_count <= 0:
+            return 0
+
+        configured = self.config.get("video_minterpolate_workers")
+        if configured:
+            return min(segment_count, max(1, int(configured)))
+
+        total_mem_bytes = self._get_total_memory_bytes() or 0
+        # Heavy 4K minterpolate jobs are memory-hungry; target roughly one worker
+        # per 8 GiB of RAM, capped at 8 workers on 64 GiB-class hosts.
+        mem_based_cap = 1
+        if total_mem_bytes > 0:
+            gib = 1024 ** 3
+            mem_based_cap = max(1, int(total_mem_bytes // (8 * gib)))
+        return min(segment_count, max(1, cpu_total), 8, mem_based_cap)
     
     def _run_ffmpeg_with_progress(
         self,
@@ -917,10 +953,10 @@ class VideoProcessor:
             )
             return output_duration * (50.0 if uses_mi else 1.0)
 
-        # minterpolate segments dominate total cost and contend heavily for L3/RAM
-        # when run in parallel. Run them strictly sequentially (first, so progress
-        # starts moving right away) with `-threads=cpu-1`, then handle the fast
-        # plain segments in parallel using the regular worker pool.
+        # minterpolate is the expensive part of the pipeline, but on many hosts it
+        # does not scale well with per-process `-threads`. Prefer a bounded number
+        # of separate ffmpeg processes (distributed across cores) and keep each
+        # process single-threaded to avoid cache/RAM blowups on large hosts.
         def _is_minterpolate(seg: Dict[str, Any]) -> bool:
             return bool(
                 seg["use_minterpolate"]
@@ -937,10 +973,21 @@ class VideoProcessor:
             key=_estimate_segment_cost,
             reverse=True,
         )
-        minterpolate_threads = max(1, cpu_total - 1)
+        minterpolate_workers = self._resolve_minterpolate_workers(
+            cpu_total=cpu_total,
+            segment_count=len(minterpolate_segments),
+        )
+        minterpolate_threads = 1
+        total_mem_bytes = self._get_total_memory_bytes() or 0
+        total_mem_gib = total_mem_bytes / float(1024 ** 3) if total_mem_bytes > 0 else None
+        mi_mem_note = (
+            f", host_mem≈{total_mem_gib:.0f}GiB"
+            if total_mem_gib is not None
+            else ""
+        )
         logger.info(
             f"Video speed stages: minterpolate={len(minterpolate_segments)} "
-            f"(sequential, threads={minterpolate_threads}), "
+            f"(parallel workers={minterpolate_workers}, threads/job={minterpolate_threads}{mi_mem_note}), "
             f"plain={len(plain_segments)} (parallel workers={segment_workers})"
         )
 
@@ -1042,18 +1089,24 @@ class VideoProcessor:
             return seg_idx, segment_output
 
         try:
-            # Phase 1: minterpolate segments — sequentially, one ffmpeg at a time,
-            # each with near-full CPU via -threads=cpu-1. These are the heavy
-            # slow-motion renders; parallelizing them thrashes caches and only
-            # elongates the tail, so we front-load them.
-            for seg_meta in minterpolate_segments:
-                seg_idx, seg_path = process_segment(seg_meta, minterpolate_threads)
-                segment_outputs.append((seg_idx, seg_path))
-                completed += 1
-                if progress_callback:
-                    progress_callback(
-                        completed, len(valid_segments), "Video speed segment processing"
-                    )
+            # Phase 1: minterpolate segments — run a small, memory-aware number of
+            # ffmpeg processes in parallel. Keep each job at `-threads=1` so the
+            # host-level parallelism comes from distributing segments across cores.
+            if minterpolate_segments:
+                mi_pool_size = min(minterpolate_workers, len(minterpolate_segments))
+                with ThreadPoolExecutor(max_workers=mi_pool_size) as executor:
+                    future_to_seg = {
+                        executor.submit(process_segment, seg_meta, minterpolate_threads): seg_meta
+                        for seg_meta in minterpolate_segments
+                    }
+                    for future in as_completed(future_to_seg):
+                        seg_idx, seg_path = future.result()
+                        segment_outputs.append((seg_idx, seg_path))
+                        completed += 1
+                        if progress_callback:
+                            progress_callback(
+                                completed, len(valid_segments), "Video speed segment processing"
+                            )
 
             # Phase 2: plain segments — parallel pool with adaptive thread budget.
             # While the queue is deeper than the pool, every ffmpeg runs with
@@ -1336,11 +1389,11 @@ class VideoProcessor:
 
         if background_audio_path and has_nontrivial_video_speed:
             logger.warning(
-                "Disabling background audio mix because per-segment video speed changes "
-                "would leave the background track in the original timeline, causing "
-                "audible desync and leaked vocals ahead/behind the picture."
+                "Background audio mix will stay enabled despite per-segment video "
+                "speed changes. The background track remains in the original "
+                "timeline, so minor drift relative to picture/dubbed speech is "
+                "expected."
             )
-            background_audio_path = None
 
         # Audio normalization is now done per-segment before combination
         # Skip whole-track normalization since segments are already normalized

@@ -149,12 +149,32 @@ class ProjectManager:
         if self.base_dir.exists():
             shutil.rmtree(self.base_dir)
     
-    def cleanup_artifacts(self) -> None:
-        """Remove only artifact files (keep uploads and results)."""
+    def cleanup_artifacts(self, preserve_tts_cache: bool = False) -> None:
+        """Remove only artifact files (keep uploads and optional TTS cache)."""
         if self.artifacts_dir.exists():
             shutil.rmtree(self.artifacts_dir)
         if self.cache_dir.exists():
-            shutil.rmtree(self.cache_dir)
+            if not preserve_tts_cache:
+                shutil.rmtree(self.cache_dir)
+            else:
+                preserved_cache_dirs = {"segment_synthesis", "synthesized_speech"}
+                for input_dir in self.cache_dir.iterdir():
+                    if not input_dir.is_dir():
+                        try:
+                            input_dir.unlink()
+                        except OSError:
+                            pass
+                        continue
+                    for child in input_dir.iterdir():
+                        if child.name in preserved_cache_dirs:
+                            continue
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            try:
+                                child.unlink()
+                            except OSError:
+                                pass
     
     def get_dubbing_config_overrides(self) -> dict:
         """Get configuration overrides for SmartDubbing to use project directories."""
@@ -202,4 +222,3 @@ class ProjectManager:
         """Static method to cleanup a project by ID."""
         manager = cls(project_id)
         manager.cleanup()
-

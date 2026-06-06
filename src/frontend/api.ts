@@ -376,6 +376,14 @@ class ApiClient {
     return this.request<ProjectStatsResponse>(`/projects/${projectId}/stats`);
   }
 
+  async getProjectReport(projectId: string): Promise<ProjectReportResponse> {
+    return this.request<ProjectReportResponse>(`/projects/${projectId}/report`);
+  }
+
+  getDownloadReportUrl(projectId: string): string {
+    return `${this.baseUrl}/projects/${projectId}/download/report`;
+  }
+
   // --- SSE Status Stream ---
 
   subscribeToStatus(
@@ -482,6 +490,7 @@ export interface ProjectConfig {
   llmModelName?: string;
   llmTemperature?: number;
   enableLlmEditor?: boolean;
+  enableLlmTextAdjustment?: boolean;
   editorLlmProvider?: string;
   editorModelName?: string;
   editorTemperature?: number;
@@ -496,12 +505,17 @@ export interface ProjectConfig {
   translationPromptPrefix?: string;
   ttsSystem?: string;
   ttsModel?: string;
-  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
+  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
-  resolvedTtsStyle?: 'podcast' | 'lecture' | 'gothic';
+  resolvedTtsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news';
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  contentValidatorProvider?: 'whisper' | 'assemblyai';
+  contentValidatorWhisperModel?: string;
+  contentValidatorWhisperComputeType?: string;
+  contentValidatorWhisperCpuThreads?: number;
+  contentValidatorSpeechModel?: string;
   dubbedVolume?: number;
   backgroundVolume?: number;
   keepOriginalAudioRanges?: string[];
@@ -658,6 +672,11 @@ export interface ProjectStatsResponse {
   totalCost: number;
 }
 
+export interface ProjectReportResponse {
+  markdown: string;
+  json: unknown | null;
+}
+
 export interface SettingsResponse {
   apiKeys?: Record<string, string>;
   defaults?: Record<string, unknown>;
@@ -675,11 +694,13 @@ export interface ApiKeyStatus {
 }
 
 export interface PresetDefaultsResponse {
+  personaId?: string;
   keepBackground?: boolean;
   llmProvider?: string;
   llmModelName?: string;
   llmTemperature?: number;
   enableLlmEditor?: boolean;
+  enableLlmTextAdjustment?: boolean;
   editorLlmProvider?: string;
   editorModelName?: string;
   editorTemperature?: number;
@@ -690,7 +711,7 @@ export interface PresetDefaultsResponse {
   ttsSystem?: string;
   ttsModel?: string;
   ttsFallbackModel?: string;
-  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
+  ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;

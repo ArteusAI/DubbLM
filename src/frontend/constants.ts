@@ -6,6 +6,12 @@ import { Persona, Language, PresetConfig } from './types';
 // src/tts/gemini_tts_wrapper.py (the backend source of truth).
 export const GEMINI_DEFAULT_TTS_MODEL = 'gemini-2.5-pro-preview-tts';
 export const GEMINI_DEFAULT_TTS_FALLBACK_MODEL = 'gemini-2.5-flash-preview-tts';
+export const GEMINI_EXPERIMENTAL_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
+export const GEMINI_TTS_MODEL_OPTIONS = [
+  GEMINI_DEFAULT_TTS_MODEL,
+  GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
+  GEMINI_EXPERIMENTAL_TTS_MODEL,
+];
 
 export const LANGUAGES: Language[] = [
   { code: 'auto', name: 'Auto Detect' },
@@ -35,6 +41,7 @@ export const DEFAULT_PERSONAS: Persona[] = [
   { id: 'housewife', name: 'Housewife', description: 'Explains technology for household and family management context.' },
   { id: 'science_popularizer', name: 'Science Popularizer', description: 'Makes complex topics engaging and understandable for general audience.' },
   { id: 'it_buddy', name: 'IT Buddy', description: 'Informal IT jargon with transliterated technical terms.' },
+  { id: 'tractorman', name: 'Tractorman', description: 'Casual informal style with sparing profanity for emphasis.' },
   { id: 'ai_buddy', name: 'AI Buddy', description: 'Clear, professional language for AI practitioners.' },
   { id: 'pedantic', name: 'Pedantic', description: 'Maximal fidelity to original wording and sentiment.' },
   { id: 'ai_visioner', name: 'AI Visioner', description: 'Strategic perspective on technical details with visionary context.' },
@@ -55,7 +62,7 @@ export const LLM_PROVIDERS = [
 ];
 
 export const TTS_STYLES: {
-  id: 'podcast' | 'lecture' | 'gothic' | 'custom' | 'auto';
+  id: 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
   label: string;
   icon: string;
   description: string;
@@ -81,6 +88,13 @@ export const TTS_STYLES: {
     icon: 'BookMarked',
     description: 'Slow, atmospheric storytelling with deep resonance.',
     prompt: 'Read in a slow, deliberate, suspenseful tone with deep resonance:',
+  },
+  {
+    id: 'news',
+    label: 'News',
+    icon: 'Radio',
+    description: 'Energetic broadcast narration for news episodes.',
+    prompt: 'Synthesize only the transcript below in the language it is written; do not read these directions. Deliver it like a modern news explainer: confident, crisp broadcast narration with forward momentum, energetic narrative cadence, clear factual emphasis, bright but serious tone, no shouting or parody, short clean pauses between clauses:',
   },
   {
     id: 'custom',
@@ -128,11 +142,13 @@ export const PRESETS: PresetConfig[] = [
     name: 'Fast',
     description: '~1x video speed',
     icon: '⚡',
+    personaId: 'none',
     keepBackground: false,
     llmProvider: 'gemini',
-    llmModelName: 'gemini-flash-lite-latest',
+    llmModelName: 'gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: false,
+    enableLlmTextAdjustment: false,
     editorLlmProvider: 'openrouter',
     editorModelName: 'openai/gpt-5.4',
     editorTemperature: 1.0,
@@ -145,7 +161,7 @@ export const PRESETS: PresetConfig[] = [
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
     enableEmotionEnrichment: false,
-    enableContentValidation: true,
+    enableContentValidation: false,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     useTwoPassEncoding: true,
@@ -158,20 +174,22 @@ export const PRESETS: PresetConfig[] = [
     name: 'HQ',
     description: '~2x video duration',
     icon: '✨',
+    personaId: 'none',
     keepBackground: false,
     llmProvider: 'gemini',
     llmModelName: 'gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: false,
+    enableLlmTextAdjustment: false,
     editorLlmProvider: 'openrouter',
     editorModelName: 'openai/gpt-5.4',
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
     refinementLlmProvider: 'gemini',
-    refinementModelName: 'gemini-2.5-pro',
+    refinementModelName: 'gemini-flash-latest',
     refinementTemperature: 1.0,
     ttsSystem: 'gemini',
-    ttsModel: GEMINI_DEFAULT_TTS_MODEL,
+    ttsModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
     ttsFallbackModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
     ttsStyle: 'auto',
     voiceAutoSelection: true,
@@ -190,11 +208,13 @@ export const PRESETS: PresetConfig[] = [
     name: 'Ultra',
     description: '~4x video duration',
     icon: '💎',
+    personaId: 'normal',
     keepBackground: true,
     llmProvider: 'gemini',
     llmModelName: 'gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: true,
+    enableLlmTextAdjustment: true,
     editorLlmProvider: 'openrouter',
     editorModelName: 'openai/gpt-5.4',
     editorTemperature: 1.0,

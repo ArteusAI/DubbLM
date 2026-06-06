@@ -31,7 +31,7 @@ class SegmentOptimizer:
         self.max_segment_before_translate_chars = self.opt_cfg.get('max_segment_before_translate_chars', 420)
         self.max_segment_duration = self.opt_cfg.get('max_segment_duration', 60)
         self.min_segment_duration = self.opt_cfg.get('min_segment_duration', 0.5)
-        self.max_segment_to_synth_tokens = self.opt_cfg.get('max_segment_to_synth_tokens', 7000)
+        self.max_segment_to_synth_tokens = self.opt_cfg.get('max_segment_to_synth_tokens', 1024)
 
         logger.debug(f"SegmentOptimizer initialized with: "
                     f"tts_system={self.tts_system}, "
@@ -79,6 +79,103 @@ class SegmentOptimizer:
 
         # For other TTS systems, use simple space
         return " "
+
+    def _segment_duration(self, segment: Dict[str, Any]) -> float:
+        return max(0.0, float(segment.get('end', 0.0)) - float(segment.get('start', 0.0)))
+
+    def _segment_word_count(self, segment: Dict[str, Any]) -> int:
+        words = segment.get('words')
+        if isinstance(words, list) and words:
+            return len(words)
+        return len(str(segment.get('text') or '').split())
+
+    def _is_short_speaker_fragment(self, segment: Dict[str, Any]) -> bool:
+        max_duration = float(self.opt_cfg.get('speaker_fragment_max_duration', 3.0))
+        max_words = int(self.opt_cfg.get('speaker_fragment_max_words', 10))
+        return (
+            self._segment_duration(segment) <= max_duration
+            or self._segment_word_count(segment) <= max_words
+        )
+
+    def _speaker_fragment_repair_enabled(self, unique_speaker_count: int) -> bool:
+        mode = self.opt_cfg.get('repair_speaker_fragmentation', 'auto')
+        if isinstance(mode, str):
+            mode = mode.strip().lower()
+        if mode in (False, 'false', 'off', 'disabled', 'none', '0'):
+            return False
+        if mode in (True, 'true', 'on', 'enabled', '1'):
+            return True
+
+        expected_speakers = self.config.get('speakers_expected')
+        if expected_speakers is None:
+            return False
+
+        margin = int(self.opt_cfg.get('speaker_fragment_expected_speaker_margin', 2))
+        try:
+            return unique_speaker_count > int(expected_speakers) + margin
+        except (TypeError, ValueError):
+            return False
+
+    def repair_speaker_fragmentation(
+        self,
+        segments: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Smooth obvious diarization fragments before voice assignment.
+
+        AssemblyAI can occasionally split one continuous speaker into alternating
+        labels every few words. That is very audible for TTS because every label
+        gets its own pinned voice. Keep the repair conservative: only relabel
+        short A/B/A islands with tight neighboring gaps.
+        """
+        if len(segments) < 3:
+            return [segment.copy() for segment in segments]
+
+        unique_speaker_count = len({segment.get('speaker') for segment in segments if segment.get('speaker')})
+        if not self._speaker_fragment_repair_enabled(unique_speaker_count):
+            logger.debug(
+                f"Speaker fragmentation repair skipped: unique_speakers={unique_speaker_count}, "
+                f"mode={self.opt_cfg.get('repair_speaker_fragmentation', 'auto')!r}"
+            )
+            return [segment.copy() for segment in segments]
+
+        max_gap = float(self.opt_cfg.get('speaker_fragment_max_gap', 0.75))
+        max_passes = int(self.opt_cfg.get('speaker_fragment_repair_passes', 3))
+        repaired = [segment.copy() for segment in sorted(segments, key=lambda x: x['start'])]
+        changes = 0
+
+        # A / short-B / A islands are usually word-tail speaker flips. Iterate a
+        # few times so A/B/A/B/A chains collapse without using global dominance.
+        for _ in range(max(1, max_passes)):
+            pass_changes = 0
+            for idx in range(1, len(repaired) - 1):
+                prev_segment = repaired[idx - 1]
+                segment = repaired[idx]
+                next_segment = repaired[idx + 1]
+                prev_speaker = prev_segment.get('speaker')
+                speaker = segment.get('speaker')
+                next_speaker = next_segment.get('speaker')
+                if not prev_speaker or prev_speaker != next_speaker or speaker == prev_speaker:
+                    continue
+
+                left_gap = float(segment.get('start', 0.0)) - float(prev_segment.get('end', 0.0))
+                right_gap = float(next_segment.get('start', 0.0)) - float(segment.get('end', 0.0))
+                if left_gap <= max_gap and right_gap <= max_gap and self._is_short_speaker_fragment(segment):
+                    segment['speaker'] = prev_speaker
+                    pass_changes += 1
+
+            changes += pass_changes
+            if pass_changes == 0:
+                break
+
+        if changes:
+            before_speakers = len({segment.get('speaker') for segment in segments if segment.get('speaker')})
+            after_speakers = len({segment.get('speaker') for segment in repaired if segment.get('speaker')})
+            logger.info(
+                f"Repaired {changes} short speaker fragment(s): "
+                f"speakers {before_speakers} → {after_speakers}"
+            )
+
+        return repaired
 
     def merge_adjacent_segments(
         self,
@@ -445,17 +542,20 @@ class SegmentOptimizer:
         """
         logger.info("Optimizing segments after diarization...")
 
-        # Step 1: Merge adjacent segments with tight gap
+        # Step 1: Repair obvious short speaker-label fragments before voice assignment
+        repaired = self.repair_speaker_fragmentation(transcription)
+
+        # Step 2: Merge adjacent segments with tight gap
         merged = self.merge_adjacent_segments(
-            transcription,
+            repaired,
             max_gap=self.post_diarization_merge_gap,
             phase="post_diarization"
         )
 
-        # Step 2: Split long segments
+        # Step 3: Split long segments
         split = self.split_long_segments(merged)
 
-        # Step 3: Filter very short segments
+        # Step 4: Filter very short segments
         filtered = self.filter_short_segments(split)
 
         logger.debug(f"Post-diarization optimization: {len(transcription)} → {len(filtered)} segments")

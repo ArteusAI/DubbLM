@@ -54,6 +54,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "llmModelName": "gemini-2.5-pro",
         "llmTemperature": 0.5,
         "enableLlmEditor": False,
+        "enableLlmTextAdjustment": True,
         "editorLlmProvider": "openrouter",
         "editorModelName": "openai/gpt-5.4",
         "editorTemperature": 1.0,
@@ -62,6 +63,11 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "enableSpeakerGenderInference": True,
         "enableEmotionEnrichment": False,
         "enableContentValidation": True,
+        "contentValidatorProvider": "whisper",
+        "contentValidatorWhisperModel": "base",
+        "contentValidatorWhisperComputeType": "int8",
+        "contentValidatorWhisperCpuThreads": 2,
+        "contentValidatorSpeechModel": "nano",
         "dubbedVolume": 1.0,
         "backgroundVolume": 0.562341,
         "useTwoPassEncoding": True,
@@ -81,6 +87,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
     mapping = {
         "source_language": "sourceLang",
         "target_language": "targetLang",
+        "persona_id": "personaId",
         "refinement_persona": "personaId",
         "keep_background": "keepBackground",
         "pause_removal": "pauseRemoval",
@@ -93,6 +100,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "refinement_model_name": "refinementModelName",
         "refinement_temperature": "refinementTemperature",
         "enable_llm_editor": "enableLlmEditor",
+        "enable_llm_text_adjustment": "enableLlmTextAdjustment",
         "editor_llm_provider": "editorLlmProvider",
         "editor_model_name": "editorModelName",
         "editor_temperature": "editorTemperature",
@@ -104,6 +112,11 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "voice_auto_selection": "voiceAutoSelection",
         "enable_emotion_enrichment": "enableEmotionEnrichment",
         "enable_content_validation": "enableContentValidation",
+        "content_validator_provider": "contentValidatorProvider",
+        "content_validator_whisper_model": "contentValidatorWhisperModel",
+        "content_validator_whisper_compute_type": "contentValidatorWhisperComputeType",
+        "content_validator_whisper_cpu_threads": "contentValidatorWhisperCpuThreads",
+        "content_validator_speech_model": "contentValidatorSpeechModel",
         "dubbed_volume": "dubbedVolume",
         "background_volume": "backgroundVolume",
         "use_two_pass_encoding": "useTwoPassEncoding",
@@ -118,6 +131,12 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
     default_preset = cfg.get("default_preset")
     if default_preset in {"fast", "hq", "ultra"}:
         base["preset"] = default_preset
+        preset_values = cfg.get("presets", {}).get(default_preset)
+        if isinstance(preset_values, dict):
+            for source_key, target_key in mapping.items():
+                value = preset_values.get(source_key)
+                if value is not None:
+                    base[target_key] = value
 
     segments_optimization = cfg.get("segments_optimization")
     if isinstance(segments_optimization, dict):

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database.session import init_db
-from .routes import projects, upload, process, segments, resources, download, status, frames
+from .routes import projects, upload, process, segments, resources, download, status, frames, translate
 from .routes import settings as settings_routes
 
 
@@ -45,6 +45,7 @@ def create_app() -> FastAPI:
     )
     
     # Include routers
+    app.include_router(translate.router, prefix=app_settings.api_prefix)
     app.include_router(projects.router, prefix=app_settings.api_prefix)
     app.include_router(upload.router, prefix=app_settings.api_prefix)
     app.include_router(process.router, prefix=app_settings.api_prefix)
