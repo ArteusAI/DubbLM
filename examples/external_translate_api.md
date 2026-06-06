@@ -1,6 +1,6 @@
 # DubbLM External Translate API
 
-Краткая документация для внешних клиентов: one-shot перевод видео без многошагового project workflow.
+Brief documentation for external clients: one-shot video translation without the multi-step project workflow.
 
 **Base URL:** `http://<host>:<port>/api/v1`
 
@@ -9,41 +9,41 @@
 
 ---
 
-## Быстрый старт
+## Quick Start
 
-1. Узнать поддерживаемые языки → `GET /resources/languages`
-2. Отправить видео → `POST /translate`
-3. Опрашивать прогресс → `GET /projects/{projectId}/jobs/{jobId}/status`
-4. Скачать результат → `GET /projects/{projectId}/download/video`
+1. Get supported languages -> `GET /resources/languages`
+2. Submit a video -> `POST /translate`
+3. Poll progress -> `GET /projects/{projectId}/jobs/{jobId}/status`
+4. Download the result -> `GET /projects/{projectId}/download/video`
 
 ---
 
-## 1. Запуск перевода
+## 1. Starting Translation
 
 ### `POST /translate`
 
-Загружает видео и сразу запускает полный пайплайн: транскрипция → перевод → озвучка → сборка MP4.
+Uploads a video and immediately starts the full pipeline: transcription -> translation -> dubbing -> MP4 assembly.
 
 **Content-Type:** `multipart/form-data`
 
-| Поле | Обязательное | По умолчанию | Описание |
+| Field | Required | Default | Description |
 |------|--------------|--------------|----------|
-| `file` | да | — | Видео: `.mp4`, `.avi`, `.mkv`, `.mov`, `.webm`, `.m4v` |
-| `targetLang` | да | — | Целевой язык (BCP-47 код, напр. `ru`) |
-| `preset` | нет | `hq` | Качество: `fast`, `hq`, `ultra` |
-| `sourceLang` | нет | `auto` | Язык исходника; `auto` = автоопределение |
-| `minimalDiarizationMerge` | нет | `false` | Минимальный merge блоков после диаризации (для screen recording) |
-| `keepBackground` | нет | `false` | Сохранить фоновую дорожку из исходника (музыка, ambient) |
-| `enableLlmEditor` | нет | `false` | LLM editor pass после перевода (в preset `ultra` включён, но external API переопределяет) |
-| `speakerCount` | нет | `1` | Ожидаемое число спикеров для diarization (AssemblyAI) |
-| `personaId` | нет | из preset | Персона refinement: `normal`, `informal`, `tractorman`, `none`, … — полный список: `GET /resources/personas` |
-| `name` | нет | auto | Имя проекта в системе |
+| `file` | yes | - | Video: `.mp4`, `.avi`, `.mkv`, `.mov`, `.webm`, `.m4v` |
+| `targetLang` | yes | - | Target language (BCP-47 code, e.g. `ru`) |
+| `preset` | no | `hq` | Quality: `fast`, `hq`, `ultra` |
+| `sourceLang` | no | `auto` | Source language; `auto` = auto-detect |
+| `minimalDiarizationMerge` | no | `false` | Minimal post-diarization block merging (for screen recordings) |
+| `keepBackground` | no | `false` | Keep the source background track (music, ambient audio) |
+| `enableLlmEditor` | no | `false` | LLM editor pass after translation (`ultra` enables it, but the external API overrides it) |
+| `speakerCount` | no | `1` | Expected number of speakers for diarization (AssemblyAI) |
+| `personaId` | no | from preset | Persona refinement: `normal`, `informal`, `tractorman`, `none`, ... full list: `GET /resources/personas` |
+| `name` | no | auto | Project name in the system |
 
-По умолчанию **`keepBackground=false`**: в итоговом видео только озвученная речь. Чтобы смешать с фоном из исходника, передайте `keepBackground=true`.
+By default, **`keepBackground=false`**: the final video contains only dubbed speech. To mix it with the source background, pass `keepBackground=true`.
 
-По умолчанию **`enableLlmEditor=false`**: без дополнительного LLM editor pass (быстрее и дешевле). Для включения: `enableLlmEditor=true`.
+By default, **`enableLlmEditor=false`**: no additional LLM editor pass (faster and cheaper). To enable it, pass `enableLlmEditor=true`.
 
-**Ответ `202`:**
+**`202` response:**
 
 ```json
 {
@@ -55,9 +55,9 @@
 }
 ```
 
-Сохраните `projectId` и `jobId`. `pollUrl` и `downloadUrl` — относительные пути от base URL.
+Save `projectId` and `jobId`. `pollUrl` and `downloadUrl` are relative paths from the base URL.
 
-### Пример (curl)
+### Example (curl)
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/translate" \
@@ -70,7 +70,7 @@ curl -X POST "http://localhost:8000/api/v1/translate" \
   -F "personaId=tractorman"
 ```
 
-### Пример (Python)
+### Example (Python)
 
 ```python
 import requests
@@ -102,20 +102,20 @@ if status["status"] == "completed":
 
 ### `minimalDiarizationMerge`
 
-Если `true`, в конфиг проекта записывается:
+If `true`, the following values are written to the project config:
 
-- `postDiarizationMergeGap = 0` — почти не объединять соседние блоки одного спикера после диаризации
-- `repairSpeakerFragmentation = false` — не «склеивать» короткие фрагменты меток спикеров
+- `postDiarizationMergeGap = 0` - almost do not merge neighboring blocks from the same speaker after diarization
+- `repairSpeakerFragmentation = false` - do not "stitch" short fragments of speaker labels
 
-Полезно для записей экрана, где важна синхронность речи с действиями на экране.
+Useful for screen recordings where speech must stay synchronized with on-screen actions.
 
 ---
 
-## 2. Доступные языки
+## 2. Available Languages
 
 ### `GET /resources/languages`
 
-Возвращает список языков, которые UI и API принимают в `targetLang` / `sourceLang`:
+Returns the list of languages accepted by the UI and API in `targetLang` / `sourceLang`:
 
 ```json
 [
@@ -125,38 +125,38 @@ if status["status"] == "completed":
 ]
 ```
 
-Полный список — в ответе endpoint. Используйте поле **`code`** в запросах.
+The full list is returned by the endpoint. Use the **`code`** field in requests.
 
-**Исходный язык `auto`:** если язык видео неизвестен, передайте `sourceLang=auto` (значение по умолчанию). Транскрибер попытается определить язык автоматически.
+**Source language `auto`:** if the video's language is unknown, pass `sourceLang=auto` (the default). The transcriber will try to detect the language automatically.
 
-**Целевой язык:** указывается явно (`targetLang=ru`, `de`, `en`, …). Код должен быть из списка `/resources/languages` или совместим с BCP-47, который поддерживает backend.
+**Target language:** specified explicitly (`targetLang=ru`, `de`, `en`, ...). The code must be from `/resources/languages` or be a BCP-47-compatible code supported by the backend.
 
-### Пресеты качества
+### Quality Presets
 
 ```http
 GET /settings/presets
 GET /settings/presets/hq
 ```
 
-| preset | Назначение |
+| preset | Purpose |
 |--------|------------|
-| `fast` | Быстрее, проще TTS, 720p |
-| `hq` | Баланс качества и скорости (по умолчанию) |
-| `ultra` | Максимальное качество, LLM editor, original video quality |
+| `fast` | Faster, simpler TTS, 720p |
+| `hq` | Quality/speed balance (default) |
+| `ultra` | Maximum quality, LLM editor, original video quality |
 
 ---
 
-## 3. Прогресс перевода
+## 3. Translation Progress
 
-One-shot запрос создаёт один job с `autoProcess=true`: тот же `jobId` проходит транскрипцию **и** озвучку до конца.
+A one-shot request creates one job with `autoProcess=true`: the same `jobId` runs through transcription **and** dubbing until completion.
 
-### Вариант A: polling (рекомендуется для простых клиентов)
+### Option A: Polling (recommended for simple clients)
 
 ```http
 GET /projects/{projectId}/jobs/{jobId}/status
 ```
 
-**Пример ответа:**
+**Example response:**
 
 ```json
 {
@@ -176,80 +176,80 @@ GET /projects/{projectId}/jobs/{jobId}/status
 }
 ```
 
-**Поля:**
+**Fields:**
 
-| Поле | Значения | Смысл |
+| Field | Values | Meaning |
 |------|----------|-------|
-| `status` | `pending`, `processing`, `completed`, `failed`, `cancelled` | Состояние job |
-| `progress` | `0`–`100` | Общий прогресс |
-| `currentStep` | см. ниже | Текущая фаза |
-| `errorMessage` | string / null | Текст ошибки при `failed` |
-| `logs` | массив | Последние сообщения пайплайна |
+| `status` | `pending`, `processing`, `completed`, `failed`, `cancelled` | Job state |
+| `progress` | `0`-`100` | Overall progress |
+| `currentStep` | see below | Current phase |
+| `errorMessage` | string / null | Error text when `failed` |
+| `logs` | array | Latest pipeline messages |
 
-**Типичные `currentStep`:**
+**Typical `currentStep` values:**
 
-| step | Этап |
+| step | Stage |
 |------|------|
-| `initialization` | Старт |
-| `audio_extraction` | Извлечение аудио |
-| `diarization` | Диаризация |
-| `speaker_analysis` | Анализ спикеров |
-| `translation` | Перевод |
-| `handoff` | Переход к озвучке |
+| `initialization` | Start |
+| `audio_extraction` | Audio extraction |
+| `diarization` | Diarization |
+| `speaker_analysis` | Speaker analysis |
+| `translation` | Translation |
+| `handoff` | Handoff to dubbing |
 | `speech_synthesis` | TTS |
-| `background_audio` | Фоновое аудио |
-| `video_combine` | Сборка видео |
-| `complete` | Готово |
+| `background_audio` | Background audio |
+| `video_combine` | Video assembly |
+| `complete` | Done |
 
-**Когда считать job завершённым:**
+**When to treat the job as finished:**
 
-- `status == "completed"` → можно скачивать видео
-- `status == "failed"` → смотреть `errorMessage`
-- `status == "cancelled"` → остановлен пользователем
+- `status == "completed"` -> video can be downloaded
+- `status == "failed"` -> check `errorMessage`
+- `status == "cancelled"` -> stopped by the user
 
-**Интервал polling:** 5–15 секунд. Не чаще 1 раза в секунду.
+**Polling interval:** 5-15 seconds. Do not poll more often than once per second.
 
-### Вариант B: SSE stream (для live UI)
+### Option B: SSE Stream (for live UI)
 
 ```http
 GET /projects/{projectId}/status
 Accept: text/event-stream
 ```
 
-События:
+Events:
 
-- `progress` — `{"percent": 48, "step": "speech_synthesis"}`
-- `log` — строка лога
-- `complete` — `{"status": "dubbed"}` или `{"status": "error", "error": "..."}`
+- `progress` - `{"percent": 48, "step": "speech_synthesis"}`
+- `log` - log line
+- `complete` - `{"status": "dubbed"}` or `{"status": "error", "error": "..."}`
 
-SSE привязан к **активному job проекта**, не к конкретному `jobId`. После one-shot translate у проекта один основной job — stream подходит.
+SSE is bound to the **active project job**, not to a specific `jobId`. After a one-shot translate request, the project has one main job, so the stream is suitable.
 
 ---
 
-## 4. Получение результата
+## 4. Getting the Result
 
-### Видео
+### Video
 
 ```http
 GET /projects/{projectId}/download/video
 ```
 
-Доступно когда job завершился со `status: completed` и проект в состоянии `dubbed`.
+Available when the job has finished with `status: completed` and the project is in the `dubbed` state.
 
-Также поддерживается range streaming:
+Range streaming is also supported:
 
 ```http
 GET /projects/{projectId}/stream/video
 ```
 
-### Субтитры (опционально)
+### Subtitles (optional)
 
 ```http
 GET /projects/{projectId}/download/subtitles?format=srt&lang=target
 GET /projects/{projectId}/download/subtitles?format=srt&lang=source
 ```
 
-### Сегменты с текстом (опционально)
+### Text Segments (optional)
 
 ```http
 GET /projects/{projectId}/segments
@@ -257,16 +257,16 @@ GET /projects/{projectId}/segments
 
 ---
 
-## 5. Ошибки и лимиты
+## 5. Errors and Limits
 
-| HTTP | Причина |
+| HTTP | Reason |
 |------|---------|
-| `400` | Неверный формат файла, не указан `targetLang` |
-| `404` | Проект / job / результат не найден |
-| `413` | Файл больше лимита upload (по умолчанию 5 GB) |
-| `500` | Ошибка сохранения файла или внутренняя ошибка |
+| `400` | Invalid file format, `targetLang` not specified |
+| `404` | Project / job / result not found |
+| `413` | File exceeds the upload limit (5 GB by default) |
+| `500` | File save error or internal error |
 
-При `failed` job детали — в `errorMessage` и в `logs`.
+For a `failed` job, details are available in `errorMessage` and `logs`.
 
 ---
 
@@ -282,14 +282,14 @@ GET /health
 
 ---
 
-## 7. Связь с полным API
+## 7. Relationship to the Full API
 
-External endpoint — обёртка над тем же backend, что и UI:
+The external endpoint is a wrapper over the same backend used by the UI:
 
-| External | Полный API (эквивалент) |
+| External | Full API (equivalent) |
 |----------|-------------------------|
-| `POST /translate` | `POST /projects` + `PATCH .../config` + `POST .../upload` + `POST .../process/transcribe` (с `autoProcess: true`) |
+| `POST /translate` | `POST /projects` + `PATCH .../config` + `POST .../upload` + `POST .../process/transcribe` (with `autoProcess: true`) |
 | `pollUrl` | `GET /projects/{id}/jobs/{jobId}/status` |
 | `downloadUrl` | `GET /projects/{id}/download/video` |
 
-Frontend и ручные интеграции продолжают использовать project-centric API; external clients могут работать только через `/translate` + polling + download.
+Frontend and manual integrations continue to use the project-centric API; external clients can work only through `/translate` + polling + download.
