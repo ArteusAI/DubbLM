@@ -2,250 +2,396 @@
 
 ![DubbLM Logo](logo.png)
 
-An intelligent video dubbing system that uses AI to create natural, context-aware translations and high-quality speech synthesis for video content.
+DubbLM is an AI video dubbing system for high-quality, context-aware translation, speech synthesis, and video assembly. It can be used through a React UI, a FastAPI backend, a one-shot external API, or the original CLI workflow.
 
 ## Important Notice
 
-**DubbLM is designed for high-quality, context-aware translation processing, not real-time applications.** This system prioritizes translation accuracy, context understanding, and content adaptation over processing speed. The AI thoroughly analyzes conversations, adapts content for specific audiences, and ensures natural speech patterns - processes that require significant computational time. Expect processing times that are considerably longer than the original video duration.
+**DubbLM is optimized for quality, not real-time processing.** The system analyzes speaker context, translates dialogue with LLMs, refines wording, synthesizes speech, adjusts timing, and rebuilds the final video. Processing can take significantly longer than the source video duration, especially with premium TTS, background preservation, LLM editor passes, or high-resolution video settings.
+
+## What It Does
+
+- **Context-aware translation** with Gemini or OpenRouter-backed LLMs.
+- **React UI workflow** for project upload, presets, transcription, segment editing, dubbing, and result download.
+- **FastAPI + Celery backend** for persistent projects, async processing, progress streaming, and external integrations.
+- **Segment editor** for translation edits, speaker renaming, voice assignment, TTS previews, rephrasing, muting, and cache resets.
+- **Multiple TTS providers** including Gemini, OpenAI, MiniMax, and local/F5/Coqui paths where configured.
+- **Speaker-aware controls** including diarization, voice matching, per-speaker prompts, and gender inference/overrides.
+- **Timing and video controls** for background audio, original-audio ranges, segment stretching, volume, subtitles, and quality presets.
+- **Reports and cost tracking** with per-stage API usage, downloadable artifacts, and summary reports.
 
 ## How It Works
 
-The DubbLM process consists of several AI-powered stages:
+The DubbLM pipeline is split into async stages:
 
-1. **Audio Extraction & Speaker Diarization** - Separates speakers and identifies who speaks when
-2. **Transcription** - Converts speech to text using advanced models (Whisper, OpenAI, AssemblyAI)
-3. **Context-Aware Translation** - Uses LLM to translate with full context understanding
-4. **Translation Refinement** - Applies persona-specific refinement for natural speech patterns
-5. **Voice Synthesis** - Generates dubbed audio using TTS systems (OpenAI, Gemini, Coqui)
-6. **Audio/Video Integration** - Combines translated audio with original video
+1. **Upload and project setup** - Store source video and project config.
+2. **Audio extraction and diarization** - Identify speakers and speech ranges.
+3. **Transcription** - Convert speech to text using AssemblyAI, OpenAI + PyAnnote, or WhisperX.
+4. **Context analysis and translation** - Translate with full dialogue context and optional glossary/prompt guidance.
+5. **Refinement and editor pass** - Apply persona/style refinement and optional LLM editor improvements.
+6. **Segment review** - Edit text, speakers, voices, prompts, and preview TTS before final dubbing.
+7. **Speech synthesis** - Generate per-segment speech with selected TTS providers and voice mappings.
+8. **Audio/video assembly** - Align speech, preserve background if requested, generate subtitles, and encode the final video.
+9. **Report generation** - Store cost, timing, artifacts, and downloadable summary data.
 
-## Why LLM Translation is Superior
+## Interfaces
 
-Traditional translators work sentence-by-sentence without context. Our LLM approach:
-- **Understands full conversation context** - maintains coherence across dialogue
-- **Preserves speaker personalities** - adapts tone and style per character
-- **Handles technical terminology** - maintains consistency with domain-specific terms
-- **Creates natural speech patterns** - optimized for audio dubbing, not just text
+### Web UI
 
-## Refinement Personas
+The UI is the main workflow for interactive use:
 
-The `refinement_persona` feature adapts translations for specific audiences:
+- Project list with persistent project state.
+- Batch upload and background upload progress.
+- Presets: `fast`, `hq`, and `ultra`.
+- Server-side API key management.
+- Live processing logs and progress via SSE.
+- Segment editor after transcription.
+- Final result view with video streaming, downloads, subtitles, report, and API cost panel.
 
-- **`normal`** - Standard, natural translation preserving all details
-- **`casual_manager`** - Simplifies technical content for business audiences
-- **`child`** - Transforms complex topics into child-friendly stories
-- **`housewife`** - Makes content relatable to household managers and families
-- **`science_popularizer`** - Engaging explanations for general audiences
-- **`it_buddy`** - Casual IT jargon for developer audiences
-- **`ai_buddy`** - Clear, professional language for AI practitioners
+### API
 
-## TTS Model Comparison
+The backend exposes `FastAPI` routes under `/api/v1`:
 
-### Gemini TTS
-- **Quality**: Highest natural speech quality
-- **Speed**: ~0.25x video speed (slower processing)
-- **Cost**: Higher pricing
-- **Best for**: Premium productions requiring top quality
+- Project workflow: create projects, upload videos, update config, transcribe, edit segments, dub, download.
+- One-shot workflow: `POST /api/v1/translate` uploads a video and starts the full pipeline.
+- Status: polling through job status endpoints or live SSE through `/projects/{projectId}/status`.
+- Resources: voices, personas, languages, presets, settings, thumbnails, frames, reports, and artifacts.
 
-### OpenAI TTS
-- **Quality**: Good, reliable speech synthesis
-- **Speed**: ~0.5x video speed (moderate processing)
-- **Cost**: More affordable
-- **Best for**: Balanced quality/cost projects
+Swagger UI is available at:
 
-### Voice Selection
-- **Automatic**: AI matches most similar voices to speaker characteristics from existing TTS voice set
-- **Manual**: Assign specific voices per speaker from config
+```text
+http://localhost:8000/api/v1/docs
+```
 
-**Note**: Voice cloning is not yet implemented
+See [examples/external_translate_api.md](examples/external_translate_api.md) for detailed external API documentation.
 
-### Background Audio Processing
-- **`keep_background: true`** - Preserves original background music and ambient sounds
-- **Memory Warning**: Background separation requires significant RAM usage. Avoid using this feature on long videos (>30 minutes) as it may cause memory issues on systems with limited RAM
+### CLI
+
+The CLI remains useful for scripts, local experiments, and batch jobs:
+
+```bash
+python dubblm_cli.py --input video.mp4 --source_language en --target_language ru
+```
+
+CLI options are loaded from `dubbing_config.yml` by default and can be overridden with flags.
 
 ## Installation
 
 ### Requirements
+
 - Python 3.12+
-- FFmpeg
-- CUDA (optional, for GPU acceleration when WhisperX enabled)
+- FFmpeg and FFprobe
+- Redis for the API/Celery workflow
+- Node.js 20+ for the frontend
+- CUDA is optional, mainly for local WhisperX/GPU-heavy paths
 
-### Setup
+### Python Setup
+
 ```bash
-# Install system dependencies
-# Ubuntu/Debian:
-sudo apt update && sudo apt install ffmpeg python3.12 python3.12-venv
-# macOS:
-brew install ffmpeg python@3.12
-# Windows: Download FFmpeg from https://ffmpeg.org/download.html
+# Ubuntu/Debian
+sudo apt update
+sudo apt install ffmpeg redis-server python3.12 python3.12-venv
 
-# Install uv package manager
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
+# macOS
+brew install ffmpeg redis python@3.12
+brew services start redis
 
-# Clone and install dependencies
+# Clone and install
 git clone https://github.com/ArteusAI/DubbLM.git
 cd DubbLM
 python3.12 -m venv .venv
 source .venv/bin/activate
+pip install uv
 uv pip install -r requirements.txt
 
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your API keys (see API Keys section below)
+# Configure environment
+cp env.example .env
 ```
 
-### API Keys Configuration
+Edit `.env` with the API keys you need.
 
-Different features require different API keys. Add these to your `.env` file:
+## API Keys
 
-**Required for basic functionality:**
-- `OPENAI_API_KEY` - For OpenAI TTS and transcription services
-- `GOOGLE_API_KEY` - For Gemini TTS and LLM translation services
+DubbLM can read keys from `.env` or from server-side settings saved by the UI.
 
-**Optional (depending on chosen services):**
+Common keys:
 
-*For Transcription:*
-- `ASSEMBLYAI_API_KEY` - If using `transcription_system: "assemblyai"`
-- `OPENAI_API_KEY` - If using `transcription_system: "openai"`
-- `HF_TOKEN` - Required for PyAnnote diarization when `transcription_system` is `"openai"` (aka `"pyannote_openai"`). Create an access token in your Hugging Face account and set it as `HF_TOKEN`.
+- `GOOGLE_API_KEY` - Gemini LLM/TTS and Gemini-based enrichment.
+- `GEMINI_API_KEY` - Stored by the UI settings layer; keep aligned with `GOOGLE_API_KEY` if needed by your deployment.
+- `OPENAI_API_KEY` - OpenAI TTS and OpenAI transcription paths.
+- `OPENROUTER_API_KEY` - OpenRouter LLM/refinement/editor models.
+- `ASSEMBLYAI_API_KEY` - AssemblyAI transcription and diarization.
+- `HF_TOKEN` - PyAnnote/Hugging Face access for local diarization/gender inference paths.
+- `MINIMAX_API_KEY` - MiniMax TTS.
+- `MINIMAX_GROUP_ID` - Optional MiniMax group/account identifier for MiniMax TTS.
 
-*For Translation:*
-- `GOOGLE_API_KEY` - If using `llm_provider: "gemini"` (default)
-- `OPENROUTER_API_KEY` - If using `llm_provider: "openrouter"`
+Minimum practical setup for the default UI presets is usually:
 
-*For Text-to-Speech:*
-- `OPENAI_API_KEY` - If using `tts_system: "openai"`
-- `GOOGLE_API_KEY` - If using `tts_system: "gemini"`
-- No API key needed for `tts_system: "coqui"` (local TTS)
-
-**Example .env file:**
 ```env
-OPENAI_API_KEY=sk-your-openai-key-here
-GOOGLE_API_KEY=your-google-api-key-here
-ASSEMBLYAI_API_KEY=your-assemblyai-key-here
-OPENROUTER_API_KEY=your-openrouter-key-here
-HF_TOKEN=your-huggingface-token-here
+GOOGLE_API_KEY=your-google-key
+ASSEMBLYAI_API_KEY=your-assemblyai-key
+OPENAI_API_KEY=your-openai-key
 ```
 
-**Minimum setup:** You need at least `GOOGLE_API_KEY` for default Gemini-based translation and TTS.
+Add `OPENROUTER_API_KEY` for OpenRouter editor/refinement models and `MINIMAX_API_KEY` for MiniMax voices.
 
-If you enable OpenAI transcription (`--transcription_system openai` or `pyannote_openai`), you must also set `HF_TOKEN` to allow loading the PyAnnote diarization pipeline.
+## Running the Web App
 
-## Usage Examples
+Start Redis first if it is not already running:
+
+```bash
+redis-server
+```
+
+Start the backend API:
+
+```bash
+source .venv/bin/activate
+python run_api.py
+```
+
+Start the Celery worker in a second terminal:
+
+```bash
+source .venv/bin/activate
+python run_worker.py
+```
+
+Start the frontend in a third terminal:
+
+```bash
+cd src/frontend
+npm install
+API_URL=http://localhost:8000 npm run dev
+```
+
+Open:
+
+```text
+http://localhost:3000
+```
+
+The frontend proxies `/api` to `API_URL`; the backend defaults to port `8000`.
+
+## UI Workflow
+
+1. Open the project dashboard.
+2. Upload one or more videos.
+3. Choose source/target language and a preset:
+   - `fast` - Faster, simpler TTS, 720p output.
+   - `hq` - Balanced default, Gemini TTS, 1080p output.
+   - `ultra` - Highest quality, editor/refinement options, background preservation, original quality.
+4. Configure advanced options if needed: provider/model, TTS style, voice mappings, prompt prefixes, segment merge/stretch settings, background/original audio ranges, subtitles, and workers.
+5. Start transcription.
+6. Review and edit segments in the editor.
+7. Preview TTS for individual segments and adjust voices/prompts.
+8. Start final dubbing.
+9. Download video, subtitles, report, and inspect cost/timing statistics.
+
+## Segment Editor
+
+After transcription, the editor supports:
+
+- Editing translated segment text.
+- Muting segments.
+- Rephrasing a segment with an LLM prompt.
+- Generating and replaying TTS previews.
+- Renaming speakers globally.
+- Changing a speaker voice across all matching segments.
+- Setting per-segment or per-speaker TTS prompts.
+- Overriding inferred speaker gender, then re-running translation when required.
+- Resetting only TTS cache while keeping transcription and translation.
+
+If gender overrides change after translation, the backend blocks final dubbing until translation is refreshed so grammatical gender can stay consistent.
+
+## Presets and Configuration
+
+`dubbing_config.yml` is the main configuration file for CLI defaults and UI/API preset defaults.
+
+Important configuration areas:
+
+- `default_preset` and `presets.fast|hq|ultra`
+- `source_language`, `target_language`
+- `transcription_system`, `whisper_model`, `speakers_expected`
+- `llm_provider`, `llm_model_name`, `refinement_*`, `editor_*`
+- `tts_system`, `tts_model`, `tts_fallback_model`, `tts_prompt_prefix`
+- `voice_auto_selection`, `voice_name`, `voice_prompt`, `tts_system_mapping`
+- `keep_background`, `keep_original_audio_ranges`, `dubbed_volume`, `background_volume`
+- `segment_stretch`, `segments_optimization`
+- `save_original_subtitles`, `save_translated_subtitles`
+- `pricing` for cost estimation/reporting
+
+## TTS Providers and Voices
+
+Supported provider paths include:
+
+- **Gemini TTS** - Highest quality path, supports Gemini voice catalog, prompt styles, fallback model, emotion enrichment, and long-form segment handling.
+- **OpenAI TTS** - Reliable and faster for balanced jobs.
+- **MiniMax TTS** - Additional voice model support via `MINIMAX_API_KEY`.
+- **F5/Coqui/local paths** - Available for local or experimental setups when dependencies and references are configured.
+
+Voice selection can be automatic or manually mapped per speaker. The UI exposes provider voices and preview samples when sample files are available.
+
+TTS style presets include:
+
+- `podcast`
+- `lecture`
+- `gothic`
+- `news`
+- `custom`
+- `auto`
+
+## Translation Personas
+
+Personas are loaded from files in `src/translation/personas/`. Current built-in personas include:
+
+- `none`
+- `normal`
+- `casual_manager`
+- `child`
+- `housewife`
+- `science_popularizer`
+- `it_buddy`
+- `ai_buddy`
+- `ai_visioner`
+- `pedantic`
+- `poet`
+- `pushkin_style`
+- `tractorman`
+- `informal`
+- `adhd_clarity`
+- `product_demo`
+
+The UI can list available personas through `/api/v1/resources/personas`.
+
+## External One-Shot API
+
+Use `POST /api/v1/translate` when an external client wants to upload a video and run the full pipeline in one request.
+
+Example:
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/translate" \
+  -F "file=@demo.mp4" \
+  -F "targetLang=ru" \
+  -F "preset=hq" \
+  -F "sourceLang=auto" \
+  -F "minimalDiarizationMerge=true" \
+  -F "speakerCount=1"
+```
+
+The response contains a `projectId`, `jobId`, `pollUrl`, and `downloadUrl`.
+
+For a full guide, see [examples/external_translate_api.md](examples/external_translate_api.md). For Python examples, see [examples/api_usage_example.py](examples/api_usage_example.py).
+
+## CLI Usage
 
 ### Basic Dubbing
-```bash
-python dubblm_cli.py --input video.mp4 --source_language en --target_language es
-```
 
-### With Configuration File
 ```bash
-python dubblm_cli.py --config my_config.yml --input video.mp4
-```
-
-### Advanced Options
-```bash
-# High-quality Gemini TTS with specific persona
 python dubblm_cli.py \
   --input video.mp4 \
   --source_language en \
-  --target_language fr \
-  --tts_system gemini \
-  --refinement_persona casual_manager \
-  --save_translated_subtitles
-
-# Multiple TTS systems per speaker
-python dubblm_cli.py \
-  --input video.mp4 \
-  --source_language en \
-  --target_language de \
-  --tts_system_mapping '{"SPEAKER_00": "gemini", "SPEAKER_01": "openai"}'
+  --target_language ru
 ```
 
-### Speaker Analysis
+### Config File
+
 ```bash
-# Generate speaker report before dubbing
+python dubblm_cli.py \
+  --config dubbing_config.yml \
+  --input video.mp4
+```
+
+### Cost Estimation
+
+```bash
 python dubblm_cli.py \
   --input video.mp4 \
   --source_language en \
+  --target_language ru \
+  --estimate_cost
+```
+
+### Segment Testing
+
+```bash
+python dubblm_cli.py \
+  --input video.mp4 \
+  --source_language en \
+  --target_language ru \
+  --start_time 60 \
+  --duration 120
+```
+
+### Speaker Report
+
+```bash
+python dubblm_cli.py \
+  --input video.mp4 \
+  --source_language en \
+  --target_language ru \
   --generate_speaker_report
 ```
 
-### Debug Mode
+### Batch With Glob
+
 ```bash
-# Create debug video with speaker labels
 python dubblm_cli.py \
-  --input video.mp4 \
+  --input "sources/**/*.mp4" \
   --source_language en \
-  --target_language de \
-  --debug_info \
-  --debug_diarize_only
+  --target_language ru
 ```
 
-## Configuration
+For all flags:
 
-Create `dubbing_config.yml` to set default parameters:
-
-```yaml
-source_language: "en"
-target_language: "es"
-tts_system: "gemini"
-refinement_persona: "normal"
-voice_auto_selection: true
-save_translated_subtitles: true
-remove_pauses: true
-use_two_pass_encoding: true
-
-# Per-speaker voice mapping
-voice_name:
-  SPEAKER_A: "alloy"
-  SPEAKER_B: "nova"
-
-# Per-speaker TTS systems
-tts_system_mapping:
-  SPEAKER_00: "gemini"
-  SPEAKER_01: "openai"
+```bash
+python dubblm_cli.py --help
 ```
 
 ## Output Files
 
-The tool generates:
-- `{input}_{target_lang}.mp4` - Dubbed video
-- `{input}_{target_lang}.srt` - Translated subtitles (optional)
-- `artifacts/` - Debug files, transcriptions, and intermediate audio
+Depending on interface and configuration, DubbLM generates:
+
+- Final dubbed MP4.
+- Source and translated subtitles in SRT/VTT.
+- Per-project artifacts under `projects/<project_id>/`.
+- Intermediate audio chunks, previews, cache files, debug logs, reports, and cost ledgers.
+- `report.md` and `report.json` for completed API/UI jobs.
+
+The API result view can stream the dubbed video with HTTP range support and download subtitles/reports.
+
+## Performance Tips
+
+- Use `fast` for quick iteration and `hq`/`ultra` for final outputs.
+- Test with `start_time` and `duration` before processing long videos.
+- Keep `max_workers` moderate; high values can increase API pressure and memory use.
+- Use `--estimate_cost` before long CLI jobs.
+- Avoid `keep_background` on very long videos unless the machine has enough RAM.
+- Use `reset-tts-cache` from the UI/API when only TTS needs to be regenerated.
+- Preserve original audio ranges for sections such as music, ads, intros, or untranslatable clips.
 
 ## Demo Video
 
 [![DubbLM Demo](example.png)](https://youtu.be/UADjkgMXQCY)
 
-
-## Performance Tips
-
-- Use `--no_cache` to force fresh processing
-- Enable `--remove_pauses` to optimize timing
-- Use GPU for faster processing when available
-- Consider `--start_time` and `--duration` for testing on video segments
-- **Avoid `--keep_background` on long videos** - Background audio separation consumes significant RAM and may cause memory issues on videos longer than 30 minutes
-
 ## Roadmap
 
-**Upcoming features and improvements:**
+- Lighter optional dependency installation for GPU/local-heavy features.
+- Better production packaging for API, worker, frontend, Redis, and storage.
+- More robust provider fallback and cost prediction.
+- Expanded voice catalogs, voice samples, and validation.
+- Continued video timing, segment optimization, and editor improvements.
 
-- **🚀 Lightweight Setup** - Reduce installation size by making optional packages (NVIDIA CUBLAS, etc.) truly optional and installable only when needed
-- **📺 Smart Ad Removal** - Automatic detection and removal of native advertisements from video content during processing
-- **⏱️ Dialogue Pace Control** - Advanced controls for managing conversation tempo and speech timing across different speakers
-- **🔧 Code Refactoring** - Ongoing improvements to code structure, performance optimizations, and maintainability
+## About Us
 
-## About us
+This project is open to use and fork. It is developed by IT engineers of [Arteus](https://arteus.io/), a company specializing in adaptive AI systems for business automation, sales, and customer service.
 
-This project is open to use and fork for everyone and developed by IT engineers of [Arteus](https://arteus.io/) - a company specializing in adaptive AI systems for business automation, sales, and customer service.
+## Contributing
 
-## You are talented
+Want to contribute or ask a question: http://t.me/pavelfedortsov
 
-Want to contribute, ask http://t.me/pavelfedortsov
+## Give Us a Star
 
-## Give us a star, plz
 <picture>
   <source
     media="(prefers-color-scheme: dark)"
@@ -267,4 +413,47 @@ Want to contribute, ask http://t.me/pavelfedortsov
 
 ## License
 
-MIT 
+MIT
+
+## Changelog Since Last README Update
+
+This changelog covers commits after the last README-touching commit, `4a7d7aa` from 2025-09-19, through `a6e66ac` on 2026-06-06.
+
+### UI and Backend Workflow
+
+- Added the FastAPI/Celery project workflow and connected it to the frontend: project persistence, uploads, config updates, processing jobs, and worker-backed transcription/dubbing (`800c5fd`, `63709ca`).
+- Polished the frontend workflow with project dashboard improvements, processing progress, presets, video thumbnails/frames, and Gemini TTS synthesis integration (`7cae81e`, `e74a918`).
+- Preserved segment data across project transitions and improved editor/result continuity (`c204bbf`).
+- Added one-shot external translation API and API examples for third-party clients (`a6e66ac`).
+
+### Editor and Translation Refinement
+
+- Added editor mode with optional LLM editor pass, model/provider controls, reasoning effort, and text adjustment controls (`a8f5d42`, `f6bb6ab`).
+- Improved segment rephrasing and translation prompt handling (`1b02e22`).
+- Moved refinement personas into files and expanded persona coverage, including ADHD clarity and demo/product-oriented prompting (`c979213`, `98f3376`, `36bf524`).
+
+### TTS, Voices, and Speaker Controls
+
+- Added per-speaker TTS prompt support and UI/backend config plumbing (`fd89c52`).
+- Added automatic speaker gender inference, speaker metadata, gender overrides, and stale-translation checks before dubbing (`66badce`).
+- Improved voice segment normalization, volume normalization, long synthesis handling, and Gemini/OpenAI voice matching (`2d4759b`, `7aa4177`).
+- Added MiniMax/new TTS model support, voice samples/catalog updates, and TTS provider expansion (`a6e66ac`).
+- Reverted default Gemini TTS selection back to the 2.5 TTS model line after experimentation (`ce120dc`).
+
+### Cost Tracking and Reports
+
+- Added cost analysis, adaptive voice segment length estimation, and cost estimation before dubbing (`4e1e954`, `734c2b5`, `76341b4`).
+- Added better reporting for estimation misses and more relaxed logging around cost/debug output (`4eae375`, `d2ba822`).
+- Added report/cost infrastructure used by result views and downloadable artifacts (`a6e66ac`).
+
+### Segment and Video Timing
+
+- Added segment optimization and better segment stretching for speech/video alignment (`c218d47`, `ec64085`).
+- Removed the older pause-removal speedup path and replaced it with newer stretch controls (`20b7383`, `ac343b9`, `3476441`).
+- Improved presets and video stretching controls in UI/backend configuration (`e74a918`).
+
+### Defaults, Tests, and Maintenance
+
+- Fixed default parameters after the previous README update (`345bf53`).
+- Added tests for important pipeline, frontend/backend, cost, TTS, project, route, and timing behavior (`fdf4634`).
+- Continued frontend/backend normalization and integration cleanup across project config and processing paths (`63709ca`, `800c5fd`).
