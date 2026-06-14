@@ -117,11 +117,39 @@ class ApiClient {
     });
   }
 
+  async downloadVideoFromUrl(
+    projectId: string,
+    url: string,
+    quality: DownloadQuality = 'best'
+  ): Promise<VideoDownloadResponse> {
+    return this.request<VideoDownloadResponse>(`/projects/${projectId}/download-url`, {
+      method: 'POST',
+      body: JSON.stringify({ url, quality }),
+    });
+  }
+
+  async getVideoInfo(
+    url: string,
+    quality: DownloadQuality = 'best'
+  ): Promise<VideoInfoResponse> {
+    return this.request<VideoInfoResponse>(`/projects/video-info`, {
+      method: 'POST',
+      body: JSON.stringify({ url, quality }),
+    });
+  }
+
   // --- Processing ---
 
   async startTranscription(projectId: string): Promise<JobResponse> {
     return this.request<JobResponse>(
       `/projects/${projectId}/process/transcribe`,
+      { method: 'POST' }
+    );
+  }
+
+  async queueAutoProcess(projectId: string): Promise<QueueAutoResponse> {
+    return this.request<QueueAutoResponse>(
+      `/projects/${projectId}/process/queue-auto`,
       { method: 'POST' }
     );
   }
@@ -340,6 +368,36 @@ class ApiClient {
     });
   }
 
+  async uploadCookies(file: File): Promise<{ message: string; filename: string; size: number }> {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const url = `${this.baseUrl}/settings/cookies`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        detail: `HTTP ${response.status}: ${response.statusText}`,
+      }));
+      throw new Error(error.detail || 'Failed to upload cookies');
+    }
+
+    return response.json();
+  }
+
+  async getCookiesStatus(): Promise<CookiesStatusResponse> {
+    return this.request<CookiesStatusResponse>('/settings/cookies');
+  }
+
+  async deleteCookies(): Promise<{ message: string; deleted: boolean }> {
+    return this.request<{ message: string; deleted: boolean }>('/settings/cookies', {
+      method: 'DELETE',
+    });
+  }
+
   // --- Downloads ---
 
   getVideoUrl(projectId: string): string {
@@ -533,6 +591,12 @@ export interface ProjectConfig {
   preservePauseDuration?: number;
 }
 
+  export interface CookiesStatusResponse {
+  configured: boolean;
+  path: string | null;
+  source: 'uploaded' | 'env';
+}
+
 export interface ProjectListResponse {
   id: string;
   name: string;
@@ -592,6 +656,25 @@ export interface UploadResponse {
   size: number;
 }
 
+export interface VideoDownloadResponse {
+  url: string;
+  filename: string;
+  size: number;
+  title?: string | null;
+  jobId: string;
+  status: string;
+  projectId: string;
+}
+
+export interface VideoInfoResponse {
+  url: string;
+  title?: string | null;
+  duration?: number | null;
+  uploader?: string | null;
+}
+
+export type DownloadQuality = 'best' | '1080p' | '720p' | '480p';
+
 export interface JobResponse {
   jobId: string;
   status: string;
@@ -600,6 +683,15 @@ export interface JobResponse {
   progress: number;
   currentStep?: string;
 }
+
+export interface QueueAutoResponse {
+  queued: boolean;
+  started: boolean;
+  jobId?: string;
+  projectId: string;
+  status: string;
+}
+
 
 export interface JobStatusResponse extends JobResponse {
   logs: LogEntry[];

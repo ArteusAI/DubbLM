@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2, RotateCcw } from 'lucide-react';
+import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2, RotateCcw, Link2, Download, Cookie, X } from 'lucide-react';
 import { Project, ProjectStatus, PresetId } from '../types';
 import { PRESETS, LANGUAGES } from '../constants';
 import { api } from '../api';
@@ -29,6 +29,7 @@ interface ProjectListViewProps {
   onSelectProject: (id: string) => void;
   onDeleteProject: (id: string) => void;
   onBatchUpload: (files: File[]) => void;
+  onDownloadFromUrl: (url: string, quality: 'best' | '1080p' | '720p' | '480p') => void;
   onAutoProcess: (ids: string[]) => void;
   onStopProcess: (ids: string[]) => void;
   onResetAndRestart: (id: string) => void;
@@ -36,7 +37,8 @@ interface ProjectListViewProps {
   onChangePreset: (projectId: string, preset: PresetId) => void;
   onChangeLanguages: (projectId: string, sourceLang: string, targetLang: string) => void;
   onProgressUpdate: (projectId: string, progress: number, stage: string) => void;
-  onStatusComplete: (projectId: string, status: ProjectStatus) => void;
+  onDownloadProgressUpdate: (projectId: string, progress: number, stage: string) => void;
+  onStatusComplete: (projectId: string, status: ProjectStatus, error?: string) => void;
 }
 
 interface CompactLangSelectorProps {
@@ -80,7 +82,8 @@ interface ProjectCardProps {
   onChangePreset: (preset: PresetId) => void;
   onChangeLanguages: (source: string, target: string) => void;
   onProgressUpdate: (progress: number, stage: string) => void;
-  onStatusComplete: (status: ProjectStatus) => void;
+  onDownloadProgressUpdate: (progress: number, stage: string) => void;
+  onStatusComplete: (status: ProjectStatus, error?: string) => void;
 }
 
 const ProjectCard: React.FC<ProjectCardProps> = ({
@@ -95,6 +98,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
   onChangePreset,
   onChangeLanguages,
   onProgressUpdate,
+  onDownloadProgressUpdate,
   onStatusComplete
 }) => {
   const [frameLoaded, setFrameLoaded] = useState(false);
@@ -105,16 +109,19 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
   
   // Store callbacks in refs to avoid dependency issues
   const onProgressRef = useRef(onProgressUpdate);
+  const onDownloadProgressRef = useRef(onDownloadProgressUpdate);
   const onCompleteRef = useRef(onStatusComplete);
   onProgressRef.current = onProgressUpdate;
+  onDownloadProgressRef.current = onDownloadProgressUpdate;
   onCompleteRef.current = onStatusComplete;
   
   const processing = project.status === 'transcribing' || project.status === 'dubbing' || project.isAutoProcessing;
+  const downloading = project.status === 'downloading' || project.isDownloading;
   const uploading = project.isUploading;
   
-  // Subscribe to SSE for progress updates when processing
+  // Subscribe to SSE for progress updates when processing or downloading
   useEffect(() => {
-    if (!processing || uploading) {
+    if ((!processing && !downloading) || uploading) {
       setLocalProgress(0);
       setLocalStage(undefined);
       return;
@@ -124,10 +131,14 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
       onProgress: (percent, step) => {
         setLocalProgress(percent);
         setLocalStage(step);
-        onProgressRef.current(percent, step);
+        if (downloading) {
+          onDownloadProgressRef.current(percent, step);
+        } else {
+          onProgressRef.current(percent, step);
+        }
       },
-      onComplete: (status) => {
-        onCompleteRef.current(status as ProjectStatus);
+      onComplete: (status, error) => {
+        onCompleteRef.current(status as ProjectStatus, error);
       },
       onError: () => {
         // Silent fail - will retry on next render
@@ -135,24 +146,26 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
     });
     
     return unsubscribe;
-  }, [project.id, processing, uploading]);
+  }, [project.id, processing, downloading, uploading]);
   
   // Use local progress for real-time updates, fallback to project progress
-  const progress = localProgress || project.processProgress || 0;
-  const stage = localStage || project.processStage;
+  const progress = downloading
+    ? (localProgress || project.downloadProgress || 0)
+    : (localProgress || project.processProgress || 0);
+  const stage = localStage || (downloading ? project.downloadStage : project.processStage);
   
   // Get frame URL from backend (buckets at 5% intervals)
   const frameUrl = useMemo(() => {
-    if (!processing || uploading) return null;
+    if (!processing || uploading || downloading) return null;
     return api.getVideoFrameUrl(project.id, progress);
-  }, [project.id, processing, uploading, progress]);
+  }, [project.id, processing, uploading, downloading, progress]);
   
   // Get static thumbnail URL from backend
   const thumbnailUrl = useMemo(() => {
     // Always available after upload
-    if (uploading) return null;
+    if (uploading || downloading) return null;
     return api.getVideoThumbnailUrl(project.id);
-  }, [project.id, uploading]);
+  }, [project.id, uploading, downloading]);
   
   // Preload frame image
   useEffect(() => {
@@ -195,9 +208,9 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
     : (thumbLoaded && thumbnailUrl ? thumbnailUrl : null);
   
   // Show loading state while waiting for frame/thumb
-  const isLoadingFrame = (processing && frameUrl && !frameLoaded) || (!uploading && thumbnailUrl && !thumbLoaded);
+  const isLoadingFrame = (processing && frameUrl && !frameLoaded) || (!uploading && !downloading && thumbnailUrl && !thumbLoaded);
   
-  const statusInfo = getStatusInfo(project.status, uploading, stage);
+  const statusInfo = getStatusInfo(project.status, uploading, downloading, stage);
 
   return (
     <div 
@@ -211,7 +224,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
       onClick={onSelect}
     >
       {/* Video Frame Background */}
-      {(backgroundImage || isLoadingFrame || processing) && (
+      {(backgroundImage || isLoadingFrame || processing || downloading) && (
         <>
           {/* Actual frame image or loading placeholder */}
           {backgroundImage ? (
@@ -231,18 +244,20 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               style={{ 
                 background: processing 
                   ? 'linear-gradient(135deg, rgba(245, 158, 11, 0.1) 0%, rgba(168, 85, 247, 0.05) 100%)'
-                  : 'linear-gradient(135deg, rgba(59, 130, 246, 0.08) 0%, rgba(16, 185, 129, 0.05) 100%)',
+                  : downloading
+                    ? 'linear-gradient(135deg, rgba(59, 130, 246, 0.12) 0%, rgba(37, 99, 235, 0.05) 100%)'
+                    : 'linear-gradient(135deg, rgba(59, 130, 246, 0.08) 0%, rgba(16, 185, 129, 0.05) 100%)',
                 opacity: 0.5
               }}
             />
           )}
-          {/* Animated glow during processing */}
-          {processing && (
+          {/* Animated glow during processing or downloading */}
+          {(processing || downloading) && (
             <div 
               className="absolute inset-0 pointer-events-none transition-all duration-300"
               style={{
                 background: `radial-gradient(ellipse at ${Math.min(progress, 100)}% 50%, 
-                  rgba(245, 158, 11, 0.25) 0%, 
+                  ${downloading ? 'rgba(59, 130, 246, 0.25)' : 'rgba(245, 158, 11, 0.25)'} 0%, 
                   transparent 50%)`
               }}
             />
@@ -274,14 +289,14 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
             {/* Icon Box */}
             <div className={`
               w-10 h-10 rounded-lg flex items-center justify-center border backdrop-blur-sm
-              ${uploading ? 'bg-blue-500/10 border-blue-500/20 text-blue-500' :
+              ${uploading || downloading ? 'bg-blue-500/10 border-blue-500/20 text-blue-500' :
                 project.status === 'dubbed' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-500' : 
                 project.status === 'transcribed' ? 'bg-brand-500/10 border-brand-500/20 text-brand-500' : 
                 project.status === 'error' ? 'bg-red-500/10 border-red-500/20 text-red-500' :
                 processing ? 'bg-amber-500/10 border-amber-500/20 text-amber-500' :
                 'bg-zinc-800/50 border-zinc-700/50 text-zinc-400'}
             `}>
-              {uploading ? (
+              {uploading || downloading ? (
                 <Loader2 className="w-5 h-5 animate-spin" />
               ) : project.status === 'error' ? (
                 <AlertCircle className="w-5 h-5" />
@@ -297,17 +312,21 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
           
           {/* Actions */}
           <div className="flex items-center gap-1">
-            {!uploading && !processing && project.status !== 'dubbed' && project.status !== 'error' && (
+            {!processing && project.status !== 'dubbed' && project.status !== 'error' && (
               <button
                 onClick={(e) => { e.stopPropagation(); onAutoProcess(); }}
-                className="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800/80 rounded-lg transition-colors backdrop-blur-sm"
-                title="Feeling Lucky (Auto-Process)"
+                className={`p-2 rounded-lg transition-colors backdrop-blur-sm ${
+                  project.config?.autoProcess
+                    ? 'text-amber-400 bg-amber-500/10 hover:text-amber-300 hover:bg-amber-500/20 animate-pulse'
+                    : 'text-zinc-400 hover:text-white hover:bg-zinc-800/80'
+                }`}
+                title={project.config?.autoProcess ? "Auto-processing queued" : "Feeling Lucky (Auto-Process)"}
               >
                 <Sparkles className="w-4 h-4" />
               </button>
             )}
             
-            {processing && (
+            {(processing || downloading || (uploading && project.config?.autoProcess)) && (
               <button
                 onClick={(e) => { e.stopPropagation(); onStopProcess(); }}
                 className="p-2 text-amber-400 hover:text-white hover:bg-amber-500/20 rounded-lg transition-colors animate-pulse backdrop-blur-sm"
@@ -317,15 +336,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               </button>
             )}
 
-            {!uploading && !processing && (
-              <button
-                onClick={(e) => { e.stopPropagation(); onResetAndRestart(); }}
-                className="p-2 text-zinc-500 hover:text-cyan-300 hover:bg-cyan-500/10 rounded-lg transition-colors backdrop-blur-sm"
-                title="Reset Cache and Restart"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
-            )}
+
 
             <button
               onClick={(e) => { e.stopPropagation(); onDelete(); }}
@@ -353,6 +364,19 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                 />
               </div>
             </div>
+          ) : downloading ? (
+            <div className="space-y-2 mt-2">
+              <div className="flex justify-between text-[10px] font-medium uppercase tracking-wider">
+                <span className="text-blue-400">{stage || 'Downloading video...'}</span>
+                <span className="text-zinc-500">{Math.round(progress)}%</span>
+              </div>
+              <div className="h-1.5 bg-zinc-800/80 rounded-full overflow-hidden backdrop-blur-sm">
+                <div 
+                  className="h-full bg-gradient-to-r from-blue-600 to-blue-400 transition-all duration-300 shadow-lg shadow-blue-500/30"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+            </div>
           ) : processing ? (
             <div className="space-y-2 mt-2">
               <div className="flex justify-between text-[10px] font-medium uppercase tracking-wider">
@@ -367,8 +391,15 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               </div>
             </div>
           ) : project.status === 'error' ? (
-            <div className="text-xs text-red-400 mt-1 truncate">
-              {project.error || 'An error occurred'}
+            <div className="mt-2 group">
+              <div className="text-xs text-red-400 line-clamp-2 leading-relaxed" title={project.error || 'An error occurred'}>
+                {project.error || 'An error occurred'}
+              </div>
+              {project.error && project.error.length > 80 && (
+                <div className="hidden group-hover:block absolute z-50 max-w-sm mt-1 p-2 text-[11px] text-red-200 bg-red-950/90 border border-red-800 rounded shadow-lg">
+                  {project.error}
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -452,9 +483,13 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
   );
 };
 
-const getStatusInfo = (status: ProjectStatus, isUploading?: boolean, processStage?: string) => {
+const getStatusInfo = (status: ProjectStatus, isUploading?: boolean, isDownloading?: boolean, processStage?: string) => {
   if (isUploading) {
     return { label: 'Uploading', color: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
+  }
+
+  if (isDownloading) {
+    return { label: 'Downloading', color: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
   }
   
   // When processing, show more accurate stage based on processStage
@@ -494,6 +529,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   onSelectProject,
   onDeleteProject,
   onBatchUpload,
+  onDownloadFromUrl,
   onAutoProcess,
   onStopProcess,
   onResetAndRestart,
@@ -501,11 +537,29 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   onChangePreset,
   onChangeLanguages,
   onProgressUpdate,
+  onDownloadProgressUpdate,
   onStatusComplete
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [urlInput, setUrlInput] = useState('');
+  const [downloadQuality, setDownloadQuality] = useState<'best' | '1080p' | '720p' | '480p'>('best');
+  const [isSubmittingUrl, setIsSubmittingUrl] = useState(false);
+  const [cookiesStatus, setCookiesStatus] = useState<{ configured: boolean; source: string } | null>(null);
+  const [isCookiesLoading, setIsCookiesLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const cookiesInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const loadCookiesStatus = async () => {
+      try {
+        setCookiesStatus(await api.getCookiesStatus());
+      } catch {
+        setCookiesStatus(null);
+      }
+    };
+    loadCookiesStatus();
+  }, []);
 
   const handleBatchSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -532,6 +586,49 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
       if (videoFiles.length > 0) {
         onBatchUpload(videoFiles);
       }
+    }
+  };
+
+  const handleUrlSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!urlInput.trim() || isSubmittingUrl) return;
+
+    setIsSubmittingUrl(true);
+    try {
+      await onDownloadFromUrl(urlInput.trim(), downloadQuality);
+      setUrlInput('');
+    } finally {
+      setIsSubmittingUrl(false);
+    }
+  };
+
+  const handleCookiesSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsCookiesLoading(true);
+    try {
+      await api.uploadCookies(file);
+      setCookiesStatus(await api.getCookiesStatus());
+    } catch (err) {
+      console.error('Failed to upload cookies:', err);
+      alert(err instanceof Error ? err.message : 'Failed to upload cookies');
+    } finally {
+      setIsCookiesLoading(false);
+      e.target.value = '';
+    }
+  };
+
+  const handleDeleteCookies = async () => {
+    setIsCookiesLoading(true);
+    try {
+      await api.deleteCookies();
+      setCookiesStatus(await api.getCookiesStatus());
+    } catch (err) {
+      console.error('Failed to delete cookies:', err);
+      alert(err instanceof Error ? err.message : 'Failed to delete cookies');
+    } finally {
+      setIsCookiesLoading(false);
     }
   };
 
@@ -613,6 +710,90 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
             )}
           </div>
           <div className="flex items-center gap-3">
+            {/* URL Download Form */}
+            <form onSubmit={handleUrlSubmit} className="flex items-center gap-2">
+              <div className="flex items-center bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 focus-within:border-brand-500 focus-within:ring-1 focus-within:ring-brand-500/50 transition-all">
+                <Link2 className="w-4 h-4 text-zinc-500 mr-2 shrink-0" />
+                <input
+                  type="url"
+                  placeholder="Paste video URL (YouTube, etc.)"
+                  value={urlInput}
+                  onChange={(e) => setUrlInput(e.target.value)}
+                  disabled={isSubmittingUrl}
+                  className="bg-transparent border-none outline-none text-sm text-white placeholder-zinc-500 w-56 lg:w-72"
+                />
+              </div>
+              <select
+                value={downloadQuality}
+                onChange={(e) => setDownloadQuality(e.target.value as 'best' | '1080p' | '720p' | '480p')}
+                disabled={isSubmittingUrl}
+                className="bg-zinc-900 border border-zinc-700 rounded-lg px-2 py-2 text-xs text-zinc-300 outline-none focus:border-brand-500"
+                title="Download quality"
+              >
+                <option value="best">Best</option>
+                <option value="1080p">1080p</option>
+                <option value="720p">720p</option>
+                <option value="480p">480p</option>
+              </select>
+              <button
+                type="submit"
+                disabled={!urlInput.trim() || isSubmittingUrl}
+                className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium text-sm transition-colors"
+                title="Download from URL"
+              >
+                {isSubmittingUrl ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+                <span className="hidden sm:inline">Download</span>
+              </button>
+            </form>
+
+            {/* Cookies upload for authenticated downloads */}
+            <div className="flex items-center gap-2">
+              <input
+                type="file"
+                accept=".txt"
+                className="hidden"
+                ref={cookiesInputRef}
+                onChange={handleCookiesSelect}
+              />
+              <button
+                onClick={() => cookiesInputRef.current?.click()}
+                disabled={isCookiesLoading}
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg font-medium text-sm transition-colors border ${
+                  cookiesStatus?.configured
+                    ? 'bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20'
+                    : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:text-white hover:bg-zinc-800'
+                }`}
+                title={
+                  cookiesStatus?.configured
+                    ? `Cookies configured (${cookiesStatus.source}). Click to replace.`
+                    : 'Upload cookies.txt for YouTube/private videos'
+                }
+              >
+                {isCookiesLoading ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Cookie className="w-4 h-4" />
+                )}
+                <span className="hidden sm:inline">
+                  {cookiesStatus?.configured ? 'Cookies' : 'Cookies'}
+                </span>
+              </button>
+              {cookiesStatus?.configured && (
+                <button
+                  onClick={handleDeleteCookies}
+                  disabled={isCookiesLoading}
+                  className="p-2 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                  title="Remove cookies"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
             <button 
               onClick={onOpenSettings}
               className="p-2.5 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors border border-zinc-800 hover:border-zinc-700"
@@ -646,7 +827,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
                 <FolderOpen className="w-10 h-10 text-zinc-600" />
               </div>
               <p className="text-xl font-semibold text-zinc-300">No projects yet</p>
-              <p className="text-sm mt-2 max-w-sm text-center">Get started by clicking "Add Media" or dragging your video files directly onto this area.</p>
+              <p className="text-sm mt-2 max-w-sm text-center">Get started by clicking "Add Media", dragging your video files directly onto this area, or pasting a video URL above.</p>
             </div>
           ) : (
             projects.map((project) => (
@@ -663,7 +844,8 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
                 onChangePreset={(preset) => onChangePreset(project.id, preset)}
                 onChangeLanguages={(source, target) => onChangeLanguages(project.id, source, target)}
                 onProgressUpdate={(progress, stage) => onProgressUpdate(project.id, progress, stage)}
-                onStatusComplete={(status) => onStatusComplete(project.id, status)}
+                onDownloadProgressUpdate={(progress, stage) => onDownloadProgressUpdate(project.id, progress, stage)}
+                onStatusComplete={(status, error) => onStatusComplete(project.id, status, error)}
               />
             ))
           )}

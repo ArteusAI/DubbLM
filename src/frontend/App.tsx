@@ -9,7 +9,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider, SpeakerMetadata, TtsStyleId, ResolvedTtsStyleId } from './types';
 import { DEFAULT_PERSONAS, PRESETS } from './constants';
 import { ChevronRight, LayoutDashboard, Settings, AlertTriangle, Loader2, X } from 'lucide-react';
-import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse, ProjectConfig as ApiProjectConfig } from './api';
+import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse, ProjectConfig as ApiProjectConfig, DownloadQuality, VideoInfoResponse, QueueAutoResponse } from './api';
 
 const DEFAULT_PRESET = PRESETS.find(p => p.id === 'hq')!;
 
@@ -438,18 +438,25 @@ const App: React.FC = () => {
     if (!activeProjectId) return;
     
     // Only subscribe if in processing state
-    if (!activeProjectStatus || !['transcribing', 'dubbing'].includes(activeProjectStatus)) return;
+    if (!activeProjectStatus || !['downloading', 'transcribing', 'dubbing'].includes(activeProjectStatus)) return;
 
     const unsubscribe = api.subscribeToStatus(activeProjectId, {
       onProgress: (percent, currentStep) => {
         setProcessingProgress(percent);
         setProcessingStep(currentStep);
         
-        setProjects(prev => prev.map(p => 
-          p.id === activeProjectId
-            ? { ...p, processProgress: percent, processStage: currentStep }
-            : p
-        ));
+        setProjects(prev => prev.map(p => {
+          if (p.id !== activeProjectId) return p;
+          const updates: Partial<Project> = {};
+          if (p.status === 'downloading') {
+            updates.downloadProgress = percent;
+            updates.downloadStage = currentStep;
+          } else {
+            updates.processProgress = percent;
+            updates.processStage = currentStep;
+          }
+          return { ...p, ...updates };
+        }));
       },
       onLog: (log) => {
         // Deduplicate logs by ID
@@ -469,7 +476,7 @@ const App: React.FC = () => {
           setError(errorMsg);
           setProjects(prev => prev.map(p =>
             p.id === activeProjectId
-              ? { ...p, status: 'error' as ProjectStatus, error: errorMsg }
+              ? { ...p, status: 'error' as ProjectStatus, error: errorMsg, isDownloading: false }
               : p
           ));
           setStep(AppStep.UPLOAD);
@@ -482,7 +489,7 @@ const App: React.FC = () => {
           const mappedProject = mapProjectFromApi(updatedProject);
           
           setProjects(prev => prev.map(p =>
-            p.id === activeProjectId ? mappedProject : p
+            p.id === activeProjectId ? { ...mappedProject, isDownloading: false } : p
           ));
 
           // Navigate based on status
@@ -492,6 +499,9 @@ const App: React.FC = () => {
             // Clear autoProcess flag when complete
             await api.updateProjectConfig(activeProjectId, { autoProcess: false });
             setStep(AppStep.RESULT);
+          } else if (status === 'draft') {
+            // Download completed without auto-processing
+            setStep(AppStep.UPLOAD);
           }
         } catch (err) {
           console.error('Failed to reload project:', err);
@@ -542,6 +552,51 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDownloadFromUrl = async (url: string, quality: DownloadQuality) => {
+    try {
+      const trimmedUrl = url.trim();
+      if (!trimmedUrl) {
+        setError('Please enter a video URL');
+        return;
+      }
+
+      // Try to retrieve the video title before creating the project
+      let projectName = 'URL Download';
+      try {
+        const info: VideoInfoResponse = await api.getVideoInfo(trimmedUrl, quality);
+        projectName = info.title?.trim() || 'URL Download';
+      } catch {
+        // Fallback to a short URL-based label
+        try {
+          const parsedUrl = new URL(trimmedUrl);
+          projectName = parsedUrl.hostname || 'URL Download';
+        } catch {
+          projectName = 'URL Download';
+        }
+      }
+
+      const created = await api.createProject(projectName);
+      const project = mapProjectFromApi(created);
+
+      // Sync default config to backend immediately
+      await api.updateProjectConfig(project.id, buildProjectConfigPayload(project.config));
+
+      // Mark as downloading in local state and stay on the dashboard
+      project.isDownloading = true;
+      project.downloadProgress = 0;
+      project.downloadStage = 'Starting download...';
+
+      setProjects(prev => [project, ...prev]);
+      setActiveProjectId(project.id);
+
+      // Start download on backend
+      await api.downloadVideoFromUrl(project.id, trimmedUrl, quality);
+    } catch (err) {
+      console.error('Failed to start URL download:', err);
+      setError(err instanceof Error ? err.message : 'Failed to start download');
+    }
+  };
+
   const uploadVideoInBackground = async (projectId: string, file: File) => {
     try {
       await api.uploadVideo(projectId, file, (percent) => {
@@ -551,13 +606,26 @@ const App: React.FC = () => {
             : p
         ));
       });
-      
+
       // Upload complete
-      setProjects(prev => prev.map(p =>
-        p.id === projectId
-          ? { ...p, isUploading: false, uploadProgress: 100, sourceFilename: file.name, sourceSize: file.size }
-          : p
-      ));
+      setProjects(prev => {
+        const project = prev.find(p => p.id === projectId);
+        const autoProcessQueued = !!project?.config?.autoProcess;
+        return prev.map(p =>
+          p.id === projectId
+            ? {
+                ...p,
+                isUploading: false,
+                uploadProgress: 100,
+                sourceFilename: file.name,
+                sourceSize: file.size,
+                ...(autoProcessQueued
+                  ? { status: 'transcribing' as ProjectStatus, isAutoProcessing: true, processProgress: 0, processStage: 'Starting...' }
+                  : {}),
+              }
+            : p
+        );
+      });
     } catch (err) {
       console.error(`Failed to upload video for project ${projectId}:`, err);
       setProjects(prev => prev.map(p =>
@@ -573,30 +641,30 @@ const App: React.FC = () => {
       const project = projects.find(p => p.id === id);
       if (!project) continue;
 
-      // Skip if still uploading
-      if (project.isUploading) {
-        console.log(`Project ${id} is still uploading, skipping auto-process`);
-        continue;
-      }
-
       try {
-        // Update full config with autoProcess flag
-        const cfg = project.config;
-        await api.updateProjectConfig(id, buildProjectConfigPayload(cfg, { autoProcess: true }));
+        const response: QueueAutoResponse = await api.queueAutoProcess(id);
 
-        // Start transcription
-        await api.startTranscription(id);
-        
+        // Optimistically mark auto-processing intent in local state
         setProjects(prev => prev.map(p =>
           p.id === id
-            ? { ...p, status: 'transcribing' as ProjectStatus, isAutoProcessing: true, processProgress: 0, processStage: 'Starting...' }
+            ? { ...p, config: { ...p.config, autoProcess: true } }
             : p
         ));
+
+        if (response.started) {
+          // Processing started immediately (media already available)
+          setProjects(prev => prev.map(p =>
+            p.id === id
+              ? { ...p, status: 'transcribing' as ProjectStatus, isAutoProcessing: true, processProgress: 0, processStage: 'Starting...' }
+              : p
+          ));
+        }
+        // If queued, the backend/worker will start processing when media arrives
       } catch (err) {
-        console.error(`Failed to start processing for ${id}:`, err);
+        console.error(`Failed to queue auto-processing for ${id}:`, err);
         setProjects(prev => prev.map(p =>
           p.id === id
-            ? { ...p, status: 'error' as ProjectStatus, error: err instanceof Error ? err.message : 'Processing failed' }
+            ? { ...p, status: 'error' as ProjectStatus, error: err instanceof Error ? err.message : 'Auto-processing failed' }
             : p
         ));
       }
@@ -644,6 +712,10 @@ const App: React.FC = () => {
       setError('Please wait for video upload to complete');
       return;
     }
+    if (project.isDownloading) {
+      setError('Please wait for video download to complete');
+      return;
+    }
 
     setPendingResetId(id);
     setShowResetDialog(true);
@@ -655,6 +727,10 @@ const App: React.FC = () => {
 
     if (project.isUploading) {
       setError('Please wait for video upload to complete');
+      return;
+    }
+    if (project.isDownloading) {
+      setError('Please wait for video download to complete');
       return;
     }
 
@@ -760,6 +836,9 @@ const App: React.FC = () => {
             videoFile: p.videoFile,
             isUploading: p.isUploading,
             uploadProgress: p.uploadProgress,
+            isDownloading: p.isDownloading,
+            downloadProgress: p.downloadProgress,
+            downloadStage: p.downloadStage,
           };
         }
         return p;
@@ -937,9 +1016,13 @@ const App: React.FC = () => {
   const startProcessing = async () => {
     if (!activeProject) return;
 
-    // Don't start if upload is still in progress
+    // Don't start if upload or download is still in progress
     if (activeProject.isUploading) {
       setError('Please wait for video upload to complete');
+      return;
+    }
+    if (activeProject.isDownloading) {
+      setError('Please wait for video download to complete');
       return;
     }
 
@@ -1387,6 +1470,7 @@ const App: React.FC = () => {
             onSelectProject={handleSelectProject}
             onDeleteProject={handleDeleteProject}
             onBatchUpload={handleBatchUpload}
+            onDownloadFromUrl={handleDownloadFromUrl}
             onAutoProcess={handleAutoProcess}
             onStopProcess={handleStopProcess}
             onResetAndRestart={handleResetAndRestart}
@@ -1400,7 +1484,14 @@ const App: React.FC = () => {
                   : p
               ));
             }}
-            onStatusComplete={async (projectId, newStatus) => {
+            onDownloadProgressUpdate={(projectId, progress, stage) => {
+              setProjects(prev => prev.map(p =>
+                p.id === projectId
+                  ? { ...p, downloadProgress: progress, downloadStage: stage }
+                  : p
+              ));
+            }}
+            onStatusComplete={async (projectId, newStatus, error) => {
               try {
                 const updatedProject = await api.getProject(projectId);
                 setProjects(prev => prev.map(p =>
@@ -1408,15 +1499,25 @@ const App: React.FC = () => {
                     ? {
                         ...mapProjectFromApi(updatedProject),
                         isAutoProcessing: false,
+                        isDownloading: false,
                         processProgress: 0,
                         processStage: undefined,
+                        downloadProgress: 0,
+                        downloadStage: undefined,
+                        error: error || p.error,
                       }
                     : p
                 ));
               } catch {
                 setProjects(prev => prev.map(p =>
                   p.id === projectId
-                    ? { ...p, status: newStatus, isAutoProcessing: false }
+                    ? {
+                        ...p,
+                        status: newStatus,
+                        isAutoProcessing: false,
+                        isDownloading: false,
+                        error: error || p.error,
+                      }
                     : p
                 ));
               }

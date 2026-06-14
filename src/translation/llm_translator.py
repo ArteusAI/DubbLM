@@ -31,6 +31,7 @@ from src.utils.speaker_gender import (
     build_effective_gender_prompt_section,
     normalize_speaker_metadata_map,
 )
+from src.utils.llm_call import robust_llm_call
 
 if TYPE_CHECKING:
     from src.dubbing.core.cache_manager import CacheManager
@@ -522,7 +523,7 @@ Rules:
 """
 
         try:
-            response = self.refinement_llm.complete(prompt)
+            response = robust_llm_call(self.refinement_llm.complete, prompt)
             if hasattr(response, "text"):
                 response_text = response.text
             else:
@@ -1006,7 +1007,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         )
         
         try:
-            result = self.llm.complete(combined_prompt)
+            result = robust_llm_call(self.llm.complete, combined_prompt)
             if hasattr(result, "text"):
                 response_text = result.text
             else:
@@ -1335,7 +1336,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         if editor_llm is None:
             raise RuntimeError("Editor LLM is not initialized.")
 
-        editor_response = editor_llm.complete(prompt)
+        editor_response = robust_llm_call(editor_llm.complete, prompt)
         if hasattr(editor_response, "text"):
             response_text = editor_response.text.strip()
         else:
@@ -2204,139 +2205,92 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 
         # Start timer for this chunk's translation
         chunk_start_time = time.perf_counter()
-        
-        # Call LLM for translation
-        max_attempts = 5
+
         translated_pairs = None
         translation_text = ""
         translation_success = False
-        
-        for attempt in range(max_attempts):
-            try:
-                translation = self.llm.complete(prompt)
-                if hasattr(translation, "text"):
-                    translation_text = translation.text.strip()
-                else:
-                    translation_text = str(translation).strip()
 
-                self._record_llm_cost(
-                    self.llm_provider,
-                    self.model_name,
-                    prompt,
-                    translation_text,
-                    translation,
-                    category="translation",
-                )
-                
-                # Check if translation is empty
-                if not translation_text:
-                    if attempt < max_attempts - 1:
-                        logger.warning(f"Empty translation received, retrying ({attempt+1}/{max_attempts})...")
-                        if debug:
-                            self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, translation_text, None,
-                                                     chunk_text, f"Empty translation received")
-                        continue
-                    else:
-                        # Will handle failure after loop
-                        logger.error(f"Failed to get translation after {max_attempts} attempts, empty response")
-                        break  # Will trigger the fallback splitting mechanism
+        try:
+            # Call LLM for translation with timeout and retries.
+            # Validation errors are handled below; robust_llm_call retries only
+            # TimeoutError / ConnectionError with exponential backoff.
+            translation = robust_llm_call(self.llm.complete, prompt)
+            if hasattr(translation, "text"):
+                translation_text = translation.text.strip()
+            else:
+                translation_text = str(translation).strip()
 
-                logger.debug(f"TRACE: Raw LLM response (first 500 chars): {translation_text[:500]}")
+            self._record_llm_cost(
+                self.llm_provider,
+                self.model_name,
+                prompt,
+                translation_text,
+                translation,
+                category="translation",
+            )
 
-                try:
-                    # Try to parse JSON from LLM response
-                    repaired_json = json_repair.loads(translation_text)
-                    logger.debug(f"TRACE: Parsed JSON type: {type(repaired_json)}, is_list: {isinstance(repaired_json, list)}, is_dict: {isinstance(repaired_json, dict)}")
-                    if isinstance(repaired_json, (list, dict)) and len(str(repaired_json)) < 500:
-                        logger.debug(f"TRACE: Parsed JSON value: {repaired_json}")
-                    else:
-                        logger.debug(f"TRACE: Parsed JSON value (truncated): {str(repaired_json)[:500]}...")
+            if not translation_text:
+                raise ValueError("Empty translation received")
 
-                    # Handle different response formats from LLM
-                    if isinstance(repaired_json, list):
-                        # LLM returned array directly: [{"speaker": "X", "translation": "..."}, ...]
-                        translated_pairs = repaired_json
-                        # Normalize field names: "translation" -> "text"
-                        for pair in translated_pairs:
-                            if isinstance(pair, dict) and "translation" in pair and "text" not in pair:
-                                pair["text"] = pair.pop("translation")
-                    elif isinstance(repaired_json, dict):
-                        # LLM returned object: {"translations": [...]}
-                        translated_pairs = repaired_json.get("translations", [])
-                    else:
-                        raise ValueError(f"Unexpected JSON type: {type(repaired_json)}")
-                        
-                    # Validate all translations match the target language
-                    validation_errors = []
-                    has_invalid_translations = False
-                    
-                    # Validate number of pairs matches original
-                    if len(translated_pairs) != len(original_speaker_texts):
-                        error_msg = f"Count mismatch: {len(translated_pairs)} translations vs {len(original_speaker_texts)} original lines"
-                        validation_errors.append(error_msg)
-                        logger.error(error_msg)
-                        has_invalid_translations = True
-                    
-                    if not has_invalid_translations:
-                        # Validate speakers match in the same order
-                        speaker_mismatch_count = 0
-                        for j, (orig, trans) in enumerate(zip(original_speaker_texts, translated_pairs)):
-                            if j >= len(translated_pairs):
-                                break
-                            if orig["speaker"] != trans.get("speaker"):
-                                speaker_mismatch_count += 1
-                                if speaker_mismatch_count > 0: #FIXME: remove this check
-                                    error_msg = f"Too many speaker mismatches: expected max 1, found {speaker_mismatch_count}"
-                                    validation_errors.append(error_msg)
-                                    logger.error(error_msg)
-                                    has_invalid_translations = True
-                                    break
-                                else:
-                                    # Allow one speaker mismatch, but record it
-                                    logger.warning(f"Speaker correction at line {j+1}: replacing '{orig['speaker']}' with '{trans.get('speaker')}'")
-                                    # Update the original speaker with the LLM-assigned speaker
-                                    original_speaker_texts[j]["speaker"] = trans.get("speaker")
-                                                
-                    if has_invalid_translations:
-                        if debug:
-                            self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, translation_text, 
-                                                   translated_pairs, chunk_text, "\n".join(validation_errors))
-                        
-                        if attempt < max_attempts - 1:
-                            logger.warning(f"Invalid translation, retrying ({attempt+1}/{max_attempts})...")
-                            continue
-                        else:
-                            # Will handle failure after loop
-                            break
-                    
-                    # If we reached here, translation was successful
-                    translation_success = True
-                    break
-                except Exception as exc:
-                    if debug:
-                        self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, translation_text, None, 
-                                               chunk_text, f"Exception: {str(exc)}")
-                    
-                    if attempt < max_attempts - 1:
-                        logger.warning(f"Chunk translation error: {str(exc)}, retrying ({attempt+1}/{max_attempts})...")
-                        continue
-                    else:
-                        # Will handle failure after loop
-                        logger.error(f"Failed to translate chunk: {str(exc)}")
+            logger.debug(f"TRACE: Raw LLM response (first 500 chars): {translation_text[:500]}")
+
+            repaired_json = json_repair.loads(translation_text)
+            logger.debug(f"TRACE: Parsed JSON type: {type(repaired_json)}, is_list: {isinstance(repaired_json, list)}, is_dict: {isinstance(repaired_json, dict)}")
+            if isinstance(repaired_json, (list, dict)) and len(str(repaired_json)) < 500:
+                logger.debug(f"TRACE: Parsed JSON value: {repaired_json}")
+            else:
+                logger.debug(f"TRACE: Parsed JSON value (truncated): {str(repaired_json)[:500]}...")
+
+            # Handle different response formats from LLM
+            if isinstance(repaired_json, list):
+                translated_pairs = repaired_json
+                for pair in translated_pairs:
+                    if isinstance(pair, dict) and "translation" in pair and "text" not in pair:
+                        pair["text"] = pair.pop("translation")
+            elif isinstance(repaired_json, dict):
+                translated_pairs = repaired_json.get("translations", [])
+            else:
+                raise ValueError(f"Unexpected JSON type: {type(repaired_json)}")
+
+            validation_errors = []
+            has_invalid_translations = False
+
+            if len(translated_pairs) != len(original_speaker_texts):
+                error_msg = f"Count mismatch: {len(translated_pairs)} translations vs {len(original_speaker_texts)} original lines"
+                validation_errors.append(error_msg)
+                logger.error(error_msg)
+                has_invalid_translations = True
+
+            if not has_invalid_translations:
+                speaker_mismatch_count = 0
+                for j, (orig, trans) in enumerate(zip(original_speaker_texts, translated_pairs)):
+                    if j >= len(translated_pairs):
                         break
-            
-            except Exception as e:
-                if debug:
-                    self._write_attempt_debug(session_dir, i, attempt, chunks, prompt, "API ERROR", None, 
-                                           chunk_text, f"API Error: {str(e)}")
-                
-                if attempt < max_attempts - 1:
-                    logger.warning(f"API error: {str(e)}, retrying ({attempt+1}/{max_attempts})...")
-                else:
-                    # Will handle failure after loop
-                    logger.error(f"Failed to get translation after {max_attempts} attempts due to API errors")
-                    break
-        
+                    if orig["speaker"] != trans.get("speaker"):
+                        speaker_mismatch_count += 1
+                        if speaker_mismatch_count > 0:  # FIXME: remove this check
+                            error_msg = f"Too many speaker mismatches: expected max 1, found {speaker_mismatch_count}"
+                            validation_errors.append(error_msg)
+                            logger.error(error_msg)
+                            has_invalid_translations = True
+                            break
+                        else:
+                            logger.warning(f"Speaker correction at line {j+1}: replacing '{orig['speaker']}' with '{trans.get('speaker')}'")
+                            original_speaker_texts[j]["speaker"] = trans.get("speaker")
+
+            if has_invalid_translations:
+                raise ValueError("Invalid translation: " + "; ".join(validation_errors))
+
+            translation_success = True
+
+        except Exception as exc:
+            if debug:
+                self._write_attempt_debug(
+                    session_dir, i, 0, chunks, prompt, translation_text,
+                    translated_pairs, chunk_text, f"Exception: {str(exc)}"
+                )
+            logger.error(f"Failed to translate chunk {i+1}: {str(exc)}")
+
         # If translation failed and we have enough content to split, use the fallback splitting mechanism
         if not translation_success and len(original_speaker_texts) > 1 and recursion_depth < max_recursion_depth:
             logger.warning(f"Translation failed for chunk {i+1}. Splitting chunk and retrying...")
@@ -2730,96 +2684,64 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             # Start timer for batch refinement
             batch_start_time = time.perf_counter()
 
-            # Call LLM for refinement
-            max_attempts = 5
             refined_pairs = None
             llm_response_text = ""
-            refinement_success = False  # Track if refinement succeeded
+            refinement_success = False
 
-            for attempt in range(max_attempts):
-                try:
-                    # Prepend custom context if provided
-                    effective_refinement_prompt = (
-                        f"# Additional context (optional):\n{self.prompt_prefix}\n\n{refinement_prompt}"
-                        if self.prompt_prefix else refinement_prompt
-                    )
-                    refinement_response = self.refinement_llm.complete(effective_refinement_prompt)
-                    if hasattr(refinement_response, "text"):
-                        llm_response_text = refinement_response.text.strip()
-                    else: # openrouter
-                        llm_response_text = str(refinement_response).strip()
+            try:
+                effective_refinement_prompt = (
+                    f"# Additional context (optional):\n{self.prompt_prefix}\n\n{refinement_prompt}"
+                    if self.prompt_prefix else refinement_prompt
+                )
+                refinement_response = robust_llm_call(self.refinement_llm.complete, effective_refinement_prompt)
+                if hasattr(refinement_response, "text"):
+                    llm_response_text = refinement_response.text.strip()
+                else:  # openrouter
+                    llm_response_text = str(refinement_response).strip()
 
-                    self._record_llm_cost(
-                        self.refinement_llm_provider,
-                        self.refinement_model_name,
-                        effective_refinement_prompt,
-                        llm_response_text,
-                        refinement_response,
-                        category="refinement",
-                    )
+                self._record_llm_cost(
+                    self.refinement_llm_provider,
+                    self.refinement_model_name,
+                    effective_refinement_prompt,
+                    llm_response_text,
+                    refinement_response,
+                    category="refinement",
+                )
 
-                    if not llm_response_text:
-                        if attempt < max_attempts - 1:
-                            logger.warning(f"Empty refinement response received, retrying ({attempt+1}/{max_attempts})...")
-                            continue
-                        else:
-                            logger.error(f"Failed to get refinement after {max_attempts} attempts (empty response).")
-                            break  # Will trigger the fallback splitting mechanism
-                    
+                if not llm_response_text:
+                    raise ValueError("Empty refinement response received")
+
+                repaired_json = json_repair.loads(llm_response_text)
+                if isinstance(repaired_json, dict):
+                    candidate_pairs = repaired_json.get("translations", [])
+                else:
+                    candidate_pairs = repaired_json
+
+                refined_pairs, validation_errors = self._validate_structured_translation_pairs(
+                    candidate_pairs,
+                    [pair["speaker"] for pair in all_translated_pairs],
+                    [pair["text"] for pair in all_translated_pairs],
+                    self._required_variant_keys(),
+                    phase_name="refinement",
+                )
+                if validation_errors:
+                    raise ValueError("Invalid pairs found in refinement: " + "; ".join(validation_errors))
+
+                refinement_success = True
+
+            except Exception as e:
+                logger.error(f"Refinement failed for batch {batch_idx+1}: {str(e)}")
+                if debug and session_dir:
                     try:
-                        # Parse JSON from LLM response
-                        repaired_json = json_repair.loads(llm_response_text)
-                        if isinstance(repaired_json, dict):
-                            candidate_pairs = repaired_json.get("translations", [])
-                        else:
-                            candidate_pairs = repaired_json
+                        error_file = os.path.join(session_dir, f"batch{batch_idx+1}_refinement_error.txt")
+                        with open(error_file, "w", encoding="utf-8") as f_err:
+                            f_err.write("=== ERROR ===\n")
+                            f_err.write(str(e))
+                            f_err.write("\n\n=== LLM RESPONSE ===\n")
+                            f_err.write(llm_response_text)
+                    except Exception as log_e:
+                        logger.error(f"Error writing refinement error log: {log_e}")
 
-                        refined_pairs, validation_errors = self._validate_structured_translation_pairs(
-                            candidate_pairs,
-                            [pair["speaker"] for pair in all_translated_pairs],
-                            [pair["text"] for pair in all_translated_pairs],
-                            self._required_variant_keys(),
-                            phase_name="refinement",
-                        )
-                        if validation_errors and attempt < max_attempts - 1:
-                            logger.warning(
-                                "Invalid pairs found in refinement, retrying (%s/%s): %s...",
-                                attempt + 1,
-                                max_attempts,
-                                "; ".join(validation_errors),
-                            )
-                            continue
-
-                        # If we get here, refinement was successful
-                        refinement_success = True
-                        break # Success
-
-                    except Exception as json_error:
-                        if attempt < max_attempts - 1:
-                            logger.warning(f"Refinement JSON parsing error: {str(json_error)}, retrying ({attempt+1}/{max_attempts})...")
-                            # Optionally log the problematic response text
-                            if debug and session_dir:
-                                try:
-                                    error_file = os.path.join(session_dir, f"batch{batch_idx+1}_refinement_error_attempt_{attempt+1}.txt")
-                                    with open(error_file, "w", encoding="utf-8") as f_err:
-                                        f_err.write("=== ERROR ===\n")
-                                        f_err.write(str(json_error))
-                                        f_err.write("\n\n=== LLM RESPONSE ===\n")
-                                        f_err.write(llm_response_text)
-                                except Exception as log_e:
-                                    logger.error(f"Error writing refinement error log: {log_e}")
-                            continue
-                        else:
-                            logger.error(f"Failed to parse refinement JSON after {max_attempts} attempts: {str(json_error)}.")
-                            break  # Will trigger the fallback splitting mechanism
-
-                except Exception as e:
-                    if attempt < max_attempts - 1:
-                        logger.warning(f"Refinement API error: {str(e)}, retrying ({attempt+1}/{max_attempts})...")
-                    else:
-                        logger.error(f"Failed to get refinement after {max_attempts} attempts due to API errors.")
-                        break  # Will trigger the fallback splitting mechanism
-            
             # If refinement failed for this batch and it has more than one chunk, try splitting the batch
             if not refinement_success and len(batch) > 1 and depth < max_depth:
                 logger.warning(f"Refinement failed for batch {batch_idx+1} at depth {depth}. Splitting batch and retrying...")
@@ -3373,51 +3295,43 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
             )
         
         logger.debug(f"Built adjustment prompt (length: {len(prompt)} chars)")
-        logger.debug(f"Starting LLM adjustment attempts (max: {max_attempts})")
 
         response_text = ""
-        for attempt in range(max_attempts):
-            try:
-                logger.debug(f"Attempt {attempt + 1}/{max_attempts}: Calling refinement LLM...")
-                response = self.refinement_llm.complete(prompt)
-                response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
-                self._record_llm_cost(
-                    self.refinement_llm_provider,
-                    self.refinement_model_name,
-                    prompt,
-                    response_text,
-                    response,
-                    category="refinement",
-                )
-                
-                if not response_text:
-                    logger.warning(f"Attempt {attempt + 1}: Empty response from LLM")
-                    continue
+        try:
+            logger.debug("Calling refinement LLM for length adjustment...")
+            response = robust_llm_call(self.refinement_llm.complete, prompt)
+            response_text = response.text.strip() if hasattr(response, "text") else str(response).strip()
+            self._record_llm_cost(
+                self.refinement_llm_provider,
+                self.refinement_model_name,
+                prompt,
+                response_text,
+                response,
+                category="refinement",
+            )
 
-                logger.debug(f"Attempt {attempt + 1}: Received response (length: {len(response_text)} chars)")
-                logger.debug(f"Response preview: '{response_text[:100]}{'...' if len(response_text) > 100 else ''}'")
+            if not response_text:
+                raise ValueError("Empty response from LLM")
 
-                try:
-                    repaired = json_repair.loads(response_text)
-                    adjusted = repaired.get("text") if isinstance(repaired, dict) else None
-                    if adjusted and isinstance(adjusted, str) and adjusted.strip():
-                        logger.debug(f"Successfully parsed adjusted text (length: {len(adjusted)} chars)")
-                        logger.debug(f"Adjusted text: '{adjusted[:100]}{'...' if len(adjusted) > 100 else ''}'")
-                        logger.debug(f"Length change: {len(original_text)} → {len(adjusted)} chars (ratio: {len(adjusted)/len(original_text):.2f})")
-                        return adjusted.strip()
-                    else:
-                        logger.warning(f"Attempt {attempt + 1}: Parsed JSON but no valid 'text' field")
-                except Exception as parse_exc:
-                    logger.debug(f"Attempt {attempt + 1}: JSON parsing failed: {parse_exc}")
-                    # Try a naive fallback: if response looks like raw text without JSON
-                    if response_text and response_text.lstrip().startswith("{") is False:
-                        logger.debug(f"Using raw response text as fallback (length: {len(response_text)} chars)")
-                        return response_text
-            except Exception as api_exc:
-                logger.warning(f"Attempt {attempt + 1}: API error: {api_exc}")
-                # Retry on transient issues
-                continue
+            logger.debug(f"Received response (length: {len(response_text)} chars)")
+            logger.debug(f"Response preview: '{response_text[:100]}{'...' if len(response_text) > 100 else ''}'")
 
-        # Fallback
-        logger.warning(f"All {max_attempts} adjustment attempts failed, returning original text")
+            repaired = json_repair.loads(response_text)
+            adjusted = repaired.get("text") if isinstance(repaired, dict) else None
+            if adjusted and isinstance(adjusted, str) and adjusted.strip():
+                logger.debug(f"Successfully parsed adjusted text (length: {len(adjusted)} chars)")
+                logger.debug(f"Adjusted text: '{adjusted[:100]}{'...' if len(adjusted) > 100 else ''}'")
+                logger.debug(f"Length change: {len(original_text)} → {len(adjusted)} chars (ratio: {len(adjusted)/len(original_text):.2f})")
+                return adjusted.strip()
+            else:
+                logger.warning("Parsed JSON but no valid 'text' field")
+        except Exception as exc:
+            logger.warning(f"Length adjustment failed: {exc}")
+            # Try a naive fallback: if response looks like raw text without JSON
+            if response_text and not response_text.lstrip().startswith("{"):
+                logger.debug(f"Using raw response text as fallback (length: {len(response_text)} chars)")
+                return response_text
+
+        logger.warning("Length adjustment failed, returning original text")
+        return original_text
         return original_text

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 from ..database.session import get_db
 from ..database.models import Project, Segment, Job, JobType, JobStatus, ProjectStatus, generate_job_id
-from ..models.schemas import JobResponse
+from ..models.schemas import JobResponse, QueueAutoResponse
 from ..services.project_manager import ProjectManager
 from ..services.job_dispatch import enqueue_transcription_job
 from ..workers.tasks import dub_project, retranslate_project
@@ -33,6 +33,9 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
+    if project.status == ProjectStatus.DOWNLOADING:
+        raise HTTPException(status_code=409, detail="Video download is still in progress")
+
     # Check if project has a video
     pm = ProjectManager(project_id)
     source_video = pm.get_source_video_path()
@@ -50,6 +53,49 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
         )
     
     return enqueue_transcription_job(db, project, allow_existing=True)
+
+
+@router.post("/{project_id}/process/queue-auto", response_model=QueueAutoResponse, status_code=202)
+async def queue_auto_process(project_id: str, db: Session = Depends(get_db)):
+    """Queue a project for automatic processing once media is available.
+
+    Sets the autoProcess flag. If the project already has a source video and
+    is in DRAFT status, transcription is started immediately. Otherwise the
+    project will auto-start when the upload/download finishes.
+    """
+    db.expire_all()
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Set autoProcess flag
+    config = dict(project.config) if project.config else {}
+    config["autoProcess"] = True
+    project.config = config
+    flag_modified(project, "config")
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # If media is already available, start immediately
+    pm = ProjectManager(project_id)
+    source_video = pm.get_source_video_path()
+    if project.status == ProjectStatus.DRAFT and source_video and source_video.exists():
+        job = enqueue_transcription_job(db, project, allow_existing=False)
+        return QueueAutoResponse(
+            queued=False,
+            started=True,
+            jobId=job.jobId,
+            projectId=project_id,
+            status=project.status.value,
+        )
+
+    return QueueAutoResponse(
+        queued=True,
+        started=False,
+        projectId=project_id,
+        status=project.status.value,
+    )
 
 
 @router.post("/{project_id}/process/retranslate", response_model=JobResponse, status_code=202)
@@ -367,6 +413,14 @@ async def stop_processing(project_id: str, db: Session = Depends(get_db)):
     ).all()
     
     if not active_jobs:
+        # Still clear any queued auto-processing intent even if nothing is running
+        config = dict(project.config) if project.config else {}
+        if config.get("autoProcess"):
+            config["autoProcess"] = False
+            project.config = config
+            flag_modified(project, "config")
+            project.updated_at = datetime.now(timezone.utc)
+            db.commit()
         return {"message": "No active processing to stop", "stopped": False}
     
     stopped_count = 0
@@ -386,8 +440,18 @@ async def stop_processing(project_id: str, db: Session = Depends(get_db)):
         project.status = ProjectStatus.TRANSCRIBED
     elif project.status == ProjectStatus.TRANSCRIBING:
         project.status = ProjectStatus.DRAFT
-    
+    elif project.status == ProjectStatus.DOWNLOADING:
+        project.status = ProjectStatus.DRAFT
+
+    # Clear queued auto-processing intent
+    config = dict(project.config) if project.config else {}
+    if config.get("autoProcess"):
+        config["autoProcess"] = False
+        project.config = config
+        flag_modified(project, "config")
+
     project.updated_at = datetime.now(timezone.utc)
     db.commit()
+
     
     return {"message": f"Stopped {stopped_count} job(s)", "stopped": True}

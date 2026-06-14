@@ -41,6 +41,7 @@ The UI is the main workflow for interactive use:
 
 - Project list with persistent project state.
 - Batch upload and background upload progress.
+- **URL download**: paste links from YouTube and other yt-dlp-supported sites, choose quality, and download through the backend.
 - Presets: `fast`, `hq`, and `ultra`.
 - Server-side API key management.
 - Live processing logs and progress via SSE.
@@ -51,7 +52,7 @@ The UI is the main workflow for interactive use:
 
 The backend exposes `FastAPI` routes under `/api/v1`:
 
-- Project workflow: create projects, upload videos, update config, transcribe, edit segments, dub, download.
+- Project workflow: create projects, upload videos, download videos from URLs, update config, transcribe, edit segments, dub, download.
 - One-shot workflow: `POST /api/v1/translate` uploads a video and starts the full pipeline.
 - Status: polling through job status endpoints or live SSE through `/projects/{projectId}/status`.
 - Resources: voices, personas, languages, presets, settings, thumbnails, frames, reports, and artifacts.
@@ -175,7 +176,7 @@ The frontend proxies `/api` to `API_URL`; the backend defaults to port `8000`.
 ## UI Workflow
 
 1. Open the project dashboard.
-2. Upload one or more videos.
+2. Upload one or more videos, or paste a video URL (YouTube, Vimeo, TikTok, and other yt-dlp-supported sites) and pick a download quality.
 3. Choose source/target language and a preset:
    - `fast` - Faster, simpler TTS, 720p output.
    - `hq` - Balanced default, Gemini TTS, 1080p output.

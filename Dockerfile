@@ -17,7 +17,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     build-essential \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno (required JS runtime for yt-dlp YouTube challenge solving)
+ARG DENO_VERSION=v2.3.0
+RUN curl -fsSL https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
+    && unzip -o /tmp/deno.zip -d /usr/local/bin \
+    && rm /tmp/deno.zip \
+    && chmod +x /usr/local/bin/deno \
+    && deno --version
 
 # Set work directory
 WORKDIR /app

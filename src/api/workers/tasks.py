@@ -345,6 +345,98 @@ def update_project_status(project_id: str, status: ProjectStatus) -> None:
         db.close()
 
 
+@celery_app.task(bind=True, name="src.api.workers.tasks.download_project_video")
+def download_project_video(self, project_id: str, job_id: str, url: str, quality: str) -> Dict[str, Any]:
+    """Download source video from a URL using yt-dlp."""
+    from ..services.video_download import download_video_from_url, VideoDownloadError
+    from ..services.job_dispatch import enqueue_transcription_job
+
+    update_job_status(job_id, JobStatus.PROCESSING)
+    update_project_status(project_id, ProjectStatus.DOWNLOADING)
+    update_job_progress(job_id, 0, "initialization", "Starting video download")
+
+    try:
+        from ..services.cookies_manager import get_effective_cookies_path
+        cookies_path = get_effective_cookies_path()
+        add_job_log(job_id, f"Downloading from URL: {url}", "info")
+        add_job_log(job_id, f"Requested quality: {quality}", "info")
+        add_job_log(job_id, f"Cookies file: {cookies_path or 'not configured'}", "info")
+
+        def progress_callback(percent: int, step: str) -> None:
+            update_job_progress(job_id, percent, "downloading", step)
+
+        def log_callback(message: str, log_type: str = "info") -> None:
+            add_job_log(job_id, message, log_type)
+
+        downloaded = download_video_from_url(
+            url,
+            project_id,
+            quality=quality,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
+
+        db = get_db_session(fresh=True)
+        try:
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project:
+                raise ValueError(f"Project {project_id} not found")
+
+            project.source_file = str(downloaded.upload_path)
+            project.source_filename = downloaded.safe_filename
+            project.source_size = downloaded.file_size
+            project.updated_at = datetime.now(timezone.utc)
+
+            config_data = project.config or {}
+            auto_process = bool(config_data.get("autoProcess"))
+
+            db.commit()
+        finally:
+            db.close()
+
+        update_job_progress(job_id, 100, "complete", f"Downloaded {downloaded.safe_filename}")
+        update_job_status(job_id, JobStatus.COMPLETED)
+
+        if auto_process:
+            update_project_status(project_id, ProjectStatus.TRANSCRIBING)
+            db = get_db_session(fresh=True)
+            try:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if project:
+                    enqueue_transcription_job(db, project, allow_existing=False)
+            finally:
+                db.close()
+            return {
+                "status": "success",
+                "filename": downloaded.safe_filename,
+                "size": downloaded.file_size,
+                "title": downloaded.title,
+                "auto_process": True,
+            }
+
+        update_project_status(project_id, ProjectStatus.DRAFT)
+        return {
+            "status": "success",
+            "filename": downloaded.safe_filename,
+            "size": downloaded.file_size,
+            "title": downloaded.title,
+            "auto_process": False,
+        }
+
+    except SoftTimeLimitExceeded:
+        update_job_status(job_id, JobStatus.FAILED, "Download timed out")
+        update_project_status(project_id, ProjectStatus.ERROR)
+        raise
+    except VideoDownloadError as exc:
+        update_job_status(job_id, JobStatus.FAILED, exc.detail)
+        update_project_status(project_id, ProjectStatus.ERROR)
+        raise
+    except Exception as exc:
+        update_job_status(job_id, JobStatus.FAILED, str(exc))
+        update_project_status(project_id, ProjectStatus.ERROR)
+        raise
+
+
 def _save_processing_stats(project_id: str, job_id: str, total_cost: float) -> None:
     """Save processing statistics to project config."""
     db = get_db_session()

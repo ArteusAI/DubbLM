@@ -20,6 +20,10 @@ from ..utils.progress_utils import tqdm_progress_callback
 logger = get_logger(__name__)
 
 
+class NoAudioStreamError(RuntimeError):
+    """Raised when a video file does not contain any audio stream."""
+
+
 class AudioProcessor:
     """Handles audio extraction and processing for the Smart Dubbing system."""
     
@@ -60,6 +64,15 @@ class AudioProcessor:
         self.performance_tracker.start_timing("extract_audio")
         
         audio_file = "artifacts/audio/source.wav"
+
+        # Guard against video files with no audio track so downstream code does
+        # not fail with cryptic pydub index errors.
+        if not self._has_audio_stream(video_path):
+            logger.error(f"No audio stream found in {video_path}")
+            self.performance_tracker.end_timing("extract_audio")
+            raise NoAudioStreamError(
+                f"Video file has no audio stream: {video_path}"
+            )
         
         # Set the total duration first
         self._determine_video_duration(video_path, start_time, duration)
@@ -87,8 +100,9 @@ class AudioProcessor:
             duration_str = f"for {duration}s" if duration is not None else "to the end"
             logger.debug(f"Extracted audio segment {start_str} {duration_str} to {audio_file}")
         else:
-            # Extract full audio
-            audio = AudioSegment.from_file(video_path, format="mp4")
+            # Extract full audio. Let pydub autodetect the container instead of
+            # forcing mp4, which breaks webm/mkv sources.
+            audio = AudioSegment.from_file(video_path)
             audio.export(audio_file, format="wav")
             logger.debug(f"Extracted full audio to {audio_file}")
         
@@ -96,6 +110,28 @@ class AudioProcessor:
         self.performance_tracker.end_timing("extract_audio")
         
         return audio_file
+    
+    def _has_audio_stream(self, video_path: str) -> bool:
+        """Return True if the file contains at least one audio stream."""
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-of", "default=noprint_wrappers=1",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            return b"audio" in result.stdout.lower()
+        except Exception as exc:
+            logger.warning(f"Could not probe audio streams for {video_path}: {exc}")
+            return False
     
     def _determine_video_duration(self, video_path: str, start_time: Optional[float] = None, 
                                  duration: Optional[float] = None) -> None:

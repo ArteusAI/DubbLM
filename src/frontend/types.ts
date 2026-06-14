@@ -60,6 +60,7 @@ export interface PresetConfig {
 
 export type ProjectStatus = 
   | 'draft'
+  | 'downloading'
   | 'transcribing'
   | 'transcribed'
   | 'dubbing'
@@ -226,6 +227,11 @@ export interface Project {
   // Upload state
   isUploading?: boolean;
   uploadProgress?: number;
+  
+  // Download state
+  isDownloading?: boolean;
+  downloadProgress?: number;
+  downloadStage?: string;
   
   // Processing state
   isAutoProcessing?: boolean;

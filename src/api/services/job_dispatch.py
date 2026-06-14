@@ -8,6 +8,56 @@ from ..database.models import Job, JobType, JobStatus, Project, ProjectStatus, g
 from ..models.schemas import JobResponse
 
 
+def enqueue_download_job(
+    db: Session,
+    project: Project,
+    url: str,
+    quality: str = "best",
+) -> JobResponse:
+    """Create and dispatch a video download job for a project."""
+    active_job = db.query(Job).filter(
+        Job.project_id == project.id,
+        Job.job_type == JobType.DOWNLOAD,
+        Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+    ).first()
+    if active_job:
+        return JobResponse(
+            jobId=active_job.id,
+            status=active_job.status.value,
+            projectId=project.id,
+            type="download",
+            progress=active_job.progress,
+            currentStep=active_job.current_step,
+        )
+
+    job = Job(
+        id=generate_job_id("download"),
+        project_id=project.id,
+        job_type=JobType.DOWNLOAD,
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+
+    project.status = ProjectStatus.DOWNLOADING
+    project.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    from ..workers.tasks import download_project_video
+
+    task = download_project_video.delay(project.id, job.id, url, quality)
+    job.celery_task_id = task.id
+    db.commit()
+
+    return JobResponse(
+        jobId=job.id,
+        status="processing",
+        projectId=project.id,
+        type="download",
+        progress=0,
+        currentStep="pending",
+    )
+
+
 def enqueue_transcription_job(
     db: Session,
     project: Project,

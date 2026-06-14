@@ -3,7 +3,7 @@
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 
 from ..services.settings_service import (
     get_settings_masked,
@@ -13,6 +13,12 @@ from ..services.settings_service import (
     get_defaults,
     mask_api_key,
     API_KEY_PROVIDERS,
+)
+from ..services.cookies_manager import (
+    save_cookies_file,
+    delete_cookies_file,
+    has_cookies_file,
+    get_effective_cookies_path,
 )
 from ..services.preset_service import get_frontend_preset_config, get_frontend_preset_configs
 
@@ -112,3 +118,49 @@ async def get_presets():
 async def get_preset(preset: str):
     """Get one preset defaults resolved from dubbing_config.yml."""
     return get_frontend_preset_config(preset)
+
+
+@router.post("/cookies")
+async def upload_cookies(file: UploadFile = File(...)):
+    """Upload a cookies.txt file for video download authentication.
+
+    The file is stored globally and used automatically by yt-dlp for URL downloads.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a filename")
+
+    if not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Cookies file must be a .txt file")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Cookies file is empty")
+
+    save_cookies_file(content)
+
+    return {
+        "message": "Cookies file uploaded successfully",
+        "filename": file.filename,
+        "size": len(content),
+    }
+
+
+@router.get("/cookies")
+async def get_cookies_status():
+    """Check whether a cookies file is configured for video downloads."""
+    cookies_path = get_effective_cookies_path()
+    return {
+        "configured": has_cookies_file(),
+        "path": str(cookies_path) if cookies_path else None,
+        "source": "uploaded" if cookies_path and cookies_path.name == "cookies.txt" and "cookies" in str(cookies_path) else "env",
+    }
+
+
+@router.delete("/cookies")
+async def remove_cookies():
+    """Delete the globally uploaded cookies file."""
+    deleted = delete_cookies_file()
+    return {
+        "message": "Cookies file deleted" if deleted else "No uploaded cookies file to delete",
+        "deleted": deleted,
+    }

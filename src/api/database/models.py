@@ -28,6 +28,7 @@ class Base(DeclarativeBase):
 class ProjectStatus(str, enum.Enum):
     """Project status enumeration."""
     DRAFT = "draft"
+    DOWNLOADING = "downloading"
     TRANSCRIBING = "transcribing"
     TRANSCRIBED = "transcribed"
     DUBBING = "dubbing"
@@ -37,6 +38,7 @@ class ProjectStatus(str, enum.Enum):
 
 class JobType(str, enum.Enum):
     """Job type enumeration."""
+    DOWNLOAD = "download"
     TRANSCRIBE = "transcribe"
     DUB = "dub"
     PREVIEW = "preview"

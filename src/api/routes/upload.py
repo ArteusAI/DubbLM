@@ -9,6 +9,7 @@ from ..database.session import get_db
 from ..database.models import Project
 from ..models.schemas import UploadResponse
 from ..services.video_upload import save_project_video
+from ..services.job_dispatch import enqueue_transcription_job
 from ..config import get_settings
 
 router = APIRouter(prefix="/projects", tags=["upload"])
@@ -38,6 +39,11 @@ async def upload_video(
     project.source_size = saved_video.file_size
     project.updated_at = datetime.now(timezone.utc)
     db.commit()
+
+    # If the user queued auto-processing while uploading, start transcription now
+    config = project.config or {}
+    if config.get("autoProcess"):
+        enqueue_transcription_job(db, project, allow_existing=False)
 
     return UploadResponse(
         url=f"/api/v1/projects/{project_id}/video",

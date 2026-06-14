@@ -12,8 +12,56 @@ from sqlalchemy.orm import Session
 from ..database.session import get_db
 from ..database.models import Project, ProjectStatus
 from ..services.project_manager import ProjectManager
+from ..services.job_dispatch import enqueue_download_job
+from ..services.video_download import VideoDownloadError, validate_video_url, get_video_info
+from ..models.schemas import VideoDownloadRequest, VideoDownloadResponse, VideoInfoResponse
 
 router = APIRouter(prefix="/projects", tags=["download"])
+
+
+@router.post("/{project_id}/download-url", response_model=VideoDownloadResponse)
+async def download_video_from_url(
+    project_id: str,
+    request: VideoDownloadRequest,
+    db: Session = Depends(get_db),
+):
+    """Start downloading a video from a URL into an existing project."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status not in (ProjectStatus.DRAFT, ProjectStatus.ERROR):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot start download for project in '{project.status.value}' status",
+        )
+
+    try:
+        url = validate_video_url(request.url)
+        job_response = enqueue_download_job(db, project, url, request.quality)
+    except VideoDownloadError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    return VideoDownloadResponse(
+        url=f"/api/v1/projects/{project_id}/video",
+        filename=project.source_filename or "",
+        size=project.source_size or 0,
+        title=None,
+        jobId=job_response.jobId,
+        status=job_response.status,
+        projectId=project_id,
+    )
+
+
+@router.post("/video-info", response_model=VideoInfoResponse)
+async def fetch_video_info(request: VideoDownloadRequest):
+    """Retrieve video metadata (title, duration, uploader) from a URL without downloading."""
+    try:
+        url = validate_video_url(request.url)
+        info = get_video_info(url)
+        return VideoInfoResponse(**info)
+    except VideoDownloadError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def _resolve_result_video_path(project_id: str, project: Project) -> Path:

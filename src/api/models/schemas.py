@@ -273,6 +273,40 @@ class UploadResponse(BaseModel):
     size: int
 
 
+class VideoDownloadRequest(BaseModel):
+    """Schema for downloading a video from a URL."""
+    url: str = Field(..., min_length=1, description="Video URL supported by yt-dlp")
+    quality: Literal["best", "1080p", "720p", "480p"] = "best"
+
+
+class VideoDownloadResponse(BaseModel):
+    """Schema for video download start response."""
+    url: str
+    filename: str
+    size: int
+    title: Optional[str] = None
+    jobId: str
+    status: str
+    projectId: str
+
+
+class VideoInfoResponse(BaseModel):
+    """Schema for video metadata retrieved from a URL."""
+    url: str
+    title: Optional[str] = None
+    duration: Optional[int] = None
+    uploader: Optional[str] = None
+
+
+class QueueAutoResponse(BaseModel):
+    """Schema for queueing auto-processing on a project."""
+    queued: bool
+    started: bool
+    jobId: Optional[str] = None
+    projectId: str
+    status: str
+
+
 # --- Job Schemas ---
 
 class JobResponse(BaseModel):

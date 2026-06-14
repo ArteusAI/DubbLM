@@ -36,6 +36,7 @@ from src.utils.speaker_gender import (
     normalize_speaker_metadata_map,
 )
 from src.utils.voice_matcher import VoiceMatcher
+from src.utils.llm_call import robust_llm_call
 from pydantic import BaseModel, Field
 from src.dubbing.core.log_config import get_logger
 from src.dubbing.tts_styles import TTS_STYLE_PROMPTS
@@ -450,7 +451,7 @@ Return ONLY the enriched version of the CURRENT text with markup tags. Do not ad
             logger.debug(f"Emotion enrichment: Calling API with model {self.config.emotion_enrichment_model}")
 
             # Call Gemini API for text enrichment using llama_index (same as translator)
-            response = self.llm.complete(prompt)
+            response = robust_llm_call(self.llm.complete, prompt)
 
             logger.debug(f"Emotion enrichment: Response received - type: {type(response)}, has text: {hasattr(response, 'text') if response else False}")
 
@@ -1922,6 +1923,14 @@ class GeminiTTSWrapper(TTSInterface):
                 current_model = self.api_client.current_model
 
                 final_text = text_to_synthesize
+                
+                # Append trailing pause tag to single segment text if not present to prevent model cutoff
+                text_stripped = text_to_synthesize.strip()
+                if text_stripped and not text_stripped.endswith("]") and not text_stripped.endswith(")"):
+                    text_for_prompt = text_stripped + " [short pause]"
+                else:
+                    text_for_prompt = text_stripped
+
                 style_hint = self._get_style_prompt_for_speaker(speaker_id, segment_data)
                 prompt_parts: List[str] = []
                 if self.config.prompt_prefix:
@@ -1929,7 +1938,9 @@ class GeminiTTSWrapper(TTSInterface):
                 if style_hint:
                     prompt_parts.append(style_hint)
                 if prompt_parts:
-                    final_text = self._build_tts_prompt(prompt_parts, text_to_synthesize)
+                    final_text = self._build_tts_prompt(prompt_parts, text_for_prompt)
+                else:
+                    final_text = text_for_prompt
 
                 logger.debug(f"  TTS Synthesis for [{speaker_id}]:")
                 logger.debug(f"    Voice: {voice_name}")
@@ -2269,7 +2280,14 @@ class GeminiTTSWrapper(TTSInterface):
         if style_lines:
             preamble_parts.append("\n".join(style_lines))
 
-        transcript_lines = [f"{seg.speaker}: {seg.text.strip()}" for seg in batch]
+        # Append trailing pause tags to separate turns and prevent clipping
+        transcript_lines = []
+        for seg in batch:
+            text = str(seg.text).strip()
+            if text and not text.endswith("]") and not text.endswith(")"):
+                text = text + " [short pause]"
+            transcript_lines.append(f"{seg.speaker}: {text}")
+
         return self._build_tts_prompt(preamble_parts, "\n".join(transcript_lines))
 
     def _synthesize_multi_speaker_batch(
@@ -2414,11 +2432,39 @@ class GeminiTTSWrapper(TTSInterface):
                     start_ms = int(best.start_ms)
                     end_ms = int(best.end_ms)
 
+                    # Dynamic padding to prevent clipping of initial/trailing phonemes
+                    default_start_padding = 50  # ms
+                    default_end_padding = 150   # ms
+
+                    sorted_keys = sorted(best_per_line.keys())
+                    k = sorted_keys.index(local_i)
+                    
+                    # Safe start padding
+                    if k > 0:
+                        prev_key = sorted_keys[k - 1]
+                        prev_end = int(best_per_line[prev_key].end_ms)
+                        gap = max(0, start_ms - prev_end)
+                        start_pad = min(default_start_padding, gap // 2)
+                    else:
+                        start_pad = default_start_padding
+
+                    # Safe end padding
+                    if k < len(sorted_keys) - 1:
+                        next_key = sorted_keys[k + 1]
+                        next_start = int(best_per_line[next_key].start_ms)
+                        gap = max(0, next_start - end_ms)
+                        end_pad = min(default_end_padding, gap // 2)
+                    else:
+                        end_pad = default_end_padding
+
+                    padded_start_ms = max(0, start_ms - start_pad)
+                    padded_end_ms = end_ms + end_pad
+
                     wav_bytes = self.diarizer.slice_audio(batch_wav_path, [SpeakerSegment(
                         index=local_i,
                         speaker=str(seg.speaker),
-                        start_ms=start_ms,
-                        end_ms=end_ms,
+                        start_ms=padded_start_ms,
+                        end_ms=padded_end_ms,
                         asr_text=str(best.asr_text or "").strip(),
                         matched_line_idx=local_i,
                         matched_text=str(seg.text).strip(),
@@ -2471,8 +2517,8 @@ class GeminiTTSWrapper(TTSInterface):
 
                     duration = AudioFileUtils.get_audio_duration_seconds(Path(slice_path)) or 0.0
                     diarized_segment = DiarizationSegment(
-                        start_time=float(start_ms) / 1000.0,
-                        end_time=float(end_ms) / 1000.0,
+                        start_time=0.0,
+                        end_time=duration,
                         speaker=str(seg.speaker),
                         text=str(seg.text),
                         confidence=1.0,
