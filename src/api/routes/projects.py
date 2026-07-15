@@ -97,6 +97,14 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
         "sourceFile": project.source_file,
         "sourceFilename": project.source_filename,
         "sourceSize": project.source_size,
+        "sourceWidth": project.source_width,
+        "sourceHeight": project.source_height,
+        "sourceDuration": project.source_duration,
+        "resultSize": project.result_size,
+        "resultWidth": project.result_width,
+        "resultHeight": project.result_height,
+        "resultDuration": project.result_duration,
+        "totalSize": project.total_size,
     }
     
     if include_segments:

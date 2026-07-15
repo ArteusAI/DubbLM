@@ -408,6 +408,35 @@ class ApiClient {
     return `${this.baseUrl}/projects/${projectId}/download/video`;
   }
 
+  async startVideoClip(
+    projectId: string,
+    start: number,
+    end: number,
+    quality: ClipQuality,
+  ): Promise<ClipJobStartResponse> {
+    const qs = new URLSearchParams({
+      start: String(start),
+      end: String(end),
+      quality,
+    }).toString();
+    return this.request<ClipJobStartResponse>(
+      `/projects/${projectId}/download/video/clip?${qs}`,
+      { method: 'POST' },
+    );
+  }
+
+  async getVideoClipStatus(projectId: string, jobId: string): Promise<ClipJobStatusResponse> {
+    return this.request<ClipJobStatusResponse>(`/projects/${projectId}/download/video/clip/${jobId}/status`);
+  }
+
+  getVideoClipResultUrl(projectId: string, jobId: string): string {
+    return `${this.baseUrl}/projects/${projectId}/download/video/clip/${jobId}/result`;
+  }
+
+  async cancelVideoClip(projectId: string, jobId: string): Promise<void> {
+    await this.request(`/projects/${projectId}/download/video/clip/${jobId}`, { method: 'DELETE' });
+  }
+
   getStreamVideoUrl(projectId: string): string {
     return `${this.baseUrl}/projects/${projectId}/stream/video`;
   }
@@ -605,12 +634,20 @@ export interface ProjectListResponse {
   updatedAt: string;
   config: ProjectConfig;
   speakerGenderTranslationStale?: boolean;
-}
-
-export interface ProjectResponse extends ProjectListResponse {
   sourceFile?: string;
   sourceFilename?: string;
   sourceSize?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  sourceDuration?: number;
+  resultSize?: number;
+  resultWidth?: number;
+  resultHeight?: number;
+  resultDuration?: number;
+  totalSize?: number;
+}
+
+export interface ProjectResponse extends ProjectListResponse {
   segments?: SegmentResponse[];
 }
 
@@ -674,6 +711,22 @@ export interface VideoInfoResponse {
 }
 
 export type DownloadQuality = 'best' | '1080p' | '720p' | '480p';
+
+export type ClipQuality = '720p' | '1080p' | 'original' | 'messenger';
+
+export interface ClipJobStartResponse {
+  jobId: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  progress: number;
+}
+
+export interface ClipJobStatusResponse {
+  jobId: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  progress: number;
+  error?: string | null;
+  downloadName?: string;
+}
 
 export interface JobResponse {
   jobId: string;
@@ -762,6 +815,9 @@ export interface PreviewStatusResponse {
 export interface ProjectStatsResponse {
   processingTimeSec: number;
   totalCost: number;
+  resultDuration?: number;
+  resultWidth?: number;
+  resultHeight?: number;
 }
 
 export interface ProjectReportResponse {

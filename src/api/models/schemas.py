@@ -161,6 +161,14 @@ class ProjectResponse(BaseModel):
     sourceFile: Optional[str] = None
     sourceFilename: Optional[str] = None
     sourceSize: Optional[int] = None
+    sourceWidth: Optional[int] = None
+    sourceHeight: Optional[int] = None
+    sourceDuration: Optional[float] = None
+    resultSize: Optional[int] = None
+    resultWidth: Optional[int] = None
+    resultHeight: Optional[int] = None
+    resultDuration: Optional[float] = None
+    totalSize: Optional[int] = None
     segments: Optional[List["SegmentResponse"]] = None
 
 
@@ -173,6 +181,17 @@ class ProjectListResponse(BaseModel):
     updatedAt: datetime
     config: ProjectConfig = Field(default_factory=ProjectConfig)
     speakerGenderTranslationStale: bool = False
+    sourceFile: Optional[str] = None
+    sourceFilename: Optional[str] = None
+    sourceSize: Optional[int] = None
+    sourceWidth: Optional[int] = None
+    sourceHeight: Optional[int] = None
+    sourceDuration: Optional[float] = None
+    resultSize: Optional[int] = None
+    resultWidth: Optional[int] = None
+    resultHeight: Optional[int] = None
+    resultDuration: Optional[float] = None
+    totalSize: Optional[int] = None
 
 
 # --- Segment Schemas ---

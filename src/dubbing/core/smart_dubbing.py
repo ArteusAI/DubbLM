@@ -1221,6 +1221,24 @@ class SmartDubbing:
             if cache_path.exists():
                 continue
 
+            # Reject outputs that are effectively empty (a lone WAV header or a
+            # truncated write). Persisting them would poison the pipeline cache
+            # and later surface as a silent segment in the final mix.
+            try:
+                if os.path.getsize(output_path) < 1000:
+                    logger.warning(
+                        f"Prepass ({tts_system}): skipping persist of segment "
+                        f"{task['segment_index'] + 1} — output too small "
+                        f"({os.path.getsize(output_path)} bytes, likely no audio data)."
+                    )
+                    continue
+            except OSError as size_exc:
+                logger.warning(
+                    f"Prepass ({tts_system}): cannot size output for segment "
+                    f"{task['segment_index'] + 1}: {size_exc}"
+                )
+                continue
+
             try:
                 os.makedirs(cache_path.parent, exist_ok=True)
                 shutil.copy(output_path, cache_path)
@@ -1618,11 +1636,29 @@ class SmartDubbing:
             force_resynth = segment_dict.get("force_resynthesize", False)
             if self.cache_manager.use_cache and not force_resynth:
                 cached_path_to_use = None
+                # Minimum on-disk size for a cache entry to be considered valid. A
+                # WAV that is just the 44-byte header (or a truncated write below
+                # ~1 KB) carries no samples and would render as silence in the mix;
+                # treat such entries as misses and re-synthesize instead of
+                # propagating the gap.
+                MIN_CACHE_WAV_BYTES = 1000
                 for text_variant in candidate_texts:
                     candidate_key = make_cache_key(text_variant)
                     candidate_path = segment_cache_path / f"{candidate_key}.wav"
                     if candidate_path.exists():
                         try:
+                            if os.path.getsize(candidate_path) < MIN_CACHE_WAV_BYTES:
+                                logger.warning(
+                                    f"Segment {segment_index + 1}: cache entry "
+                                    f"{candidate_path.name} is only "
+                                    f"{os.path.getsize(candidate_path)} bytes — ignoring stale "
+                                    f"or truncated cache and re-synthesizing."
+                                )
+                                try:
+                                    os.remove(candidate_path)
+                                except OSError:
+                                    pass
+                                continue
                             cached_audio_info = AudioSegment.from_file(candidate_path)
                             if len(cached_audio_info) > 0:
                                 cached_path_to_use = candidate_path

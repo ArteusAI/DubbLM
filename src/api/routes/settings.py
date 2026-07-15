@@ -1,9 +1,14 @@
 """Settings management routes."""
 
+import io
+import os
+from pathlib import Path
 from typing import Dict, Any, Optional
-from pydantic import BaseModel
+import zipfile
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from ..services.settings_service import (
     get_settings_masked,
@@ -164,3 +169,66 @@ async def remove_cookies():
         "message": "Cookies file deleted" if deleted else "No uploaded cookies file to delete",
         "deleted": deleted,
     }
+
+
+# Define the default extension directory relative to this file
+EXTENSION_DIR = Path(__file__).resolve().parents[3] / "extension"
+
+
+@router.get("/extension/download")
+async def download_extension(request: Request):
+    """Download the Chrome extension packaged as a ZIP, with the correct API URL and Bearer Token pre-configured."""
+    if not EXTENSION_DIR.exists() or not EXTENSION_DIR.is_dir():
+        raise HTTPException(status_code=404, detail="Extension source folder not found")
+
+    # Determine the external API URL. If referer is present, parse it to preserve the original port
+    referer = request.headers.get("referer")
+    if referer:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                external_api_url = f"{parsed.scheme}://{parsed.netloc}"
+            else:
+                external_api_url = str(request.base_url).rstrip("/")
+        except Exception:
+            external_api_url = str(request.base_url).rstrip("/")
+    else:
+        external_api_url = str(request.base_url).rstrip("/")
+
+    api_token = os.getenv("DUBBLM_API_TOKEN") or os.getenv("API_TOKEN") or ""
+
+    # Create in-memory ZIP file
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_path in EXTENSION_DIR.glob("**/*"):
+            if file_path.is_file():
+                content = file_path.read_bytes()
+                relative_path = file_path.relative_to(EXTENSION_DIR)
+                
+                # Perform dynamic injection for config.js
+                if file_path.name == "config.js":
+                    try:
+                        content_str = content.decode("utf-8")
+                        # Inject the actual base URL
+                        content_str = content_str.replace(
+                            'serverUrl: "http://localhost:8000"', 
+                            f'serverUrl: "{external_api_url}"'
+                        )
+                        # Inject the actual Bearer token
+                        content_str = content_str.replace(
+                            'apiToken: ""',
+                            f'apiToken: "{api_token}"'
+                        )
+                        content = content_str.encode("utf-8")
+                    except Exception:
+                        pass
+                
+                zip_file.writestr(str(relative_path), content)
+
+    zip_buffer.seek(0)
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=dubblm-extension.zip"}
+    )

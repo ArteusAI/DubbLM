@@ -9,6 +9,7 @@ import tempfile
 import shutil
 import hashlib
 import math
+import uuid
 from pathlib import Path
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1508,6 +1509,7 @@ class GeminiTTSWrapper(TTSInterface):
 
         part_paths: List[str] = []
         model_used: Optional[str] = None
+        all_parts_ok = True
         try:
             for part_index, part_text in enumerate((first_text, second_text)):
                 part_path = f"{temp_output_path}_split{split_depth}_part{part_index}.wav"
@@ -1528,13 +1530,25 @@ class GeminiTTSWrapper(TTSInterface):
                     )
                     return None
 
-                if not part_ok or not os.path.exists(part_path):
+                if not os.path.exists(part_path):
+                    # Child could not produce any audio at all — split is unusable.
                     logger.warning(
-                        f"Sentence-split part {part_index + 1}/2 did not pass validation for "
+                        f"Sentence-split part {part_index + 1}/2 produced no audio for "
                         f"{segment_data.speaker}."
                     )
                     return None
 
+                if not part_ok:
+                    # Child saved its best-attempt audio at part_path but it did not
+                    # pass validation. Keep it rather than discarding the whole split:
+                    # a best-effort tail is better than silence (which is what the
+                    # previous behaviour effectively produced by returning None and
+                    # eventually failing the entire segment).
+                    logger.warning(
+                        f"Sentence-split part {part_index + 1}/2 using best-attempt "
+                        f"(validation failed) for {segment_data.speaker}."
+                    )
+                    all_parts_ok = False
                 part_paths.append(part_path)
                 if part_model:
                     model_used = part_model
@@ -1550,12 +1564,13 @@ class GeminiTTSWrapper(TTSInterface):
                 actual_model=model_used or primary_model_name,
                 attempts=attempts_counter[0],
                 used_fallback=False,
-                success=True,
+                success=all_parts_ok,
                 duration_seconds=time.perf_counter() - synth_start_ts,
                 output_path=temp_output_path,
                 group_id=report_group_id,
+                error=None if all_parts_ok else "sentence-split used best-attempt parts",
             ))
-            return text, model_used or primary_model_name, True
+            return text, model_used or primary_model_name, all_parts_ok
         finally:
             for part_path in part_paths:
                 if part_path != temp_output_path and os.path.exists(part_path):
@@ -1913,7 +1928,14 @@ class GeminiTTSWrapper(TTSInterface):
                 logger.debug(f"Emotion enrichment: Disabled in config")
 
         for attempt in range(max_retries):
-            temp_attempt_path = f"{temp_output_path}_attempt_{self.api_client.current_model}_{attempt}.wav"
+            # Include a unique suffix so rephrase cycles (which restart `attempt`
+            # at 0) and recursive sentence-split calls cannot collide with the
+            # parent frame's `primary_best` path. Earlier the names reused
+            # `{temp_output_path}_attempt_{model}_{attempt}.wav` across rephrase
+            # cycles, so a later cycle could overwrite/remove a file the caller
+            # still referenced via `primary_best["path"]`, causing a FileNotFoundError
+            # when the caller tried `shutil.move(primary_best["path"], ...)`.
+            temp_attempt_path = f"{temp_output_path}_attempt_{self.api_client.current_model}_{attempt}_{uuid.uuid4().hex[:8]}.wav"
             if attempts_counter is not None:
                 attempts_counter[0] += 1
 

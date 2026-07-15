@@ -90,6 +90,18 @@ class Project(Base):
     source_file = Column(String(512), nullable=True)
     source_filename = Column(String(255), nullable=True)
     source_size = Column(Integer, nullable=True)
+    source_width = Column(Integer, nullable=True)
+    source_height = Column(Integer, nullable=True)
+    source_duration = Column(Float, nullable=True)
+
+    # Result (dubbed) video info
+    result_size = Column(Integer, nullable=True)
+    result_width = Column(Integer, nullable=True)
+    result_height = Column(Integer, nullable=True)
+    result_duration = Column(Float, nullable=True)
+
+    # Cached total project size on disk (uploads + artifacts + cache + results)
+    total_size = Column(Integer, nullable=True)
     
     # Configuration stored as JSON
     config = Column(JSON, default=dict)

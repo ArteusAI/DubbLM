@@ -1,13 +1,57 @@
-import React, { useState, useEffect } from 'react';
-import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X, Maximize2, Minimize2, Scissors, Loader2, ExternalLink, AlertCircle, XCircle } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import api, { ProjectStatsResponse } from '../api';
+import api, { ProjectStatsResponse, ClipQuality, ClipJobStatusResponse } from '../api';
 
 interface ResultViewProps {
   projectId: string;
   onReset: () => void;
 }
+
+interface PersistedClipJob {
+  jobId: string;
+  start: number;
+  end: number;
+  quality: ClipQuality;
+  startedAt: number;
+}
+
+const CLIP_JOB_STORAGE_TTL = 3600_000; // 1h
+const CLIP_POLL_INTERVAL = 1500;
+
+const clipJobStorageKey = (projectId: string) => `dubblm_clip_job_${projectId}`;
+
+const loadPersistedClipJob = (projectId: string): PersistedClipJob | null => {
+  try {
+    const raw = localStorage.getItem(clipJobStorageKey(projectId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedClipJob;
+    if (Date.now() - parsed.startedAt > CLIP_JOB_STORAGE_TTL) {
+      localStorage.removeItem(clipJobStorageKey(projectId));
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const persistClipJob = (projectId: string, job: PersistedClipJob) => {
+  try {
+    localStorage.setItem(clipJobStorageKey(projectId), JSON.stringify(job));
+  } catch {
+    // ignore
+  }
+};
+
+const clearPersistedClipJob = (projectId: string) => {
+  try {
+    localStorage.removeItem(clipJobStorageKey(projectId));
+  } catch {
+    // ignore
+  }
+};
 
 interface ReportArtifactLink {
   label: string;
@@ -312,6 +356,41 @@ const formatTime = (seconds: number): string => {
   return `${hours}h ${remainingMins}m`;
 };
 
+const parseTimecode = (value: string): number => {
+  const trimmed = value.trim();
+  if (!trimmed) return 0;
+  const parts = trimmed.split(':').map((p) => p.trim());
+  if (parts.some((p) => p === '' || !/^\d+(\.\d+)?$/.test(p))) return NaN;
+  const nums = parts.map(Number);
+  if (nums.length === 1) return nums[0];
+  if (nums.length === 2) return nums[0] * 60 + nums[1];
+  if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
+  return NaN;
+};
+
+const formatTimecode = (seconds: number): string => {
+  if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  if (hours > 0) return `${pad(hours)}:${pad(mins)}:${pad(secs)}`;
+  return `${pad(mins)}:${pad(secs)}`;
+};
+
+const CLIP_QUALITY_OPTIONS: Array<{ value: ClipQuality; label: string; note?: string }> = [
+  { value: '720p', label: '720p' },
+  { value: '1080p', label: '1080p' },
+  { value: 'original', label: 'Original' },
+  { value: 'messenger', label: 'Msg 480p' },
+];
+
+const formatResolution = (w?: number, h?: number): string | null => {
+  if (!w || !h) return null;
+  return `${w}×${h}`;
+};
+
 export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) => {
   const [stats, setStats] = useState<ProjectStatsResponse | null>(null);
   const [reportMd, setReportMd] = useState<string | null>(null);
@@ -319,6 +398,22 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
   const [reportError, setReportError] = useState<string | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [isReportOpen, setIsReportOpen] = useState(false);
+  const [isVideoZoomed, setIsVideoZoomed] = useState(false);
+  const [isClipPopupOpen, setIsClipPopupOpen] = useState(false);
+  const [clipStart, setClipStart] = useState(0);
+  const [clipEnd, setClipEnd] = useState(0);
+  const [clipStartInput, setClipStartInput] = useState('00:00');
+  const [clipEndInput, setClipEndInput] = useState('00:30');
+  const [clipQuality, setClipQuality] = useState<ClipQuality>('1080p');
+  const [clipPlacement, setClipPlacement] = useState<'top' | 'bottom'>('bottom');
+  const [clipJobId, setClipJobId] = useState<string | null>(null);
+  const [clipStatus, setClipStatus] = useState<ClipJobStatusResponse | null>(null);
+  const [clipError, setClipError] = useState<string | null>(null);
+  const clipPollRef = useRef<number | null>(null);
+  const isClipRendering = clipJobId !== null && clipStatus?.status !== 'failed';
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const clipButtonRef = useRef<HTMLDivElement>(null);
+  const videoDuration = stats?.resultDuration ?? 0;
 
   const streamVideoUrl = api.getStreamVideoUrl(projectId);
   const downloadVideoUrl = api.getDownloadVideoUrl(projectId);
@@ -385,10 +480,169 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
     document.body.removeChild(link);
   };
 
+  const stopClipPolling = useCallback(() => {
+    if (clipPollRef.current !== null) {
+      window.clearInterval(clipPollRef.current);
+      clipPollRef.current = null;
+    }
+  }, []);
+
+  const resetClipJobState = useCallback(() => {
+    stopClipPolling();
+    setClipJobId(null);
+    setClipStatus(null);
+    setClipError(null);
+    clearPersistedClipJob(projectId);
+  }, [projectId, stopClipPolling]);
+
+  const pollClipJob = useCallback((jobId: string) => {
+    stopClipPolling();
+    clipPollRef.current = window.setInterval(async () => {
+      try {
+        const s = await api.getVideoClipStatus(projectId, jobId);
+        setClipStatus(s);
+        if (s.status === 'completed') {
+          stopClipPolling();
+        } else if (s.status === 'failed') {
+          stopClipPolling();
+          setClipError(s.error || 'Render failed');
+          clearPersistedClipJob(projectId);
+        }
+      } catch (err) {
+        stopClipPolling();
+        const msg = err instanceof Error ? err.message : 'Polling failed';
+        setClipStatus(null);
+        setClipError(msg);
+        clearPersistedClipJob(projectId);
+      }
+    }, CLIP_POLL_INTERVAL);
+  }, [projectId, stopClipPolling]);
+
+  // On mount: resume an in-flight clip job saved before refresh.
+  useEffect(() => {
+    const persisted = loadPersistedClipJob(projectId);
+    if (!persisted) return;
+    setClipJobId(persisted.jobId);
+    setClipStart(persisted.start);
+    setClipEnd(persisted.end);
+    setClipStartInput(formatTimecode(persisted.start));
+    setClipEndInput(formatTimecode(persisted.end));
+    setClipQuality(persisted.quality);
+    setIsClipPopupOpen(true);
+    api.getVideoClipStatus(projectId, persisted.jobId)
+      .then((s) => {
+        setClipStatus(s);
+        if (s.status === 'completed' || s.status === 'processing' || s.status === 'queued') {
+          if (s.status !== 'completed') pollClipJob(persisted.jobId);
+        } else if (s.status === 'failed') {
+          setClipError(s.error || 'Render failed');
+          clearPersistedClipJob(projectId);
+        }
+      })
+      .catch(() => {
+        // Backend lost the job (restart). Forget it.
+        setClipJobId(null);
+        setClipError('Previous render job no longer available. Please start again.');
+        clearPersistedClipJob(projectId);
+      });
+    return () => stopClipPolling();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  const openClipPopup = () => {
+    const current = videoRef.current?.currentTime ?? 0;
+    const start = Math.floor(current);
+    const maxEnd = videoDuration > 0 ? videoDuration : start + 30;
+    const end = Math.min(start + 30, maxEnd);
+    // If a job is already in flight, keep its state instead of resetting.
+    if (!clipJobId) {
+      setClipStart(start);
+      setClipEnd(Math.max(end, start + 1));
+      setClipStartInput(formatTimecode(start));
+      setClipEndInput(formatTimecode(Math.max(end, start + 1)));
+      setClipQuality('1080p');
+    }
+    setClipError(null);
+    setIsClipPopupOpen(true);
+  };
+
+  useEffect(() => {
+    if (!isClipPopupOpen || !clipButtonRef.current) return;
+    const rect = clipButtonRef.current.getBoundingClientRect();
+    const viewportH = window.innerHeight;
+    const spaceBelow = viewportH - rect.bottom;
+    const spaceAbove = rect.top;
+    setClipPlacement(spaceBelow < spaceAbove ? 'top' : 'bottom');
+  }, [isClipPopupOpen]);
+
+  const handleClipStartChange = (value: string) => {
+    setClipStartInput(value);
+    const parsed = parseTimecode(value);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      setClipStart(parsed);
+    }
+  };
+
+  const handleClipEndChange = (value: string) => {
+    setClipEndInput(value);
+    const parsed = parseTimecode(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      setClipEnd(parsed);
+    }
+  };
+
+  const isClipValid = Number.isFinite(clipStart) && Number.isFinite(clipEnd) && clipEnd > clipStart;
+  const clipDuration = isClipValid ? clipEnd - clipStart : 0;
+
+  const handleDownloadClip = async () => {
+    if (!isClipValid || clipJobId) return;
+    setClipError(null);
+    setClipStatus(null);
+    try {
+      const res = await api.startVideoClip(projectId, clipStart, clipEnd, clipQuality);
+      setClipJobId(res.jobId);
+      setClipStatus({ jobId: res.jobId, status: res.status, progress: res.progress });
+      persistClipJob(projectId, {
+        jobId: res.jobId,
+        start: clipStart,
+        end: clipEnd,
+        quality: clipQuality,
+        startedAt: Date.now(),
+      });
+      pollClipJob(res.jobId);
+    } catch (err) {
+      setClipError(err instanceof Error ? err.message : 'Failed to start render');
+    }
+  };
+
+  const handleCancelClip = async () => {
+    if (!clipJobId) return;
+    try {
+      await api.cancelVideoClip(projectId, clipJobId);
+    } catch {
+      // ignore — backend may have already cleaned up
+    }
+    resetClipJobState();
+  };
+
+  const handleDownloadClipResult = () => {
+    if (!clipJobId) return;
+    const url = api.getVideoClipResultUrl(projectId, clipJobId);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = clipStatus?.downloadName || `clip_${clipStart.toFixed(0)}-${clipEnd.toFixed(0)}_${clipQuality}.mp4`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    // Result endpoint removes the file after serving; forget the job.
+    resetClipJobState();
+  };
+
   const reportContent = reportMd ? splitReportContent(reportMd, reportApiCosts.length > 0) : null;
 
   return (
     <div className="relative flex h-full w-full flex-col items-center justify-center space-y-8 p-6">
+      {!isVideoZoomed && (
       <div className="text-center space-y-4 max-w-lg">
         <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-emerald-500/10 mb-4 ring-1 ring-emerald-500/50">
           <CheckCircle className="w-10 h-10 text-emerald-500" />
@@ -413,25 +667,204 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
           </div>
         )}
       </div>
+      )}
 
-      <div className="w-full max-w-3xl bg-black rounded-xl overflow-hidden aspect-video border border-zinc-800 shadow-2xl">
-        <video 
+      <div className={`relative w-full bg-black rounded-xl overflow-hidden border border-zinc-800 shadow-2xl ${
+        isVideoZoomed ? 'max-w-6xl max-h-[80vh] flex-shrink-0' : 'max-w-3xl aspect-video'
+      }`}>
+        <video
+          ref={videoRef}
           src={streamVideoUrl}
           controls
           preload="metadata"
           playsInline
-          className="w-full h-full"
+          className={isVideoZoomed ? 'w-full h-auto max-h-[80vh] block' : 'w-full h-full'}
         />
+        <button
+          type="button"
+          onClick={() => setIsVideoZoomed((z) => !z)}
+          className="absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-black/50 text-zinc-300 backdrop-blur-md transition-all hover:bg-black/70 hover:text-white"
+          aria-label={isVideoZoomed ? 'Shrink video' : 'Expand video'}
+          title={isVideoZoomed ? 'Shrink video' : 'Expand video'}
+        >
+          {isVideoZoomed ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+        </button>
       </div>
 
       <div className="flex flex-row justify-center gap-3">
-        <button 
-          onClick={handleDownloadVideo}
-          className="flex items-center justify-center gap-2 px-6 py-3 bg-brand-600 hover:bg-brand-500 text-white rounded-xl font-bold shadow-lg shadow-brand-500/20 transition-all active:scale-95"
-        >
-          <Download className="w-5 h-5" />
-          Download Video
-        </button>
+        <div className="relative flex" ref={clipButtonRef}>
+          <button 
+            onClick={handleDownloadVideo}
+            className="flex items-center justify-center gap-2 px-6 py-3 bg-brand-600 hover:bg-brand-500 text-white rounded-l-xl font-bold shadow-lg shadow-brand-500/20 transition-all active:scale-95 rounded-r-none"
+          >
+            <Download className="w-5 h-5" />
+            Download Video
+          </button>
+          <button
+            type="button"
+            onClick={openClipPopup}
+            className="flex items-center justify-center w-9 px-0 py-3 bg-brand-600 hover:bg-brand-500 text-white rounded-r-xl border-l border-brand-700/60 font-bold shadow-lg shadow-brand-500/20 transition-all active:scale-95 rounded-l-none"
+            aria-label="Download a clip"
+            title="Download a clip"
+            aria-expanded={isClipPopupOpen}
+          >
+            <Scissors className="w-4 h-4" />
+          </button>
+
+          {isClipPopupOpen && (
+            <>
+              <div
+                className="fixed inset-0 z-30"
+                onClick={() => { setIsClipPopupOpen(false); if (!clipJobId) setClipError(null); }}
+                aria-hidden="true"
+              />
+              <div
+                className={`absolute right-0 z-40 w-72 max-h-[80vh] overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900 p-3 shadow-2xl ${
+                  clipPlacement === 'top' ? 'bottom-full mb-1' : 'top-full mt-1'
+                }`}
+              >
+                <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-white">
+                  <Scissors className="h-4 w-4 text-brand-400" />
+                  <span>Download Clip</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="block">
+                    <span className="mb-1 block text-[10px] uppercase tracking-wide text-zinc-500">Start</span>
+                    <input
+                      type="text"
+                      value={clipStartInput}
+                      onChange={(e) => handleClipStartChange(e.target.value)}
+                      placeholder="MM:SS"
+                      className="w-full rounded-lg border border-zinc-700/50 bg-zinc-950 px-2 py-1.5 text-xs text-white focus:ring-1 focus:ring-brand-500/50 focus:outline-none"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="mb-1 block text-[10px] uppercase tracking-wide text-zinc-500">End</span>
+                    <input
+                      type="text"
+                      value={clipEndInput}
+                      onChange={(e) => handleClipEndChange(e.target.value)}
+                      placeholder="MM:SS"
+                      className="w-full rounded-lg border border-zinc-700/50 bg-zinc-950 px-2 py-1.5 text-xs text-white focus:ring-1 focus:ring-brand-500/50 focus:outline-none"
+                    />
+                  </label>
+                </div>
+                <div className="mt-1 text-[10px] text-zinc-500">
+                  Format: HH:MM:SS or MM:SS
+                  {videoDuration > 0 && <> · Video length: {formatTimecode(videoDuration)}</>}
+                </div>
+                <div className="mt-1 text-[11px] text-zinc-400">
+                  Duration: {formatTimecode(clipDuration)}{!isClipValid && <span className="ml-2 text-red-400">Invalid range</span>}
+                </div>
+                <div className="mt-3">
+                  <span className="mb-1 block text-[10px] uppercase tracking-wide text-zinc-500">Quality</span>
+                  <div className="grid grid-cols-2 gap-1">
+                    {CLIP_QUALITY_OPTIONS.map((opt) => {
+                      const isOriginal = opt.value === 'original';
+                      const note = isOriginal
+                        ? formatResolution(stats?.resultWidth, stats?.resultHeight)
+                        : opt.note;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setClipQuality(opt.value)}
+                          className={`flex flex-col items-center rounded-lg px-2 py-1.5 text-[11px] font-medium transition-all ${
+                            clipQuality === opt.value
+                              ? 'bg-brand-600 text-white'
+                              : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                          }`}
+                        >
+                          <span>{opt.label}</span>
+                          {note && (
+                            <span className={`text-[9px] font-normal leading-tight ${
+                              clipQuality === opt.value ? 'text-white/70' : 'text-zinc-500'
+                            }`}>
+                              {isOriginal ? `source ${note}` : note}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                {clipJobId && clipStatus?.status !== 'failed' ? (
+                  <div className="mt-3 rounded-lg border border-zinc-700/60 bg-zinc-950 p-3">
+                    {clipStatus?.status === 'completed' ? (
+                      <>
+                        <div className="flex items-center justify-center gap-2 text-xs font-semibold text-emerald-400">
+                          <CheckCircle className="h-3.5 w-3.5" />
+                          <span>Clip ready!</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleDownloadClipResult}
+                          className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-brand-600 px-3 py-2 text-xs font-bold text-white transition-all hover:bg-brand-500"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                          Download Clip
+                        </button>
+                        <button
+                          type="button"
+                          onClick={resetClipJobState}
+                          className="mt-1.5 w-full text-center text-[10px] text-zinc-500 transition-colors hover:text-zinc-300"
+                        >
+                          Dismiss &amp; render another
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center justify-center gap-2 text-xs font-medium text-zinc-200">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-400" />
+                          <span>Rendering clip on server…</span>
+                          {clipStatus && clipStatus.progress > 0 && (
+                            <span className="text-zinc-500">{clipStatus.progress.toFixed(0)}%</span>
+                          )}
+                        </div>
+                        <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                          <div
+                            className="h-full rounded-full bg-brand-500 transition-all duration-300"
+                            style={{ width: `${Math.min(100, Math.max(0, clipStatus?.progress ?? 0))}%` }}
+                          />
+                        </div>
+                        <p className="mt-1.5 text-center text-[10px] text-zinc-500">
+                          Re-encoding can take several minutes. You may refresh the page — render continues in background.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={handleCancelClip}
+                          className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-zinc-800 px-3 py-1.5 text-[11px] font-medium text-zinc-300 transition-all hover:bg-zinc-700"
+                        >
+                          <XCircle className="h-3 w-3" />
+                          Cancel render
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleDownloadClip}
+                    disabled={!isClipValid}
+                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-brand-600 px-3 py-2 text-xs font-bold text-white transition-all hover:bg-brand-500 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    Render &amp; Download Clip
+                  </button>
+                )}
+                {clipError && (
+                  <div className="mt-2 flex items-start gap-1.5 rounded-lg border border-red-500/30 bg-red-500/10 p-2 text-[11px] text-red-300">
+                    <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                    <span className="break-words">{clipError}</span>
+                  </div>
+                )}
+                {!clipJobId && !clipError && (
+                  <p className="mt-1.5 text-center text-[10px] text-zinc-500">Clip is re-encoded on the server (may take several minutes).</p>
+                )}
+              </div>
+            </>
+          )}
+        </div>
         <button 
           onClick={() => handleDownloadSubtitles('source')}
           className="flex items-center justify-center gap-2 px-4 py-3 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl font-medium transition-all"

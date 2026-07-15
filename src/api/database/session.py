@@ -1,8 +1,8 @@
 """Database session management."""
 
 from pathlib import Path
-from typing import Generator
-from sqlalchemy import create_engine
+from typing import Generator, List
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -76,6 +76,41 @@ def init_db() -> None:
     """Initialize the database and create all tables."""
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    _ensure_project_columns(engine)
+
+
+# Columns added to the `projects` table after initial release. Each entry is
+# (column_name, SQL type declaration for SQLite ALTER TABLE ADD COLUMN).
+_PROJECT_EXTRA_COLUMNS: List[tuple] = [
+    ("source_width", "INTEGER"),
+    ("source_height", "INTEGER"),
+    ("source_duration", "REAL"),
+    ("result_size", "INTEGER"),
+    ("result_width", "INTEGER"),
+    ("result_height", "INTEGER"),
+    ("result_duration", "REAL"),
+    ("total_size", "INTEGER"),
+]
+
+
+def _ensure_project_columns(engine) -> None:
+    """Add new columns to the `projects` table if missing.
+
+    SQLite supports `ALTER TABLE ... ADD COLUMN` for nullable columns without
+    defaults, so existing rows are unaffected. This is idempotent and acts as
+    a lightweight migration in the absence of a migration framework.
+    """
+    inspector = inspect(engine)
+    if "projects" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("projects")}
+    with engine.begin() as conn:
+        for col_name, col_type in _PROJECT_EXTRA_COLUMNS:
+            if col_name not in existing:
+                conn.execute(
+                    text(f'ALTER TABLE projects ADD COLUMN "{col_name}" {col_type}')
+                )
 
 
 def get_db() -> Generator[Session, None, None]:

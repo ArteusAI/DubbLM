@@ -9,6 +9,8 @@ from ..database.session import get_db
 from ..database.models import Project
 from ..models.schemas import UploadResponse
 from ..services.video_upload import save_project_video
+from ..services.video_info import probe_video, compute_project_size
+from ..services.project_manager import ProjectManager
 from ..services.job_dispatch import enqueue_transcription_job
 from ..config import get_settings
 
@@ -37,6 +39,16 @@ async def upload_video(
     project.source_file = str(saved_video.upload_path)
     project.source_filename = saved_video.safe_filename
     project.source_size = saved_video.file_size
+
+    # Probe resolution/duration of the source video
+    probe = probe_video(saved_video.upload_path)
+    project.source_width = probe["width"]
+    project.source_height = probe["height"]
+    project.source_duration = probe["duration"]
+
+    # Refresh total project size on disk
+    project.total_size = compute_project_size(ProjectManager(project_id))
+
     project.updated_at = datetime.now(timezone.utc)
     db.commit()
 

@@ -231,6 +231,14 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
     videoFile: null,
     sourceFilename: p.sourceFilename,
     sourceSize: p.sourceSize,
+    sourceWidth: p.sourceWidth,
+    sourceHeight: p.sourceHeight,
+    sourceDuration: p.sourceDuration,
+    resultSize: p.resultSize,
+    resultWidth: p.resultWidth,
+    resultHeight: p.resultHeight,
+    resultDuration: p.resultDuration,
+    totalSize: p.totalSize,
     processProgress: 0,
     speakerGenderTranslationStale: p.speakerGenderTranslationStale || false,
   };
@@ -578,6 +586,13 @@ const App: React.FC = () => {
       const created = await api.createProject(projectName);
       const project = mapProjectFromApi(created);
 
+      // Store downloadUrl and downloadQuality in config locally first
+      project.config = {
+        ...project.config,
+        downloadUrl: trimmedUrl,
+        downloadQuality: quality
+      };
+
       // Sync default config to backend immediately
       await api.updateProjectConfig(project.id, buildProjectConfigPayload(project.config));
 
@@ -594,6 +609,39 @@ const App: React.FC = () => {
     } catch (err) {
       console.error('Failed to start URL download:', err);
       setError(err instanceof Error ? err.message : 'Failed to start download');
+    }
+  };
+
+  const handleRetryDownload = async (projectId: string) => {
+    try {
+      const project = projects.find(p => p.id === projectId);
+      if (!project) return;
+
+      const downloadUrl = project.config?.downloadUrl;
+      const downloadQuality = project.config?.downloadQuality || 'best';
+
+      if (!downloadUrl) {
+        setError('No download URL found for this project');
+        return;
+      }
+
+      setProjects(prev => prev.map(p =>
+        p.id === projectId
+          ? {
+              ...p,
+              status: 'downloading' as ProjectStatus,
+              isDownloading: true,
+              downloadProgress: 0,
+              downloadStage: 'Retrying download with new cookies...',
+              error: undefined,
+            }
+          : p
+      ));
+
+      await api.downloadVideoFromUrl(projectId, downloadUrl, downloadQuality);
+    } catch (err) {
+      console.error('Failed to retry download:', err);
+      setError(err instanceof Error ? err.message : 'Failed to retry download');
     }
   };
 
@@ -1471,6 +1519,7 @@ const App: React.FC = () => {
             onDeleteProject={handleDeleteProject}
             onBatchUpload={handleBatchUpload}
             onDownloadFromUrl={handleDownloadFromUrl}
+            onRetryDownload={handleRetryDownload}
             onAutoProcess={handleAutoProcess}
             onStopProcess={handleStopProcess}
             onResetAndRestart={handleResetAndRestart}

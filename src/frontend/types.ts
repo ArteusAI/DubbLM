@@ -223,6 +223,14 @@ export interface Project {
   videoFile: File | null;
   sourceFilename?: string;
   sourceSize?: number;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  sourceDuration?: number;
+  resultSize?: number;
+  resultWidth?: number;
+  resultHeight?: number;
+  resultDuration?: number;
+  totalSize?: number;
   
   // Upload state
   isUploading?: boolean;

@@ -385,6 +385,16 @@ def download_project_video(self, project_id: str, job_id: str, url: str, quality
             project.source_file = str(downloaded.upload_path)
             project.source_filename = downloaded.safe_filename
             project.source_size = downloaded.file_size
+
+            # Probe resolution/duration of downloaded source video
+            from ..services.video_info import probe_video, compute_project_size
+
+            probe = probe_video(downloaded.upload_path)
+            project.source_width = probe["width"]
+            project.source_height = probe["height"]
+            project.source_duration = probe["duration"]
+            project.total_size = compute_project_size(ProjectManager(project_id))
+
             project.updated_at = datetime.now(timezone.utc)
 
             config_data = project.config or {}
@@ -1275,7 +1285,29 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         
         # Save processing stats and clear autoProcess flag
         _save_processing_stats(project_id, job_id, total_cost)
-        
+
+        # Persist result video resolution/duration/size and refresh total project size
+        try:
+            from ..services.video_info import probe_video, compute_project_size, file_size
+
+            result_path = Path(output_video_path)
+            if result_path.exists():
+                probe = probe_video(result_path)
+                db = get_db_session(fresh=True)
+                try:
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    if project:
+                        project.result_width = probe["width"]
+                        project.result_height = probe["height"]
+                        project.result_duration = probe["duration"]
+                        project.result_size = file_size(result_path)
+                        project.total_size = compute_project_size(ProjectManager(project_id))
+                        db.commit()
+                finally:
+                    db.close()
+        except Exception as result_probe_exc:
+            logger.warning("Failed to probe result video for %s: %s", project_id, result_probe_exc)
+
         # Clear autoProcess flag
         db = get_db_session()
         try:

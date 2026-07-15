@@ -14,6 +14,7 @@ from ..database.session import get_db
 from ..database.models import Project, Segment, Job, JobType, JobStatus, ProjectStatus, generate_job_id
 from ..models.schemas import JobResponse, QueueAutoResponse
 from ..services.project_manager import ProjectManager
+from ..services.video_info import compute_project_size
 from ..services.job_dispatch import enqueue_transcription_job
 from ..workers.tasks import dub_project, retranslate_project
 from ..workers.celery_app import celery_app
@@ -214,6 +215,12 @@ async def restart_processing(project_id: str, db: Session = Depends(get_db)):
     project.config = config
     flag_modified(project, "config")
     project.status = ProjectStatus.DRAFT
+    # Result artifacts wiped above — clear cached result metadata and refresh size
+    project.result_size = None
+    project.result_width = None
+    project.result_height = None
+    project.result_duration = None
+    project.total_size = compute_project_size(pm)
     project.updated_at = datetime.now(timezone.utc)
     db.commit()
 

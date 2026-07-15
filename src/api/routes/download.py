@@ -1,11 +1,17 @@
 """Download routes for results."""
 
+import asyncio
 import json
+import logging
 import mimetypes
+import subprocess
+import tempfile
+import time
+import uuid
 from pathlib import Path
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
 
@@ -17,6 +23,30 @@ from ..services.video_download import VideoDownloadError, validate_video_url, ge
 from ..models.schemas import VideoDownloadRequest, VideoDownloadResponse, VideoInfoResponse
 
 router = APIRouter(prefix="/projects", tags=["download"])
+
+logger = logging.getLogger(__name__)
+
+
+CLIP_QUALITY_PRESETS = {
+    "720p": {"max_height": 720, "crf": 20},
+    "1080p": {"max_height": 1080, "crf": 19},
+    "original": {"max_height": None, "crf": 18},
+    "messenger": {"max_height": 480, "crf": 28, "audio_bitrate": "96k"},
+}
+
+
+# In-memory store for clip rendering jobs (process-local; cleared on restart).
+CLIP_JOBS: dict[str, dict] = {}
+CLIP_JOB_TTL = 3600  # seconds to keep completed/failed jobs around
+
+
+def _gc_clip_jobs() -> None:
+    now = time.time()
+    expired = [jid for jid, j in CLIP_JOBS.items() if now - j.get("updated_at", 0) > CLIP_JOB_TTL]
+    for jid in expired:
+        job = CLIP_JOBS.pop(jid, None)
+        if job and job.get("output_path"):
+            _cleanup_clip_file(Path(job["output_path"]))
 
 
 @router.post("/{project_id}/download-url", response_model=VideoDownloadResponse)
@@ -38,6 +68,13 @@ async def download_video_from_url(
 
     try:
         url = validate_video_url(request.url)
+        # Store download url and quality in project.config
+        config = dict(project.config or {})
+        config["downloadUrl"] = url
+        config["downloadQuality"] = request.quality
+        project.config = config
+        db.commit()
+
         job_response = enqueue_download_job(db, project, url, request.quality)
     except VideoDownloadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -139,6 +176,238 @@ async def download_video(project_id: str, db: Session = Depends(get_db)):
         media_type="video/mp4",
         filename=video_path.name
     )
+
+
+def _cleanup_clip_file(file_path: Path) -> None:
+    try:
+        if file_path.exists():
+            file_path.unlink()
+    except OSError as exc:
+        logger.warning("Failed to remove clip file %s: %s", file_path, exc)
+
+
+async def _run_clip_render(job_id: str, cmd: list[str], out_path: Path, total_duration: float) -> None:
+    """Background task: run ffmpeg, parse -progress output, update CLIP_JOBS."""
+    job = CLIP_JOBS.get(job_id)
+    if not job:
+        return
+
+    job.update(
+        status="processing",
+        progress=0.0,
+        updated_at=time.time(),
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        job.update(status="failed", error=f"Failed to start ffmpeg: {exc}", updated_at=time.time())
+        _cleanup_clip_file(out_path)
+        return
+
+    job["process"] = proc
+
+    assert proc.stdout is not None
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if text.startswith("out_time_ms=") or text.startswith("out_time_us="):
+                try:
+                    us = int(text.split("=", 1)[1])
+                except ValueError:
+                    continue
+                seconds = us / 1_000_000
+                if total_duration > 0:
+                    pct = max(0.0, min(99.0, (seconds / total_duration) * 100.0))
+                    job.update(progress=pct, updated_at=time.time())
+    except Exception as exc:
+        logger.warning("clip %s progress read error: %s", job_id, exc)
+
+    try:
+        rc = await proc.wait()
+    except Exception as exc:
+        rc = -1
+        logger.warning("clip %s wait error: %s", job_id, exc)
+
+    stderr_tail = ""
+    if proc.stderr is not None:
+        try:
+            err_bytes = await proc.stderr.read()
+            stderr_tail = err_bytes.decode("utf-8", errors="replace")[-2000:]
+        except Exception:
+            pass
+
+    if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
+        job.update(status="completed", progress=100.0, updated_at=time.time())
+        logger.info("clip %s rendered successfully (%s bytes)", job_id, out_path.stat().st_size)
+    else:
+        _cleanup_clip_file(out_path)
+        job.update(
+            status="failed",
+            error=f"ffmpeg exited with rc={rc}. {stderr_tail[-500:]}" or "Render failed",
+            updated_at=time.time(),
+        )
+        logger.error("clip %s render failed rc=%s: %s", job_id, rc, stderr_tail[-500:])
+
+
+@router.post("/{project_id}/download/video/clip")
+async def start_video_clip(
+    project_id: str,
+    start: float = Query(..., ge=0),
+    end: float = Query(..., gt=0),
+    quality: str = Query("1080p", pattern="^(720p|1080p|original|messenger)$"),
+    db: Session = Depends(get_db),
+):
+    """Start rendering a re-encoded clip of the dubbed video. Returns a jobId for polling."""
+    _gc_clip_jobs()
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.status != ProjectStatus.DUBBED:
+        raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
+
+    video_path = _resolve_result_video_path(project_id, project)
+
+    duration = project.result_duration or 0.0
+    tolerance = 1.0
+    if duration > 0 and end > duration + tolerance:
+        raise HTTPException(status_code=400, detail=f"End time exceeds video duration ({duration:.2f}s)")
+    if end <= start:
+        raise HTTPException(status_code=400, detail="End time must be greater than start time")
+
+    pm = ProjectManager(project_id)
+    clips_dir = pm.cache_dir / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = uuid.uuid4().hex
+    out_path = clips_dir / f"{job_id}.mp4"
+    if out_path.exists():
+        out_path.unlink()
+
+    preset = CLIP_QUALITY_PRESETS[quality]
+    vf_args = []
+    if preset["max_height"] is not None:
+        vf_args = ["-vf", f"scale=-2:{preset['max_height']}:flags=lanczos"]
+
+    total_duration = max(0.1, end - start)
+
+    audio_bitrate = preset.get("audio_bitrate", "192k")
+    preset_name = "fast" if quality == "messenger" else "medium"
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-progress", "pipe:1",
+        "-nostats",
+        "-ss", f"{start:.3f}",
+        "-to", f"{end:.3f}",
+        "-i", str(video_path),
+        *vf_args,
+        "-c:v", "libx264",
+        "-crf", str(preset["crf"]),
+        "-preset", preset_name,
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    config = project.config or {}
+    target_lang = config.get("targetLang", "ru")
+    source = pm.get_source_video_path()
+    base_name = source.stem if source else project_id
+    download_name = f"{base_name}_{target_lang}_clip_{start:.1f}-{end:.1f}_{quality}.mp4"
+
+    CLIP_JOBS[job_id] = {
+        "status": "queued",
+        "progress": 0.0,
+        "error": None,
+        "output_path": str(out_path),
+        "download_name": download_name,
+        "project_id": project_id,
+        "start": start,
+        "end": end,
+        "quality": quality,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "process": None,
+    }
+
+    logger.info("Starting clip render job %s for project %s [%ss-%ss] quality=%s",
+                job_id, project_id, start, end, quality)
+    asyncio.create_task(_run_clip_render(job_id, cmd, out_path, total_duration))
+
+    return {"jobId": job_id, "status": "queued", "progress": 0.0}
+
+
+@router.get("/{project_id}/download/video/clip/{job_id}/status")
+async def get_video_clip_status(project_id: str, job_id: str, db: Session = Depends(get_db)):
+    """Poll clip render job status."""
+    _gc_clip_jobs()
+    job = CLIP_JOBS.get(job_id)
+    if not job or job.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="Clip job not found")
+    return {
+        "jobId": job_id,
+        "status": job["status"],
+        "progress": round(float(job.get("progress", 0.0)), 1),
+        "error": job.get("error"),
+        "downloadName": job.get("download_name"),
+    }
+
+
+@router.get("/{project_id}/download/video/clip/{job_id}/result")
+async def get_video_clip_result(
+    project_id: str,
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Download the rendered clip file (one-shot; file is removed after)."""
+    job = CLIP_JOBS.get(job_id)
+    if not job or job.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="Clip job not found")
+    if job["status"] != "completed":
+        raise HTTPException(status_code=409, detail=f"Clip not ready (status={job['status']})")
+
+    out_path = Path(job["output_path"])
+    if not out_path.exists():
+        job.update(status="failed", error="Result file no longer available", updated_at=time.time())
+        raise HTTPException(status_code=404, detail="Result file no longer available")
+
+    background_tasks.add_task(_cleanup_clip_file, out_path)
+    background_tasks.add_task(lambda: CLIP_JOBS.pop(job_id, None))
+    return FileResponse(
+        path=str(out_path),
+        media_type="video/mp4",
+        filename=job.get("download_name") or "clip.mp4",
+    )
+
+
+@router.delete("/{project_id}/download/video/clip/{job_id}")
+async def cancel_video_clip(project_id: str, job_id: str, db: Session = Depends(get_db)):
+    """Cancel a running clip render job (or forget a completed/failed one)."""
+    job = CLIP_JOBS.pop(job_id, None)
+    if not job:
+        raise HTTPException(status_code=404, detail="Clip job not found")
+    proc = job.get("process")
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    out_path = job.get("output_path")
+    if out_path:
+        _cleanup_clip_file(Path(out_path))
+    return {"ok": True}
 
 
 @router.get("/{project_id}/stream/video")
@@ -302,6 +571,9 @@ async def get_project_stats(project_id: str, db: Session = Depends(get_db)):
     return {
         "processingTimeSec": result_stats.get("processingTimeSec", 0),
         "totalCost": result_stats.get("totalCost", 0),
+        "resultDuration": project.result_duration or 0,
+        "resultWidth": project.result_width or 0,
+        "resultHeight": project.result_height or 0,
     }
 
 
