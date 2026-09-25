@@ -12,7 +12,8 @@ export enum TTSProvider {
   GEMINI = 'gemini',
   OPENAI = 'openai',
   COQUI = 'coqui',
-  MINIMAX = 'minimax'
+  MINIMAX = 'minimax',
+  OPENROUTER = 'openrouter'
 }
 
 export type PresetId = 'fast' | 'hq' | 'ultra';
@@ -49,8 +50,11 @@ export interface PresetConfig {
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  enableContextStyle?: boolean;
+  contextStyleMaxChars?: number;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  normalizeAudio?: boolean;
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: VideoQualityPreset;
   maxWorkers?: number;
@@ -168,6 +172,8 @@ export interface AppConfig {
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  enableContextStyle?: boolean;
+  contextStyleMaxChars?: number;
   contentValidatorProvider?: 'whisper' | 'assemblyai';
   contentValidatorWhisperModel?: string;
   contentValidatorWhisperComputeType?: string;
@@ -180,6 +186,7 @@ export interface AppConfig {
   // Audio extras
   dubbedVolume?: number;
   backgroundVolume?: number;
+  normalizeAudio?: boolean;
   keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: VideoQualityPreset;

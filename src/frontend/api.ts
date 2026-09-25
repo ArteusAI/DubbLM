@@ -17,29 +17,43 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    timeoutMs = 0
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`;
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
-    });
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
-    if (!response.ok) {
-      const error: ApiError = await response.json().catch(() => ({
-        detail: `HTTP ${response.status}: ${response.statusText}`,
-      }));
-      throw new Error(error.detail);
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller ? controller.signal : options.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+
+      if (!response.ok) {
+        const error: ApiError = await response.json().catch(() => ({
+          detail: `HTTP ${response.status}: ${response.statusText}`,
+        }));
+        throw new Error(error.detail);
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
+      }
+
+      return response.json();
+    } catch (err) {
+      if (controller?.signal.aborted) {
+        throw new Error('Request timed out');
+      }
+      throw err;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
     }
-
-    if (response.status === 204) {
-      return undefined as T;
-    }
-
-    return response.json();
   }
 
   // --- Projects ---
@@ -132,10 +146,14 @@ class ApiClient {
     url: string,
     quality: DownloadQuality = 'best'
   ): Promise<VideoInfoResponse> {
-    return this.request<VideoInfoResponse>(`/projects/video-info`, {
-      method: 'POST',
-      body: JSON.stringify({ url, quality }),
-    });
+    return this.request<VideoInfoResponse>(
+      `/projects/video-info`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ url, quality }),
+      },
+      45000
+    );
   }
 
   // --- Processing ---
@@ -408,6 +426,20 @@ class ApiClient {
     return `${this.baseUrl}/projects/${projectId}/download/video`;
   }
 
+  async getShareVideoLink(
+    projectId: string,
+    expiresIn?: number,
+  ): Promise<{
+    url: string;
+    expiresIn: number;
+    expiresAt: string;
+    filename: string;
+    key: string;
+  }> {
+    const qs = expiresIn != null ? `?expires_in=${expiresIn}` : '';
+    return this.request(`/projects/${projectId}/share/video${qs}`);
+  }
+
   async startVideoClip(
     projectId: string,
     start: number,
@@ -598,6 +630,8 @@ export interface ProjectConfig {
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  enableContextStyle?: boolean;
+  contextStyleMaxChars?: number;
   contentValidatorProvider?: 'whisper' | 'assemblyai';
   contentValidatorWhisperModel?: string;
   contentValidatorWhisperComputeType?: string;
@@ -605,6 +639,7 @@ export interface ProjectConfig {
   contentValidatorSpeechModel?: string;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  normalizeAudio?: boolean;
   keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: '720p' | '1080p' | 'original';
@@ -864,8 +899,11 @@ export interface PresetDefaultsResponse {
   voiceAutoSelection?: boolean;
   enableEmotionEnrichment?: boolean;
   enableContentValidation?: boolean;
+  enableContextStyle?: boolean;
+  contextStyleMaxChars?: number;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  normalizeAudio?: boolean;
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: '720p' | '1080p' | 'original';
   maxWorkers?: number;

@@ -152,10 +152,10 @@ class ProjectManager:
     def cleanup_artifacts(self, preserve_tts_cache: bool = False) -> None:
         """Remove only artifact files (keep uploads and optional TTS cache)."""
         if self.artifacts_dir.exists():
-            shutil.rmtree(self.artifacts_dir)
+            shutil.rmtree(self.artifacts_dir, ignore_errors=True)
         if self.cache_dir.exists():
             if not preserve_tts_cache:
-                shutil.rmtree(self.cache_dir)
+                shutil.rmtree(self.cache_dir, ignore_errors=True)
             else:
                 preserved_cache_dirs = {"segment_synthesis", "synthesized_speech"}
                 for input_dir in self.cache_dir.iterdir():

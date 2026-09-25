@@ -53,14 +53,19 @@ class SegmentOptimizer:
         """
         return len(self.encoding.encode(text))
 
+    # Gap (seconds) at or above which a merged pause is rendered as a long
+    # pause. The Gemini 3.8 prompting guide defines only <short pause> and
+    # <long pause> and does not specify durations, so this boundary is a
+    # project heuristic rather than a spec value.
+    LONG_PAUSE_GAP_SECONDS = 0.6
+
     def _get_translation_separator(self, gap: float) -> str:
         """
         Get separator for merged translation segments based on TTS system and gap duration.
 
-        For Gemini TTS, uses pause markers to create more natural speech:
-        - gap < 0.25s  → [short pause] (~250ms, similar to comma)
-        - 0.25s ≤ gap < 0.5s → [medium pause] (~500ms, similar to sentence break)
-        - gap ≥ 0.5s → [long pause] (~1000ms+, for dramatic effect)
+        Gemini 3.8 supports only two inline pause tags per the prompting guide:
+        ``[short pause]`` and ``[long pause]``. Legacy Gemini keeps the older
+        three-tag mapping (short/medium/long) used by earlier models.
 
         Args:
             gap: Time gap between segments in seconds
@@ -68,7 +73,12 @@ class SegmentOptimizer:
         Returns:
             Appropriate separator string
         """
-        # For Gemini TTS, use pause markers based on official spec
+        if self.tts_system == 'gemini38':
+            if gap < self.LONG_PAUSE_GAP_SECONDS:
+                return " [short pause] "
+            return " [long pause] "
+
+        # Legacy Gemini TTS (pre-3.8 models) uses short/medium/long markers.
         if self.tts_system == 'gemini':
             if gap < 0.25:
                 return " [short pause] "

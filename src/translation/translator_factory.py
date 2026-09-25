@@ -67,6 +67,7 @@ class TranslatorFactory:
             editor_reasoning_effort = kwargs.get("editor_reasoning_effort")
             tts_system = kwargs.get("tts_system")
             tts_system_mapping = kwargs.get("tts_system_mapping")
+            tts_model = kwargs.get("tts_model")
             
             # Segment stretch mode for alternative version generation
             segment_stretch = kwargs.get("segment_stretch", "audio_and_video")
@@ -94,6 +95,7 @@ class TranslatorFactory:
                 editor_reasoning_effort=editor_reasoning_effort,
                 tts_system=tts_system,
                 tts_system_mapping=tts_system_mapping,
+                tts_model=tts_model,
             )
                 
             # Initialize the translator

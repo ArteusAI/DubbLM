@@ -43,6 +43,10 @@ from ..debug.cost_tracker import CostTracker
 from ..debug.report_builder import ReportBuilder
 from ..utils.subtitle_utils import SubtitleManager
 from .log_config import get_logger
+from .segment_context import (
+    build_context_style as build_segment_context_style,
+    context_cache_token,
+)
 from .cost_estimator import CostEstimator
 from src.utils.speaker_gender import normalize_speaker_metadata_map
 
@@ -235,6 +239,7 @@ class SmartDubbing:
                 segment_stretch=self.config.get('segment_stretch', 'audio_and_video'),
                 tts_system=self.config.get('tts_system'),
                 tts_system_mapping=self.config.get('tts_system_mapping'),
+                tts_model=self.config.get('tts_model'),
             )
             if hasattr(self.translator, "set_speaker_metadata"):
                 self.translator.set_speaker_metadata(self.config.get("speaker_metadata"))
@@ -268,7 +273,12 @@ class SmartDubbing:
                 voice_similarity_threshold=self.config.get('voice_similarity_threshold'),
                 voice_similarity_relaxed_threshold=self.config.get('voice_similarity_relaxed_threshold'),
                 min_voice_validation_duration_seconds=self.config.get('min_voice_validation_duration_seconds'),
+                voice_reference_mode=self.config.get('voice_reference_mode'),
+                enable_voice_gender_relative_check=self.config.get('enable_voice_gender_relative_check'),
+                voice_gender_relative_margin=self.config.get('voice_gender_relative_margin'),
                 enable_content_validation=self.config.get('enable_content_validation', True),
+                enable_context_style=self.config.get('enable_context_style', True),
+                context_style_max_chars=self.config.get('context_style_max_chars', 140),
                 content_validator_provider=self.config.get('content_validator_provider', 'whisper'),
                 content_validator_whisper_model=self.config.get('content_validator_whisper_model', 'base'),
                 content_validator_whisper_compute_type=self.config.get('content_validator_whisper_compute_type', 'int8'),
@@ -465,7 +475,7 @@ class SmartDubbing:
                 keep_original_audio_ranges=keep_original_audio_ranges,
                 source_language=self.config.get('source_language'),
                 target_language=self.config.get('target_language'),
-                normalize_audio=self.config.get('normalize_audio', True),
+                normalize_audio=self.config.get('normalize_audio', False),
                 use_two_pass_encoding=self.config.get('use_two_pass_encoding', True),
                 pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get('min_pause_duration', 3),
@@ -943,24 +953,70 @@ class SmartDubbing:
 
         return translated_segments
 
-    @staticmethod
+    def _build_context_style(self, segments: List[Dict], segment_index: int) -> Optional[str]:
+        """Quote the previous line into a short delivery-context hint for Gemini 3.8.
+
+        The hint goes into ``speech_metadata.style`` only and is never spoken;
+        it keeps intonation continuous across adjacent lines.
+        """
+        if segment_index <= 0 or segment_index >= len(segments):
+            return None
+        max_chars = int(self.config.get("context_style_max_chars", 140) or 140)
+        previous = segments[segment_index - 1] or {}
+        return build_segment_context_style(
+            previous_text=previous.get("translation") or previous.get("original_text"),
+            previous_speaker=previous.get("speaker"),
+            current_speaker=(segments[segment_index] or {}).get("speaker"),
+            max_chars=max_chars,
+        )
+
+    def _resolve_speaker_reference_source_audio(self) -> Optional[str]:
+        """Return the best original-audio source for multi-sample voice profiles.
+
+        Prefers the separated vocals stem (when audio-separator is used),
+        falling back to the extracted source track.
+        """
+        import glob as _glob
+
+        candidates: List[str] = []
+        try:
+            candidates.extend(sorted(_glob.glob("*Vocals*.wav")))
+            candidates.extend(sorted(_glob.glob("artifacts/audio/*Vocals*.wav")))
+        except Exception:
+            pass
+        candidates.append("artifacts/audio/source.wav")
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
     def _build_segment_cache_key(
+        self,
         base_cache_prefix: str,
         tts_system: str,
         segment_index: int,
         speaker: str,
         text_value: str,
         voice_prompt_hash: str,
+        voice_name: Optional[str] = None,
+        tts_model: Optional[str] = None,
+        context_style: Optional[str] = None,
     ) -> str:
         """Canonical segment cache-key used by prepass and main synthesis pass.
 
         Keep the ingredient order and hashing identical in both call sites,
         otherwise main-pass will miss the keys seeded by the prepass.
+
+        The resolved voice name (and TTS model) are part of the key: audio cached
+        for one voice must never be replayed after the voice mapping changes,
+        otherwise e.g. a male speaker keeps a stale female-voiced render forever.
         """
         text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
+        model_hash = hashlib.md5((tts_model or "").encode()).hexdigest()[:8]
+        context_hash = context_cache_token(context_style)
         return (
             f"{base_cache_prefix}_{tts_system}_{segment_index}_"
-            f"{speaker}_{text_hash}_{voice_prompt_hash}"
+            f"{speaker}_{text_hash}_{voice_prompt_hash}_{voice_name or 'auto'}_{model_hash}_{context_hash}"
         )
 
     def _run_batched_synthesis_prepass(
@@ -1012,11 +1068,14 @@ class SmartDubbing:
                 voice_name = None
 
             voice_prompt_hash = hashlib.md5((style_prompt or "").encode()).hexdigest()[:8]
+            tts_model = getattr(getattr(tts_instance, "config", None), "model", None)
 
             def make_cache_key(text_value: str, _tts=tts_system, _spk=speaker,
-                               _idx=segment_index, _vph=voice_prompt_hash) -> str:
+                               _idx=segment_index, _vph=voice_prompt_hash,
+                               _voice=voice_name, _model=tts_model) -> str:
                 return self._build_segment_cache_key(
-                    base_cache_prefix, _tts, _idx, _spk, text_value, _vph
+                    base_cache_prefix, _tts, _idx, _spk, text_value, _vph,
+                    voice_name=_voice, tts_model=_model
                 )
 
             if self.cache_manager.use_cache and not segment_dict.get("force_resynthesize", False):
@@ -1097,6 +1156,8 @@ class SmartDubbing:
                 "segment_index": segment_index,
                 "speaker": speaker,
                 "voice_prompt_hash": voice_prompt_hash,
+                "voice_name": voice_name,
+                "tts_model": tts_model,
             })
 
         if not batches_by_tts:
@@ -1216,6 +1277,8 @@ class SmartDubbing:
                 task["speaker"],
                 text_value,
                 task["voice_prompt_hash"],
+                voice_name=task.get("voice_name"),
+                tts_model=task.get("tts_model"),
             )
             cache_path = segment_cache_path / f"{cache_key}.wav"
             if cache_path.exists():
@@ -1373,6 +1436,29 @@ class SmartDubbing:
         # Create segment cache directory if needed
         segment_cache_path = self.cache_manager.get_cache_path("segment_synthesis")
         base_cache_prefix = self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))
+
+        # One-time cleanup of segment cache entries written before the cache key
+        # started including the resolved voice name and TTS model. Old entries are
+        # unreachable with the new key format and stale audio must never be
+        # replayed after a voice change (e.g. wrong-gender renders).
+        try:
+            format_marker = segment_cache_path / ".cache_key_v3"
+            if not format_marker.exists():
+                removed = 0
+                for old_entry in segment_cache_path.glob("*.wav"):
+                    try:
+                        old_entry.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+                format_marker.touch()
+                if removed:
+                    logger.info(
+                        f"Segment cache format upgraded (dialogue context now part of the key): "
+                        f"removed {removed} stale cached segment(s)."
+                    )
+        except Exception as cache_cleanup_exc:
+            logger.warning(f"Segment cache cleanup failed: {cache_cleanup_exc}")
         
         # Check if any TTS systems are initialized
         if not self.tts_systems:
@@ -1390,6 +1476,25 @@ class SmartDubbing:
             self.config.get('enable_emotion_enrichment', False)
             and not self.config.get('enable_llm_editor', False)
         )
+
+        # Multi-sample speaker references (Gemini 3.8): original audio + the
+        # speaker's utterance ranges let the TTS wrapper average several clips
+        # from different parts of the track instead of relying on one sample.
+        speaker_reference_source_audio = self._resolve_speaker_reference_source_audio()
+        speaker_time_ranges_map: Dict[str, List[Tuple[float, float]]] = {}
+        for _seg in segments:
+            _speaker = _seg.get("speaker")
+            _start = _seg.get("start")
+            _end = _seg.get("end")
+            if not _speaker or _start is None or _end is None:
+                continue
+            try:
+                _start_f = float(_start)
+                _end_f = float(_end)
+            except (TypeError, ValueError):
+                continue
+            if _end_f > _start_f:
+                speaker_time_ranges_map.setdefault(_speaker, []).append((_start_f, _end_f))
         
         # Segment stretch mode: audio | audio_and_video | video
         segment_stretch_mode = self.config.get('segment_stretch', 'audio_and_video')
@@ -1599,6 +1704,12 @@ class SmartDubbing:
             # Prefer previously chosen text for cache key to maximize cache hits across edits
             preferred_text = (segment_dict.get("chosen_text") or active_segment.get("translation", ""))
             voice_prompt_hash = hashlib.md5((segment_style_prompt or "").encode()).hexdigest()[:8]
+            tts_model = getattr(getattr(tts_instance, "config", None), "model", None)
+
+            context_style = None
+            if tts_system == "gemini38" and self.config.get("enable_context_style", True):
+                context_style = self._build_context_style(segments, segment_index)
+            segment_dict["context_style"] = context_style
 
             def make_cache_key(text_value: str) -> str:
                 return self._build_segment_cache_key(
@@ -1608,6 +1719,9 @@ class SmartDubbing:
                     speaker,
                     text_value,
                     voice_prompt_hash,
+                    voice_name=voice_name,
+                    tts_model=tts_model,
+                    context_style=context_style,
                 )
 
             # Default cache key/path (used when saving new audio)
@@ -1696,6 +1810,9 @@ class SmartDubbing:
                 "cohesion_with_prev": segment_dict.get("cohesion_with_prev", "normal"),
                 "segment_index": segment_index,
                 "group_id": segment_dict.get("group_id"),
+                "source_audio_path": speaker_reference_source_audio,
+                "speaker_time_ranges": speaker_time_ranges_map.get(speaker),
+                "context_style": context_style,
             }
 
             potential_ref_audio_for_speaker = f"artifacts/speakers_audio/{speaker}.wav"

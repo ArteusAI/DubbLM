@@ -7,19 +7,26 @@ import {
   PRESETS,
   LLM_PROVIDERS,
   TTS_PROVIDERS,
+  normalizeTtsSystem,
   TRANSCRIPTION_PROVIDERS,
   WHISPER_MODELS,
   TTS_STYLES,
   GEMINI_DEFAULT_TTS_MODEL,
   GEMINI_EXPERIMENTAL_TTS_MODEL,
   GEMINI_TTS_MODEL_OPTIONS,
+  GEMINI38_DEFAULT_TTS_MODEL,
+  GEMINI38_TTS_MODEL_OPTIONS,
+  OPENROUTER_DEFAULT_TTS_MODEL,
+  OPENROUTER_TTS_MODEL_OPTIONS,
 } from '../constants';
 import api, { VoiceResponse } from '../api';
 
 const TTS_DEFAULT_MODELS: Record<string, string> = {
+  gemini38: GEMINI38_DEFAULT_TTS_MODEL,
   gemini: GEMINI_DEFAULT_TTS_MODEL,
   openai: 'gpt-4o-mini-tts',
   minimax: 'speech-02-hd',
+  openrouter: OPENROUTER_DEFAULT_TTS_MODEL,
 };
 
 const VIDEO_QUALITY_OPTIONS: Array<{ value: VideoQualityPreset; label: string }> = [
@@ -182,7 +189,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
   );
   const isEditorEnabled = config.enableLlmEditor ?? currentPreset.enableLlmEditor ?? false;
 
-  const selectedTtsProvider = config.ttsSystem || currentPreset.ttsSystem;
+  const selectedTtsProvider = normalizeTtsSystem(config.ttsSystem || currentPreset.ttsSystem).ttsSystem || 'openai';
   const providerVoices = useMemo(
     () => voices.filter((voice) => voice.provider === selectedTtsProvider),
     [voices, selectedTtsProvider]
@@ -401,15 +408,20 @@ export const UploadView: React.FC<UploadViewProps> = ({
                       refinementLlmProvider: (presetFromApi?.refinementLlmProvider as LlmProvider | undefined) ?? preset.refinementLlmProvider,
                       refinementModelName: presetFromApi?.refinementModelName ?? preset.refinementModelName,
                       refinementTemperature: presetFromApi?.refinementTemperature ?? preset.refinementTemperature,
-                      ttsSystem: presetFromApi?.ttsSystem ?? preset.ttsSystem,
-                      ttsModel: presetFromApi?.ttsModel ?? preset.ttsModel,
+                      ...normalizeTtsSystem(
+                        presetFromApi?.ttsSystem ?? preset.ttsSystem,
+                        presetFromApi?.ttsModel ?? preset.ttsModel,
+                      ),
                       ttsStyle: (presetFromApi?.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'podcast',
                       ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
                       voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
                       enableEmotionEnrichment: presetFromApi?.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
                       enableContentValidation: presetFromApi?.enableContentValidation ?? preset.enableContentValidation,
+                      enableContextStyle: presetFromApi?.enableContextStyle ?? preset.enableContextStyle,
+                      contextStyleMaxChars: presetFromApi?.contextStyleMaxChars ?? preset.contextStyleMaxChars,
                       dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
                       backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
+                      normalizeAudio: presetFromApi?.normalizeAudio ?? preset.normalizeAudio,
                       useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
                       videoQualityPreset: presetFromApi?.videoQualityPreset ?? preset.videoQualityPreset,
                       maxWorkers: presetFromApi?.maxWorkers ?? preset.maxWorkers,
@@ -741,7 +753,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
                         />
                         <span className="text-[10px] text-zinc-400">LLM Editor</span>
-                        <InfoTip text="Optional post-refinement editor pass. Ultra enables it by default and uses GPT-5.4 xhigh via OpenRouter when available." />
+                        <InfoTip text="Optional post-refinement editor pass. Disabled by default; can be enabled and uses GPT-5.6-sol xhigh via OpenRouter when available." />
                       </label>
                       {isEditorEnabled && (
                         <div className="space-y-2 rounded border border-zinc-800/60 bg-zinc-950/40 p-2">
@@ -773,7 +785,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                                 value={config.editorModelName || currentPreset.editorModelName || ''}
                                 onChange={(e) => onConfigChange({ editorModelName: e.target.value || undefined })}
                                 className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                                placeholder="openai/gpt-5.4"
+                                placeholder="openai/gpt-5.6-terra"
                               />
                             </div>
                             <div className="space-y-1">
@@ -831,7 +843,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Provider
-                            <InfoTip text="TTS provider (openai, gemini, minimax)" />
+                            <InfoTip text="TTS provider (openai, gemini38, minimax, openrouter)" />
                           </label>
                           <select 
                             value={selectedTtsProvider}
@@ -840,7 +852,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                               onConfigChange({ 
                                 ttsSystem: provider,
                                 ttsModel: TTS_DEFAULT_MODELS[provider] || '',
-                                ttsPromptPrefix: provider === 'gemini' ? config.ttsPromptPrefix : undefined,
+                                ttsPromptPrefix: provider === 'gemini' || provider === 'gemini38' ? config.ttsPromptPrefix : undefined,
                               });
                             }}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
@@ -853,12 +865,17 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Model
-                            <InfoTip text={`TTS model name. Experimental option: ${GEMINI_EXPERIMENTAL_TTS_MODEL}`} />
+                            <InfoTip text="TTS model name" />
                           </label>
-                          {selectedTtsProvider === 'gemini' ? (() => {
+                          {selectedTtsProvider === 'gemini' || selectedTtsProvider === 'gemini38' || selectedTtsProvider === 'openrouter' ? (() => {
                             const modelValue = config.ttsModel || currentPreset.ttsModel || '';
-                            const isKnownGeminiModel = GEMINI_TTS_MODEL_OPTIONS.includes(modelValue);
-                            const selectValue = useCustomTtsModel || !isKnownGeminiModel ? 'custom' : modelValue;
+                            const knownModels = selectedTtsProvider === 'gemini'
+                              ? GEMINI_TTS_MODEL_OPTIONS
+                              : selectedTtsProvider === 'gemini38'
+                                ? GEMINI38_TTS_MODEL_OPTIONS
+                                : [...OPENROUTER_TTS_MODEL_OPTIONS];
+                            const isKnownModel = knownModels.includes(modelValue);
+                            const selectValue = useCustomTtsModel || !isKnownModel ? 'custom' : modelValue;
                             return (
                               <div className="space-y-1">
                                 <div className="relative">
@@ -875,9 +892,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                                     }}
                                     className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 pr-6 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
                                   >
-                                    {GEMINI_TTS_MODEL_OPTIONS.map((model) => (
+                                    {knownModels.map((model) => (
                                       <option key={model} value={model}>
-                                        {model === GEMINI_EXPERIMENTAL_TTS_MODEL ? `${model} (experimental)` : model}
+                                        {selectedTtsProvider === 'gemini' && model === GEMINI_EXPERIMENTAL_TTS_MODEL
+                                          ? `${model} (experimental)`
+                                          : model}
                                       </option>
                                     ))}
                                     <option value="custom">Custom model...</option>
@@ -890,7 +909,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                                     value={modelValue}
                                     onChange={(e) => onConfigChange({ ttsModel: e.target.value || undefined })}
                                     className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                                    placeholder="Custom Gemini model"
+                                    placeholder={selectedTtsProvider === 'gemini' || selectedTtsProvider === 'gemini38' ? 'Custom Gemini model' : 'Custom OpenRouter model'}
                                   />
                                 )}
                               </div>
@@ -936,6 +955,16 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           />
                           <span className="text-[10px] text-zinc-400">Content validation</span>
                           <InfoTip text="Round-trip ASR check that TTS actually produced all expected words. Catches truncated speech at segment end; adds a small per-segment ASR cost." />
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={config.enableContextStyle ?? currentPreset.enableContextStyle ?? true}
+                            onChange={(e) => onConfigChange({ enableContextStyle: e.target.checked })}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                          />
+                          <span className="text-[10px] text-zinc-400">Dialogue context</span>
+                          <InfoTip text="Gemini 3.8 only: pass the previous translated line as a quoted delivery context in style. It is never spoken; keeps intonation continuous across adjacent lines." />
                         </label>
                       </div>
                       <div className="space-y-1">

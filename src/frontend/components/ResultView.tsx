@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X, Maximize2, Minimize2, Scissors, Loader2, ExternalLink, AlertCircle, XCircle } from 'lucide-react';
+import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X, Maximize2, Minimize2, Scissors, Loader2, ExternalLink, AlertCircle, XCircle, Share2, Link2, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import api, { ProjectStatsResponse, ClipQuality, ClipJobStatusResponse } from '../api';
@@ -409,6 +409,11 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
   const [clipJobId, setClipJobId] = useState<string | null>(null);
   const [clipStatus, setClipStatus] = useState<ClipJobStatusResponse | null>(null);
   const [clipError, setClipError] = useState<string | null>(null);
+  const [isShareLoading, setIsShareLoading] = useState(false);
+  const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [shareExpiresAt, setShareExpiresAt] = useState<string | null>(null);
+  const [shareCopied, setShareCopied] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
   const clipPollRef = useRef<number | null>(null);
   const isClipRendering = clipJobId !== null && clipStatus?.status !== 'failed';
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -425,6 +430,10 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
     api.getProjectStats(projectId)
       .then(setStats)
       .catch(() => setStats(null));
+    setShareUrl(null);
+    setShareExpiresAt(null);
+    setShareError(null);
+    setShareCopied(false);
   }, [projectId]);
 
   useEffect(() => {
@@ -468,6 +477,30 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const handleShareVideo = async () => {
+    setIsShareLoading(true);
+    setShareError(null);
+    setShareCopied(false);
+    try {
+      const res = await api.getShareVideoLink(projectId);
+      setShareUrl(res.url);
+      setShareExpiresAt(res.expiresAt);
+      try {
+        await navigator.clipboard.writeText(res.url);
+        setShareCopied(true);
+        window.setTimeout(() => setShareCopied(false), 2500);
+      } catch {
+        // Clipboard may be blocked; URL still shown in UI
+      }
+    } catch (err) {
+      setShareError(err instanceof Error ? err.message : 'Failed to create share link');
+      setShareUrl(null);
+      setShareExpiresAt(null);
+    } finally {
+      setIsShareLoading(false);
+    }
   };
 
   const handleDownloadSubtitles = (lang: 'source' | 'target') => {
@@ -881,7 +914,79 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
           <FileText className="w-4 h-4" />
           Target .SRT
         </button>
+        <button
+          type="button"
+          onClick={handleShareVideo}
+          disabled={isShareLoading}
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-60 text-white rounded-xl font-medium transition-all"
+          title="Copy a temporary S3 link to the result video"
+        >
+          {isShareLoading ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : shareCopied ? (
+            <Check className="w-4 h-4 text-emerald-400" />
+          ) : (
+            <Share2 className="w-4 h-4" />
+          )}
+          {shareCopied ? 'Link copied' : 'Share link'}
+        </button>
       </div>
+
+      {(shareUrl || shareError) && (
+        <div className="w-full max-w-3xl space-y-2">
+          {shareError && (
+            <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{shareError}</span>
+            </div>
+          )}
+          {shareUrl && (
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/80 px-4 py-3 space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                <Link2 className="h-3.5 w-3.5" />
+                Public S3 link
+                {shareExpiresAt && (
+                  <span className="font-normal normal-case text-zinc-600">
+                    · expires {new Date(shareExpiresAt).toLocaleString()}
+                  </span>
+                )}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={shareUrl}
+                  className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-zinc-300 outline-none"
+                  onFocus={(e) => e.currentTarget.select()}
+                />
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(shareUrl);
+                      setShareCopied(true);
+                      window.setTimeout(() => setShareCopied(false), 2500);
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                  className="shrink-0 rounded-lg bg-zinc-800 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-700"
+                >
+                  {shareCopied ? 'Copied' : 'Copy'}
+                </button>
+                <a
+                  href={shareUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-zinc-800 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-700"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  Open
+                </a>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <button 
         onClick={onReset}

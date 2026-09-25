@@ -1,9 +1,10 @@
 
 import { Persona, Language, PresetConfig } from './types';
 
-// Default Gemini TTS model names. Keep aligned with
-// DEFAULT_GEMINI_TTS_MODEL / DEFAULT_GEMINI_TTS_FALLBACK_MODEL in
-// src/tts/gemini_tts_wrapper.py (the backend source of truth).
+// Deprecated: Gemini (legacy) provider is hidden from the UI and existing
+// configs are migrated to gemini38. Kept for a later cleanup.
+// Keep aligned with DEFAULT_GEMINI_TTS_MODEL / DEFAULT_GEMINI_TTS_FALLBACK_MODEL
+// in src/tts/gemini_tts_wrapper.py (the backend source of truth).
 export const GEMINI_DEFAULT_TTS_MODEL = 'gemini-2.5-pro-preview-tts';
 export const GEMINI_DEFAULT_TTS_FALLBACK_MODEL = 'gemini-2.5-flash-preview-tts';
 export const GEMINI_EXPERIMENTAL_TTS_MODEL = 'gemini-3.1-flash-tts-preview';
@@ -12,6 +13,35 @@ export const GEMINI_TTS_MODEL_OPTIONS = [
   GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
   GEMINI_EXPERIMENTAL_TTS_MODEL,
 ];
+
+// Gemini 3.8 Flash TTS (Interactions API, per-segment synthesis).
+// Keep aligned with DEFAULT_GEMINI38_TTS_MODEL in
+// src/tts/gemini38_tts_wrapper.py (the backend source of truth).
+export const GEMINI38_DEFAULT_TTS_MODEL = 'gemini-3.8-flash-tts';
+export const GEMINI38_DEFAULT_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
+export const GEMINI38_TTS_MODEL_OPTIONS = [
+  GEMINI38_DEFAULT_TTS_MODEL,
+  GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
+];
+
+// Deprecated legacy provider id. The backend still accepts it for old API
+// clients, but the UI never offers it; saved configs are migrated on load.
+export const LEGACY_GEMINI_TTS_SYSTEM = 'gemini';
+
+export const normalizeTtsSystem = (
+  ttsSystem: string,
+  ttsModel?: string,
+  ttsFallbackModel?: string,
+): { ttsSystem: string; ttsModel?: string; ttsFallbackModel?: string } => {
+  if (ttsSystem !== LEGACY_GEMINI_TTS_SYSTEM) {
+    return { ttsSystem, ttsModel, ttsFallbackModel };
+  }
+  return {
+    ttsSystem: 'gemini38',
+    ttsModel: GEMINI38_DEFAULT_TTS_MODEL,
+    ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
+  };
+};
 
 export const LANGUAGES: Language[] = [
   { code: 'auto', name: 'Auto Detect' },
@@ -52,9 +82,17 @@ export const DEFAULT_PERSONAS: Persona[] = [
 
 export const TTS_PROVIDERS = [
   { id: 'openai', name: 'OpenAI' },
-  { id: 'gemini', name: 'Gemini' },
+  { id: 'gemini38', name: 'Gemini 3.8 (Highest Quality)' },
   { id: 'minimax', name: 'MiniMax' },
+  { id: 'openrouter', name: 'OpenRouter' },
 ];
+
+export const OPENROUTER_DEFAULT_TTS_MODEL = 'qwen/qwen-audio-3.0-tts-flash';
+export const OPENROUTER_TTS_MODEL_OPTIONS = [
+  'qwen/qwen-audio-3.0-tts-flash',
+  'qwen/qwen-audio-3.0-tts-plus',
+  'x-ai/grok-voice-tts-1.0',
+] as const;
 
 export const LLM_PROVIDERS = [
   { id: 'gemini', name: 'Gemini' },
@@ -150,11 +188,11 @@ export const PRESETS: PresetConfig[] = [
     enableLlmEditor: false,
     enableLlmTextAdjustment: false,
     editorLlmProvider: 'openrouter',
-    editorModelName: 'openai/gpt-5.4',
+    editorModelName: 'openai/gpt-5.6-terra',
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
-    refinementLlmProvider: 'gemini',
-    refinementModelName: 'gemini-flash-latest',
+    refinementLlmProvider: 'openrouter',
+    refinementModelName: 'openai/gpt-6-sol',
     refinementTemperature: 1.0,
     ttsSystem: 'openai',
     ttsStyle: 'auto',
@@ -162,8 +200,11 @@ export const PRESETS: PresetConfig[] = [
     enableEmotionAnalysis: false,
     enableEmotionEnrichment: false,
     enableContentValidation: false,
+    enableContextStyle: false,
+    contextStyleMaxChars: 140,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
+    normalizeAudio: false,
     useTwoPassEncoding: true,
     videoQualityPreset: '720p',
     maxWorkers: 4,
@@ -182,15 +223,15 @@ export const PRESETS: PresetConfig[] = [
     enableLlmEditor: false,
     enableLlmTextAdjustment: false,
     editorLlmProvider: 'openrouter',
-    editorModelName: 'openai/gpt-5.4',
+    editorModelName: 'openai/gpt-5.6-terra',
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
-    refinementLlmProvider: 'gemini',
-    refinementModelName: 'gemini-flash-latest',
+    refinementLlmProvider: 'openrouter',
+    refinementModelName: 'openai/gpt-6-sol',
     refinementTemperature: 1.0,
-    ttsSystem: 'gemini',
-    ttsModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
-    ttsFallbackModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
+    ttsSystem: 'gemini38',
+    ttsModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
+    ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
     ttsStyle: 'auto',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
@@ -198,6 +239,7 @@ export const PRESETS: PresetConfig[] = [
     enableContentValidation: true,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
+    normalizeAudio: false,
     useTwoPassEncoding: true,
     videoQualityPreset: '1080p',
     maxWorkers: 4,
@@ -213,18 +255,18 @@ export const PRESETS: PresetConfig[] = [
     llmProvider: 'gemini',
     llmModelName: 'gemini-flash-latest',
     llmTemperature: 0.5,
-    enableLlmEditor: true,
+    enableLlmEditor: false,
     enableLlmTextAdjustment: true,
     editorLlmProvider: 'openrouter',
-    editorModelName: 'openai/gpt-5.4',
+    editorModelName: 'openai/gpt-5.6-sol',
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
     refinementLlmProvider: 'openrouter',
-    refinementModelName: 'openai/gpt-5.4',
-    refinementTemperature: 0.8,
-    ttsSystem: 'gemini',
-    ttsModel: GEMINI_DEFAULT_TTS_MODEL,
-    ttsFallbackModel: GEMINI_DEFAULT_TTS_FALLBACK_MODEL,
+    refinementModelName: 'openai/gpt-6-sol',
+    refinementTemperature: 1.0,
+    ttsSystem: 'gemini38',
+    ttsModel: GEMINI38_DEFAULT_TTS_MODEL,
+    ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
     ttsStyle: 'auto',
     voiceAutoSelection: true,
     enableEmotionAnalysis: true,
@@ -232,6 +274,7 @@ export const PRESETS: PresetConfig[] = [
     enableContentValidation: true,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
+    normalizeAudio: false,
     useTwoPassEncoding: true,
     videoQualityPreset: 'original',
     maxWorkers: 4,

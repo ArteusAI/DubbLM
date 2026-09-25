@@ -14,6 +14,7 @@ import re
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from ..database.session import get_db
 from ..database.models import Project, ProjectStatus
@@ -95,14 +96,16 @@ async def fetch_video_info(request: VideoDownloadRequest):
     """Retrieve video metadata (title, duration, uploader) from a URL without downloading."""
     try:
         url = validate_video_url(request.url)
-        info = get_video_info(url)
+        # yt-dlp is blocking; keep it off the event loop so one slow request
+        # cannot freeze the whole API.
+        info = await run_in_threadpool(get_video_info, url)
         return VideoInfoResponse(**info)
     except VideoDownloadError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
 
 def _resolve_result_video_path(project_id: str, project: Project) -> Path:
-    """Resolve dubbed video path for a project."""
+    """Resolve dubbed video path for a project (local or restore from S3)."""
     pm = ProjectManager(project_id)
     config = project.config or {}
     target_lang = config.get("targetLang", "ru")
@@ -111,11 +114,152 @@ def _resolve_result_video_path(project_id: str, project: Project) -> Path:
     if video_path.exists():
         return video_path
 
-    videos = list(pm.results_dir.glob("*.mp4"))
+    videos = list(pm.results_dir.glob("*.mp4")) if pm.results_dir.exists() else []
     if videos:
         return videos[0]
 
+    try:
+        from ..services.object_storage import get_object_storage
+        store = get_object_storage()
+        if store.is_enabled():
+            restored = store.ensure_local_result_video(project_id, project)
+            if restored and restored.exists():
+                return restored
+    except Exception as exc:
+        logger.warning("Failed to restore result video from S3 for %s: %s", project_id, exc)
+
     raise HTTPException(status_code=404, detail="Dubbed video not found")
+
+
+def _stream_s3_response(
+    key: str,
+    media_type: str,
+    filename: str,
+    request: Request | None = None,
+    *,
+    as_attachment: bool = True,
+):
+    """Stream an S3 object, with HTTP Range support when request is provided."""
+    from ..services.object_storage import format_content_disposition, get_object_storage
+
+    store = get_object_storage()
+    try:
+        file_size = store.get_object_size(key)
+    except Exception as exc:
+        logger.warning("S3 head failed for %s: %s", key, exc)
+        raise HTTPException(status_code=404, detail="File not found in storage") from exc
+
+    range_header = request.headers.get("range") if request else None
+    disposition = "attachment" if as_attachment else "inline"
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": format_content_disposition(disposition, filename),
+        "Cache-Control": "no-cache",
+    }
+
+    if not range_header:
+        if file_size <= 0:
+            headers = {**base_headers, "Content-Length": "0"}
+            return Response(content=b"", media_type=media_type, headers=headers)
+        headers = {
+            **base_headers,
+            "Content-Length": str(file_size),
+        }
+        return StreamingResponse(
+            store.stream_range(key, 0, file_size - 1),
+            media_type=media_type,
+            headers=headers,
+            status_code=status.HTTP_200_OK,
+        )
+
+    byte_range = _parse_range_header(range_header, file_size)
+    if byte_range is None:
+        return Response(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+
+    start, end = byte_range
+    content_length = end - start + 1
+    headers = {
+        **base_headers,
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Length": str(content_length),
+    }
+    return StreamingResponse(
+        store.stream_range(key, start, end),
+        media_type=media_type,
+        headers=headers,
+        status_code=status.HTTP_206_PARTIAL_CONTENT,
+    )
+
+
+def _storage_meta(project: Project) -> dict:
+    config = project.config or {}
+    storage = config.get("storage") or {}
+    return storage if isinstance(storage, dict) else {}
+
+
+def _resolve_s3_result_key(project_id: str, project: Project, db: Session | None = None) -> str | None:
+    """Resolve result video S3 key from config or by listing the bucket; cache into config."""
+    storage = _storage_meta(project)
+    key = storage.get("resultVideoKey")
+    if key:
+        return key
+    try:
+        from ..services.object_storage import get_object_storage
+        store = get_object_storage()
+        if not store.is_enabled():
+            return None
+        discovered = store.discover_storage_meta(project_id)
+        if not discovered or not discovered.get("resultVideoKey"):
+            return None
+        # Persist so subsequent ranges skip list_objects
+        if db is not None:
+            try:
+                config = dict(project.config or {})
+                config["storage"] = {**(config.get("storage") or {}), **discovered}
+                project.config = config
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(project, "config")
+                db.commit()
+            except Exception as exc:
+                logger.warning("Failed to cache discovered storage for %s: %s", project_id, exc)
+                db.rollback()
+        return discovered.get("resultVideoKey")
+    except Exception as exp:
+        logger.warning("S3 result key resolve failed for %s: %s", project_id, exp)
+        return None
+
+
+def _resolve_s3_source_key(project_id: str, project: Project, db: Session | None = None) -> str | None:
+    storage = _storage_meta(project)
+    key = storage.get("sourceKey")
+    if key:
+        return key
+    try:
+        from ..services.object_storage import get_object_storage
+        store = get_object_storage()
+        if not store.is_enabled():
+            return None
+        discovered = store.discover_storage_meta(project_id)
+        if not discovered or not discovered.get("sourceKey"):
+            return None
+        if db is not None:
+            try:
+                config = dict(project.config or {})
+                config["storage"] = {**(config.get("storage") or {}), **discovered}
+                project.config = config
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(project, "config")
+                db.commit()
+            except Exception as exc:
+                logger.warning("Failed to cache discovered storage for %s: %s", project_id, exc)
+                db.rollback()
+        return discovered.get("sourceKey")
+    except Exception as exp:
+        logger.warning("S3 source key resolve failed for %s: %s", project_id, exp)
+        return None
 
 
 def _iter_file_range(file_path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
@@ -160,22 +304,121 @@ def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int] | 
 
 
 @router.get("/{project_id}/download/video")
-async def download_video(project_id: str, db: Session = Depends(get_db)):
-    """Download the dubbed video."""
+async def download_video(project_id: str, request: Request, db: Session = Depends(get_db)):
+    """Download the dubbed video (local file or stream from S3)."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
     if project.status != ProjectStatus.DUBBED:
         raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
-    
-    video_path = _resolve_result_video_path(project_id, project)
-    
-    return FileResponse(
-        path=str(video_path),
-        media_type="video/mp4",
-        filename=video_path.name
-    )
+
+    pm = ProjectManager(project_id)
+    config = project.config or {}
+    target_lang = config.get("targetLang", "ru")
+    local = pm.get_result_video_path(target_lang)
+    if local.exists():
+        return FileResponse(path=str(local), media_type="video/mp4", filename=local.name)
+    if pm.results_dir.exists():
+        videos = list(pm.results_dir.glob("*.mp4"))
+        if videos:
+            return FileResponse(path=str(videos[0]), media_type="video/mp4", filename=videos[0].name)
+
+    storage = _storage_meta(project)
+    key = storage.get("resultVideoKey") or _resolve_s3_result_key(project_id, project, db)
+    if key:
+        filename = Path(key).name
+        return _stream_s3_response(key, "video/mp4", filename, request=request)
+
+    raise HTTPException(status_code=404, detail="Dubbed video not found")
+
+
+@router.get("/{project_id}/share/video")
+async def share_result_video(
+    project_id: str,
+    expires_in: int | None = Query(None, ge=60, le=7 * 24 * 3600),
+    db: Session = Depends(get_db),
+):
+    """Create a time-limited public S3 URL for the dubbed video (for sharing)."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if project.status != ProjectStatus.DUBBED:
+        raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
+
+    from ..services.object_storage import get_object_storage
+    from ..config import get_settings
+
+    store = get_object_storage()
+    if not store.is_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="S3 storage is not configured. Set S3_* env vars to enable sharing.",
+        )
+
+    settings = get_settings()
+    ttl = expires_in if expires_in is not None else int(settings.s3_presign_expires)
+    ttl = max(60, min(ttl, 7 * 24 * 3600))
+
+    storage = _storage_meta(project)
+    key = storage.get("resultVideoKey") or _resolve_s3_result_key(project_id, project, db)
+
+    # If still only local — upload result to S3 so we can share it
+    if not key:
+        pm = ProjectManager(project_id)
+        config = project.config or {}
+        target_lang = config.get("targetLang", "ru")
+        local = pm.get_result_video_path(target_lang)
+        if not local.exists() and pm.results_dir.exists():
+            videos = list(pm.results_dir.glob("*.mp4"))
+            local = videos[0] if videos else local
+        if not local.exists():
+            raise HTTPException(status_code=404, detail="Dubbed video not found on disk or S3")
+        key = store.object_key(project_id, "results", local.name)
+        try:
+            store.upload_file(local, key)
+        except Exception as exc:
+            logger.exception("Failed to upload result for share %s", project_id)
+            raise HTTPException(status_code=502, detail=f"Failed to upload to S3: {exc}") from exc
+        from sqlalchemy.orm.attributes import flag_modified
+
+        config = dict(project.config or {})
+        cfg_storage = dict(config.get("storage") or {})
+        cfg_storage.update(
+            {
+                "provider": "s3",
+                "bucket": store.bucket,
+                "resultVideoKey": key,
+            }
+        )
+        config["storage"] = cfg_storage
+        project.config = config
+        flag_modified(project, "config")
+        db.commit()
+
+    filename = Path(key).name
+    try:
+        url = store.presign_get_url(
+            key,
+            expires_in=ttl,
+            filename=filename,
+            content_type="video/mp4",
+            as_attachment=False,
+        )
+    except Exception as exc:
+        logger.exception("Failed to presign share URL for %s", project_id)
+        raise HTTPException(status_code=502, detail=f"Failed to create share link: {exc}") from exc
+
+    from datetime import datetime, timezone, timedelta
+
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    return {
+        "url": url,
+        "expiresIn": ttl,
+        "expiresAt": expires_at.isoformat(),
+        "filename": filename,
+        "key": key,
+    }
 
 
 def _cleanup_clip_file(file_path: Path) -> None:
@@ -420,47 +663,57 @@ async def stream_dubbed_video(project_id: str, request: Request, db: Session = D
     if project.status != ProjectStatus.DUBBED:
         raise HTTPException(status_code=400, detail="Video not ready. Project must be dubbed first.")
 
-    video_path = _resolve_result_video_path(project_id, project)
-    file_size = video_path.stat().st_size
-    range_header = request.headers.get("range")
+    pm = ProjectManager(project_id)
+    config = project.config or {}
+    target_lang = config.get("targetLang", "ru")
+    video_path = pm.get_result_video_path(target_lang)
+    if not video_path.exists() and pm.results_dir.exists():
+        videos = list(pm.results_dir.glob("*.mp4"))
+        if videos:
+            video_path = videos[0]
 
-    base_headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
-    }
-
-    if not range_header:
+    if video_path.exists():
+        file_size = video_path.stat().st_size
+        range_header = request.headers.get("range")
+        base_headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        }
+        if not range_header:
+            headers = {**base_headers, "Content-Length": str(file_size)}
+            return StreamingResponse(
+                _iter_file_range(video_path, 0, file_size - 1),
+                media_type="video/mp4",
+                headers=headers,
+                status_code=status.HTTP_200_OK,
+            )
+        byte_range = _parse_range_header(range_header, file_size)
+        if byte_range is None:
+            return Response(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
+        start, end = byte_range
         headers = {
             **base_headers,
-            "Content-Length": str(file_size),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(end - start + 1),
         }
         return StreamingResponse(
-            _iter_file_range(video_path, 0, file_size - 1),
+            _iter_file_range(video_path, start, end),
             media_type="video/mp4",
             headers=headers,
-            status_code=status.HTTP_200_OK,
+            status_code=status.HTTP_206_PARTIAL_CONTENT,
         )
 
-    byte_range = _parse_range_header(range_header, file_size)
-    if byte_range is None:
-        return Response(
-            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-            headers={"Content-Range": f"bytes */{file_size}"},
+    storage = _storage_meta(project)
+    key = storage.get("resultVideoKey") or _resolve_s3_result_key(project_id, project, db)
+    if key:
+        return _stream_s3_response(
+            key, "video/mp4", Path(key).name, request=request, as_attachment=False
         )
 
-    start, end = byte_range
-    content_length = end - start + 1
-    headers = {
-        **base_headers,
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
-        "Content-Length": str(content_length),
-    }
-    return StreamingResponse(
-        _iter_file_range(video_path, start, end),
-        media_type="video/mp4",
-        headers=headers,
-        status_code=status.HTTP_206_PARTIAL_CONTENT,
-    )
+    raise HTTPException(status_code=404, detail="Dubbed video not found")
 
 
 @router.get("/{project_id}/download/subtitles")
@@ -492,11 +745,24 @@ async def download_subtitles(
     
     if not subtitle_path.exists():
         # Try to find any subtitle file in results matching the language
-        subtitles = list(pm.results_dir.glob(f"*_{language}.{format}"))
-        if subtitles:
-            subtitle_path = subtitles[0]
-        else:
-            raise HTTPException(status_code=404, detail=f"Subtitle file not found for {lang} language")
+        if pm.results_dir.exists():
+            subtitles = list(pm.results_dir.glob(f"*_{language}.{format}"))
+            if subtitles:
+                subtitle_path = subtitles[0]
+
+    if not subtitle_path.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            store = get_object_storage()
+            if store.is_enabled():
+                restored = store.ensure_local_subtitle(project_id, project, language, format)
+                if restored and restored.exists():
+                    subtitle_path = restored
+        except Exception as exc:
+            logger.warning("Failed to restore subtitles from S3 for %s: %s", project_id, exc)
+
+    if not subtitle_path.exists():
+        raise HTTPException(status_code=404, detail=f"Subtitle file not found for {lang} language")
     
     media_type = "text/plain" if format == "srt" else "text/vtt"
     
@@ -508,23 +774,29 @@ async def download_subtitles(
 
 
 @router.get("/{project_id}/video")
-async def get_source_video(project_id: str, db: Session = Depends(get_db)):
-    """Stream the source video."""
+async def get_source_video(project_id: str, request: Request, db: Session = Depends(get_db)):
+    """Stream the source video (local or from S3)."""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
     pm = ProjectManager(project_id)
     video_path = pm.get_source_video_path()
-    
-    if not video_path or not video_path.exists():
-        raise HTTPException(status_code=404, detail="Source video not found")
-    
-    return FileResponse(
-        path=str(video_path),
-        media_type="video/mp4",
-        filename=video_path.name
-    )
+    if video_path and video_path.exists():
+        return FileResponse(
+            path=str(video_path),
+            media_type="video/mp4",
+            filename=video_path.name
+        )
+
+    storage = _storage_meta(project)
+    key = storage.get("sourceKey") or _resolve_s3_source_key(project_id, project, db)
+    if key:
+        return _stream_s3_response(
+            key, "video/mp4", Path(key).name, request=request, as_attachment=False
+        )
+
+    raise HTTPException(status_code=404, detail="Source video not found")
 
 
 @router.get("/{project_id}/segments/{segment_id}/preview/audio")
@@ -577,11 +849,27 @@ async def get_project_stats(project_id: str, db: Session = Depends(get_db)):
     }
 
 
-def _resolve_report_paths(project_id: str) -> tuple[Path, Path]:
-    """Return (markdown_path, json_path) for the summary report."""
+def _resolve_report_paths(project_id: str, project: Project | None = None) -> tuple[Path, Path]:
+    """Return (markdown_path, json_path) for the summary report, restoring from S3 if needed."""
     pm = ProjectManager(project_id)
     md_path = pm.artifacts_dir / "report.md"
     json_path = pm.artifacts_dir / "report.json"
+    if md_path.exists():
+        return md_path, json_path
+
+    try:
+        from ..services.object_storage import get_object_storage
+        store = get_object_storage()
+        if store.is_enabled() and project is not None:
+            restored_md = store.ensure_local_report(project_id, project, kind="md")
+            restored_json = store.ensure_local_report(project_id, project, kind="json")
+            if restored_md and restored_md.exists():
+                md_path = restored_md
+            if restored_json and restored_json.exists():
+                json_path = restored_json
+    except Exception as exc:
+        logger.warning("Failed to restore report from S3 for %s: %s", project_id, exc)
+
     return md_path, json_path
 
 
@@ -592,7 +880,7 @@ async def get_project_report(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    md_path, json_path = _resolve_report_paths(project_id)
+    md_path, json_path = _resolve_report_paths(project_id, project)
     if not md_path.exists():
         raise HTTPException(status_code=404, detail="Report not available yet")
 
@@ -614,13 +902,19 @@ async def download_project_report(project_id: str, db: Session = Depends(get_db)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    md_path, _ = _resolve_report_paths(project_id)
+    md_path, _ = _resolve_report_paths(project_id, project)
     if not md_path.exists():
         raise HTTPException(status_code=404, detail="Report not available yet")
 
     pm = ProjectManager(project_id)
     source = pm.get_source_video_path()
-    filename = f"{source.stem}_report.md" if source else f"{project_id}_report.md"
+    storage = _storage_meta(project)
+    if source:
+        filename = f"{source.stem}_report.md"
+    elif storage.get("sourceFilename"):
+        filename = f"{Path(storage['sourceFilename']).stem}_report.md"
+    else:
+        filename = f"{project_id}_report.md"
     return FileResponse(
         path=str(md_path),
         media_type="text/markdown",

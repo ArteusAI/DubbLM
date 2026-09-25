@@ -1,3 +1,12 @@
+"""Legacy Gemini TTS wrapper (TTS provider ``gemini``).
+
+.. deprecated::
+    This provider is deprecated and hidden from the UI. New projects use
+    :class:`~src.tts.gemini38_tts_wrapper.Gemini38TTSWrapper` (``gemini38``).
+    The code is kept for existing projects and API clients and will be
+    removed in a future cleanup.
+"""
+
 from typing import Optional, Dict, Any, List, Union, Tuple
 import os
 import wave
@@ -24,7 +33,10 @@ from .models import (
 )
 from .gemini_voice_catalog import (
     ALL_GEMINI_VOICES,
+    GEMINI_VOICE_GENDERS,
+    get_gemini_voice_gender,
     is_gemini_voice_gender_compatible,
+    list_gemini_voices_for_gender,
     resolve_default_gemini_voice,
 )
 from .voice_sample_manager import VoiceSampleManager, AudioFileUtils, TextAnalysisUtils, AudioValidator
@@ -98,6 +110,8 @@ except Exception:
     RAPIDFUZZ_AVAILABLE = False
 
 logger = get_logger(__name__)
+
+_DEPRECATION_WARNED = False
 
 # Constants
 # Resolve samples directory relative to this file's location (src/tts/)
@@ -179,7 +193,16 @@ class GeminiTTSConfig(BaseModel):
     # Relaxed threshold allowed when we must pick the best invalid fallback.
     voice_similarity_relaxed_threshold: float = 0.65
     # Skip voice consistency checks for very short clips (unstable embeddings).
-    min_voice_validation_duration_seconds: float = 1.0
+    min_voice_validation_duration_seconds: float = 0.5
+    # Reference mode for voice consistency: "max" (best of voice sample & speaker ref),
+    # "voice_sample" (only against voice sample), "speaker_ref" (only against speaker reference).
+    voice_reference_mode: str = "max"
+    # Relative gender gate: reject the clip when it is closer to ANY cached sample of the
+    # opposite gender than to the expected voice sample (+ margin). Gemini TTS embeddings
+    # are heavily compressed (cross-gender sim ~0.82 vs within-gender ~0.90), so the
+    # absolute threshold alone cannot catch female/male voice drift.
+    enable_voice_gender_relative_check: bool = True
+    voice_gender_relative_margin: float = 0.0
     # Multi-speaker (2-speaker) batching configuration
     enable_multi_speaker: bool = True
     # Hard cap: keep under ~2/3 of the 32k context window (doc: TTS context is 32k)
@@ -527,7 +550,12 @@ class SpeechConfigBuilder:
 
 
 class GeminiTTSWrapper(TTSInterface):
-    """Google Gemini TTS wrapper with simplified single-segment synthesis."""
+    """Google Gemini TTS wrapper with simplified single-segment synthesis.
+
+    .. deprecated::
+        Legacy provider (``gemini``). Use ``Gemini38TTSWrapper`` (``gemini38``)
+        instead. Kept for existing projects and API clients.
+    """
 
     supports_segment_batching: bool = True
 
@@ -567,6 +595,14 @@ class GeminiTTSWrapper(TTSInterface):
         """
         if not GEMINI_AVAILABLE:
             raise ImportError("Google GenAI SDK is not installed.")
+
+        global _DEPRECATION_WARNED
+        if not _DEPRECATION_WARNED:
+            logger.warning(
+                "TTS provider 'gemini' is deprecated and hidden from the UI; use 'gemini38'. "
+                "The legacy wrapper is kept only for existing projects and API clients."
+            )
+            _DEPRECATION_WARNED = True
 
         config_kwargs: Dict[str, Any] = {
             "model": model,
@@ -612,6 +648,12 @@ class GeminiTTSWrapper(TTSInterface):
             config_kwargs["voice_similarity_relaxed_threshold"] = kwargs["voice_similarity_relaxed_threshold"]
         if kwargs.get("min_voice_validation_duration_seconds") is not None:
             config_kwargs["min_voice_validation_duration_seconds"] = kwargs["min_voice_validation_duration_seconds"]
+        if kwargs.get("voice_reference_mode") is not None:
+            config_kwargs["voice_reference_mode"] = kwargs["voice_reference_mode"]
+        if kwargs.get("enable_voice_gender_relative_check") is not None:
+            config_kwargs["enable_voice_gender_relative_check"] = kwargs["enable_voice_gender_relative_check"]
+        if kwargs.get("voice_gender_relative_margin") is not None:
+            config_kwargs["voice_gender_relative_margin"] = kwargs["voice_gender_relative_margin"]
         for _content_key in (
             "enable_content_validation",
             "content_validator_provider",
@@ -633,6 +675,9 @@ class GeminiTTSWrapper(TTSInterface):
         self.target_language = target_language or "en"
         self.speaker_metadata = normalize_speaker_metadata_map(speaker_metadata)
         self.speaker_genders = build_effective_speaker_gender_map(self.speaker_metadata)
+        self._voice_embeddings_lock = threading.Lock()
+        self._speaker_ref_embeddings: Dict[str, Optional[np.ndarray]] = {}
+        self._speaker_to_ref_path: Dict[str, str] = {}
 
         # Initialize components
         self.api_client = GeminiAPIClient(self.config)
@@ -842,8 +887,94 @@ class GeminiTTSWrapper(TTSInterface):
         except Exception as e:
             logger.error(f"Error during duration analysis initialization: {e}")
 
+        # Verify cached sample embeddings actually cluster with their catalog gender;
+        # contaminated samples (rendered with the wrong gender once) silently defeat
+        # voice-consistency validation for that voice.
+        try:
+            self._audit_voice_sample_embeddings()
+        except Exception as e:
+            logger.error(f"Voice sample audit failed: {e}")
+
         # Load persisted biases
         self.voice_sample_manager.load_biases()
+
+    def _audit_voice_sample_embeddings(self, max_regen_attempts: int = 3) -> None:
+        """Verify cached voice sample embeddings cluster with their catalog gender.
+
+        Gemini sample renders occasionally drift to the wrong gender; a contaminated
+        sample embedding then makes every validation against that voice a no-op (a
+        female render matches a female-contaminated 'male' sample). Detected samples
+        are regenerated (up to ``max_regen_attempts`` times) and re-audited.
+        """
+        embeddings = self.voice_matcher.sample_embeddings
+        if not embeddings:
+            return
+        known = {v: g for v, g in GEMINI_VOICE_GENDERS.items() if g in {"male", "female"}}
+        vectors = {v: np.asarray(e, dtype=np.float64) for v, e in embeddings.items() if v in known}
+        if len(vectors) < 3:
+            return
+
+        def mean_group_sim(voice: str, group: List[str]) -> Optional[float]:
+            n_a = float(np.linalg.norm(vectors[voice]))
+            if n_a <= 1e-12:
+                return None
+            sims: List[float] = []
+            for other in group:
+                if other == voice:
+                    continue
+                n_o = float(np.linalg.norm(vectors[other]))
+                if n_o <= 1e-12:
+                    continue
+                sims.append(float(np.dot(vectors[voice], vectors[other]) / (n_a * n_o)))
+            return sum(sims) / len(sims) if sims else None
+
+        def find_suspicious() -> List[Tuple[str, str, str, float, float]]:
+            out: List[Tuple[str, str, str, float, float]] = []
+            for voice in vectors:
+                gender = known[voice]
+                same = [v for v, g in known.items() if g == gender and v in vectors]
+                opposite = [v for v, g in known.items() if g != gender and v in vectors]
+                sim_same = mean_group_sim(voice, same)
+                sim_opp = mean_group_sim(voice, opposite)
+                if sim_same is None or sim_opp is None:
+                    continue
+                if sim_opp > sim_same:
+                    out.append((voice, gender, f"opp={sim_opp:.3f} > same={sim_same:.3f}", sim_opp, sim_same))
+            return out
+
+        suspicious = find_suspicious()
+        if not suspicious:
+            logger.debug(f"Voice sample audit passed for {len(vectors)} voices.")
+            return
+
+        for voice, gender, detail, _, _ in suspicious:
+            logger.warning(
+                f"Voice sample audit: sample embedding for '{voice}' ({gender}) is closer to "
+                f"opposite-gender samples ({detail}) — sample looks contaminated, regenerating."
+            )
+
+        for voice, gender, detail, _, _ in suspicious:
+            for regen_attempt in range(max(1, max_regen_attempts)):
+                if not (self.voice_sample_manager and self.voice_sample_manager.regenerate_voice_sample(voice)):
+                    logger.error(f"Voice sample audit: regeneration failed for '{voice}'.")
+                    break
+                if voice in vectors:
+                    vec = embeddings.get(voice)
+                    if vec is not None:
+                        vectors[voice] = np.asarray(vec, dtype=np.float64)
+                still = find_suspicious()
+                if not any(v == voice for v, _, _, _, _ in still):
+                    logger.info(
+                        f"Voice sample audit: '{voice}' regenerated successfully "
+                        f"(attempt {regen_attempt + 1}/{max_regen_attempts})."
+                    )
+                    break
+                if regen_attempt + 1 >= max_regen_attempts:
+                    logger.error(
+                        f"Voice sample audit: '{voice}' still clusters with the opposite gender after "
+                        f"{max_regen_attempts} regeneration attempts. Consider overriding the voice "
+                        f"mapping for speakers assigned to it."
+                    )
 
     def _estimate_segment_duration_seconds(self, segment: TTSSegmentData, language: str) -> float:
         """Estimate segment duration (best-effort) for batching heuristics."""
@@ -1319,10 +1450,12 @@ class GeminiTTSWrapper(TTSInterface):
     def _validate_voice_consistency(
         self,
         audio_path: str,
-        expected_voice_name: str
+        expected_voice_name: str,
+        speaker_id: Optional[str] = None,
+        reference_audio_path: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[float]]:
         """
-        Validate synthesized audio against the expected sample voice embedding.
+        Validate synthesized audio against expected sample voice embedding and/or speaker reference.
 
         Returns:
             (is_valid, reason, similarity_score)
@@ -1336,35 +1469,153 @@ class GeminiTTSWrapper(TTSInterface):
         if not self.voice_matcher or not self.voice_matcher.audio_embedder:
             return True, "Voice matcher not available", None
 
-        if expected_voice_name not in self.voice_matcher.sample_embeddings:
-            logger.warning(
-                f"Voice consistency check skipped: no sample embedding for '{expected_voice_name}'"
-            )
-            return True, f"No sample embedding for '{expected_voice_name}'", None
+        # On-demand compute missing voice sample embedding if sample audio file exists
+        if expected_voice_name not in self.voice_matcher.sample_embeddings and self.voice_sample_manager:
+            ext = self.voice_sample_manager._get_audio_extension()
+            sample_file = self.voice_sample_manager.samples_dir / f"{expected_voice_name}.{ext}"
+            if sample_file.exists():
+                with self._voice_embeddings_lock:
+                    if expected_voice_name not in self.voice_matcher.sample_embeddings:
+                        emb = self.voice_matcher.extract_embedding_for_audio_file(sample_file)
+                        if emb is not None:
+                            self.voice_matcher.sample_embeddings[expected_voice_name] = emb
+                            logger.info(f"On-demand computed sample embedding for voice '{expected_voice_name}'")
 
         duration_seconds = AudioFileUtils.get_audio_duration_seconds(Path(audio_path))
         if (
             duration_seconds is None
             or duration_seconds < self.config.min_voice_validation_duration_seconds
         ):
-            return True, "Voice consistency skipped for short segment", None
-
-        similarity = self.voice_matcher.get_audio_similarity_to_voice(audio_path, expected_voice_name)
-        if similarity is None:
+            dur_str = f"{duration_seconds:.2f}s" if duration_seconds is not None else "unknown"
             logger.warning(
-                f"Voice consistency check skipped: could not compute embedding similarity for '{audio_path}'"
+                f"Voice consistency check skipped for short segment ({dur_str} < {self.config.min_voice_validation_duration_seconds:.2f}s): '{audio_path}'"
             )
-            return True, "Could not compute voice similarity", None
+            return True, f"Voice consistency skipped for short segment ({dur_str})", None
+
+        # Extract audio embedding of the synthesized clip
+        audio_embedding = self.voice_matcher.extract_embedding_for_audio_file(audio_path)
+        if audio_embedding is None:
+            logger.warning(
+                f"Voice consistency check skipped: could not extract embedding for '{audio_path}'"
+            )
+            return True, "Could not compute audio embedding", None
+
+        sim_voice_sample: Optional[float] = None
+        if expected_voice_name in self.voice_matcher.sample_embeddings:
+            sim_voice_sample = self.voice_matcher.get_voice_similarity(audio_embedding, expected_voice_name)
+
+        # Relative gender gate (hard): the clip must be closer to the expected voice
+        # sample than to ANY cached sample of the opposite gender. Gemini TTS
+        # embeddings are heavily compressed (cross-gender sim ~0.82 vs within-gender
+        # ~0.90), so the absolute threshold alone misses female/male voice drift.
+        if (
+            getattr(self.config, "enable_voice_gender_relative_check", True)
+            and sim_voice_sample is not None
+        ):
+            expected_gender = get_gemini_voice_gender(expected_voice_name)
+            if expected_gender in {"male", "female"}:
+                norm_a = float(np.linalg.norm(audio_embedding))
+                best_opp_name: Optional[str] = None
+                best_opp_sim: Optional[float] = None
+                if norm_a > 1e-12:
+                    for sample_voice, sample_emb in self.voice_matcher.sample_embeddings.items():
+                        if get_gemini_voice_gender(sample_voice) == expected_gender:
+                            continue
+                        norm_s = float(np.linalg.norm(sample_emb))
+                        if norm_s <= 1e-12:
+                            continue
+                        s = float(np.dot(audio_embedding, sample_emb) / (norm_a * norm_s))
+                        if np.isnan(s):
+                            continue
+                        if best_opp_sim is None or s > best_opp_sim:
+                            best_opp_sim = s
+                            best_opp_name = sample_voice
+                if best_opp_name is not None and best_opp_sim is not None:
+                    margin = max(0.0, float(getattr(self.config, "voice_gender_relative_margin", 0.0)))
+                    if best_opp_sim > sim_voice_sample + margin:
+                        logger.warning(
+                            f"Voice gender mismatch: clip closer to opposite-gender sample "
+                            f"'{best_opp_name}' ({best_opp_sim:.3f}) than to expected "
+                            f"'{expected_voice_name}' ({sim_voice_sample:.3f})"
+                        )
+                        return (
+                            False,
+                            f"Voice gender mismatch: closer to '{best_opp_name}' ({best_opp_sim:.3f}) "
+                            f"than to expected '{expected_voice_name}' ({sim_voice_sample:.3f})",
+                            sim_voice_sample,
+                        )
+
+        # Lookup speaker reference audio if not passed explicitly
+        if not reference_audio_path and speaker_id:
+            reference_audio_path = getattr(self, "_speaker_to_ref_path", {}).get(speaker_id)
+
+        sim_speaker_ref: Optional[float] = None
+        ref_path = Path(reference_audio_path) if reference_audio_path else None
+        speaker_key = speaker_id or (str(ref_path) if ref_path else None)
+
+        if speaker_key:
+            ref_emb = None
+            if speaker_key in self._speaker_ref_embeddings:
+                ref_emb = self._speaker_ref_embeddings[speaker_key]
+            elif ref_path and ref_path.exists():
+                ref_dur = AudioFileUtils.get_audio_duration_seconds(ref_path)
+                if ref_dur is not None and ref_dur >= 3.0:
+                    with self._voice_embeddings_lock:
+                        if speaker_key not in self._speaker_ref_embeddings:
+                            ref_emb = self.voice_matcher.extract_embedding_for_audio_file(ref_path)
+                            self._speaker_ref_embeddings[speaker_key] = ref_emb
+                            if ref_emb is not None:
+                                logger.debug(
+                                    f"Extracted and cached speaker reference embedding for '{speaker_key}'"
+                                )
+                        else:
+                            ref_emb = self._speaker_ref_embeddings[speaker_key]
+                else:
+                    logger.debug(
+                        f"Speaker reference audio '{ref_path.name}' is too short ({ref_dur}s) for voice consistency check"
+                    )
+
+            if ref_emb is not None:
+                try:
+                    norm_a = float(np.linalg.norm(audio_embedding))
+                    norm_r = float(np.linalg.norm(ref_emb))
+                    if norm_a > 1e-12 and norm_r > 1e-12:
+                        cos_sim = float(np.dot(audio_embedding, ref_emb) / (norm_a * norm_r))
+                        if not np.isnan(cos_sim):
+                            sim_speaker_ref = max(-1.0, min(1.0, cos_sim))
+                except Exception as exc:
+                    logger.warning(f"Error computing speaker reference similarity: {exc}")
+
+        mode = getattr(self.config, "voice_reference_mode", "max")
+        if mode == "voice_sample":
+            score = sim_voice_sample
+        elif mode == "speaker_ref":
+            score = sim_speaker_ref
+        else:  # "max"
+            valid_scores = [s for s in (sim_voice_sample, sim_speaker_ref) if s is not None]
+            score = max(valid_scores) if valid_scores else None
+
+        if score is None:
+            reason = f"No reference embeddings available for voice '{expected_voice_name}' or speaker '{speaker_id}'"
+            logger.warning(f"Voice consistency check skipped: {reason}")
+            return True, reason, None
 
         threshold = max(0.0, min(1.0, self.config.voice_similarity_threshold))
-        if similarity < threshold:
+        details = []
+        if sim_voice_sample is not None:
+            details.append(f"voice_sample={sim_voice_sample:.3f}")
+        if sim_speaker_ref is not None:
+            details.append(f"speaker_ref={sim_speaker_ref:.3f}")
+        details_str = f" ({', '.join(details)})" if details else ""
+
+        if score < threshold:
             return (
                 False,
-                f"Voice mismatch ({similarity:.3f} < {threshold:.3f}) for expected voice '{expected_voice_name}'",
-                similarity,
+                f"Voice mismatch ({score:.3f} < {threshold:.3f}){details_str} for expected voice '{expected_voice_name}'",
+                score,
             )
 
-        return True, f"Voice match ok ({similarity:.3f} >= {threshold:.3f})", similarity
+        return True, f"Voice match ok ({score:.3f} >= {threshold:.3f}){details_str}", score
 
     def _record_duration_stats(
         self,
@@ -1643,22 +1894,43 @@ class GeminiTTSWrapper(TTSInterface):
                 if cache_key in self._audio_cache:
                     cached_path, _ = self._audio_cache[cache_key]
                     if os.path.exists(cached_path):
-                        shutil.copy(cached_path, temp_output_path)
-                        logger.debug(f"  Gemini: Using cached audio for speaker {segment_data.speaker}")
-                        self._record_segment_report(SegmentSynthesisReport(
-                            segment_index=report_segment_index if report_segment_index is not None else -1,
-                            speaker=segment_data.speaker,
-                            text=current_text,
-                            requested_model=primary_model_name,
-                            actual_model=primary_model_name,
-                            attempts=0,
-                            used_fallback=False,
-                            success=True,
-                            duration_seconds=time.perf_counter() - synth_start_ts,
-                            output_path=temp_output_path,
-                            group_id=report_group_id,
-                        ))
-                        return None, None, True
+                        voice_name = self._resolve_voice_for_segment(segment_data)
+                        cache_valid, cache_reason, cache_sim = self._validate_voice_consistency(
+                            cached_path,
+                            voice_name,
+                            speaker_id=segment_data.speaker,
+                            reference_audio_path=segment_data.reference_audio_path,
+                        )
+                        if not cache_valid:
+                            logger.warning(
+                                f"  Gemini: Cached audio for speaker {segment_data.speaker} failed voice "
+                                f"re-validation ({cache_reason}) — dropping cache entry and re-synthesizing."
+                            )
+                            try:
+                                os.remove(cached_path)
+                            except OSError:
+                                pass
+                            self._audio_cache.pop(cache_key, None)
+                        else:
+                            shutil.copy(cached_path, temp_output_path)
+                            logger.debug(f"  Gemini: Using cached audio for speaker {segment_data.speaker}")
+                            self._record_segment_report(SegmentSynthesisReport(
+                                segment_index=report_segment_index if report_segment_index is not None else -1,
+                                speaker=segment_data.speaker,
+                                text=current_text,
+                                requested_model=primary_model_name,
+                                actual_model=primary_model_name,
+                                attempts=0,
+                                used_fallback=False,
+                                success=True,
+                                duration_seconds=time.perf_counter() - synth_start_ts,
+                                output_path=temp_output_path,
+                                group_id=report_group_id,
+                                voice_similarity=cache_sim,
+                                voice_validation=f"cached; {cache_reason}",
+                                voice_forced=False,
+                            ))
+                            return None, None, True
 
                 success, best_silence, best_similarity, best_path, best_text, model_used, best_content_valid = self._attempt_segment_synthesis(
                     segment_data, temp_output_path, language, primary_model_retries, max_silence_ratio=0.2,  # was 0.02 — 10x relaxed
@@ -1682,6 +1954,9 @@ class GeminiTTSWrapper(TTSInterface):
                         duration_seconds=time.perf_counter() - synth_start_ts,
                         output_path=temp_output_path,
                         group_id=report_group_id,
+                        voice_similarity=best_similarity,
+                        voice_validation=f"Voice match ok ({best_similarity:.3f})" if best_similarity is not None else "skipped",
+                        voice_forced=False,
                     ))
                     return best_text, model_used, True
 
@@ -1787,6 +2062,9 @@ class GeminiTTSWrapper(TTSInterface):
                         duration_seconds=time.perf_counter() - synth_start_ts,
                         output_path=temp_output_path,
                         group_id=report_group_id,
+                        voice_similarity=fb_similarity,
+                        voice_validation=f"Voice match ok ({fb_similarity:.3f})" if fb_similarity is not None else "skipped",
+                        voice_forced=False,
                     ))
                     return fb_text, fb_model_used, True
 
@@ -1826,6 +2104,80 @@ class GeminiTTSWrapper(TTSInterface):
                     _cleanup_paths([primary_best["path"]])
                 return split_result
 
+            # If all standard attempts failed and the failure involves a voice mismatch,
+            # attempt a forced voice switch to a gender-compatible voice as a last resort.
+            voice_mismatch_in_best = (
+                self.config.enable_voice_consistency_validation
+                and primary_best is not None
+                and primary_best.get("similarity") is not None
+                and primary_best["similarity"] < self.config.voice_similarity_threshold
+            )
+            speaker_id = segment_data.speaker or ""
+            speaker_gender = self._get_effective_speaker_gender(speaker_id)
+            if voice_mismatch_in_best and speaker_gender in {"male", "female"}:
+                target_voice = self._get_gender_aware_default_voice(speaker_id)
+                current_voice = self._resolve_voice_for_segment(segment_data)
+                forced_voice = target_voice
+                if forced_voice == current_voice:
+                    candidates = [
+                        v for v in list_gemini_voices_for_gender(speaker_gender)
+                        if v != current_voice and v not in (self.config.blocked_voices or [])
+                    ]
+                    if candidates:
+                        forced_voice = candidates[0]
+
+                if forced_voice != current_voice:
+                    logger.warning(
+                        f"Voice similarity for speaker '{speaker_id}' remained below threshold ({primary_best['similarity']:.3f} < {self.config.voice_similarity_threshold:.3f}). "
+                        f"Attempting forced gender-compatible voice '{forced_voice}' (gender={speaker_gender}) as last resort..."
+                    )
+                    forced_seg = segment_data.copy(update={"voice": forced_voice})
+                    self.api_client.set_model(self.config.model)
+                    fv_success, fv_silence, fv_similarity, fv_path, fv_text, fv_model_used, fv_content_valid = self._attempt_segment_synthesis(
+                        forced_seg, temp_output_path, language, 1, max_silence_ratio=0.2,
+                        previous_segments=previous_segments,
+                        usage_tracker=usage_tracker,
+                        attempts_counter=attempts_counter,
+                    )
+                    if fv_success and fv_path:
+                        if primary_best is not None:
+                            _cleanup_paths([primary_best["path"]])
+                        shutil.move(fv_path, temp_output_path)
+                        self._record_segment_report(SegmentSynthesisReport(
+                            segment_index=report_segment_index if report_segment_index is not None else -1,
+                            speaker=segment_data.speaker,
+                            text=fv_text or current_text,
+                            requested_model=primary_model_name,
+                            actual_model=fv_model_used or primary_model_name,
+                            attempts=attempts_counter[0],
+                            used_fallback=bool(fv_model_used and fv_model_used != primary_model_name),
+                            success=True,
+                            duration_seconds=time.perf_counter() - synth_start_ts,
+                            output_path=temp_output_path,
+                            group_id=report_group_id,
+                            voice_similarity=fv_similarity,
+                            voice_validation=f"Forced voice match ok ({fv_similarity:.3f})" if fv_similarity is not None else "forced voice accepted",
+                            voice_forced=True,
+                        ))
+                        return fv_text, fv_model_used, True
+                    elif fv_path:
+                        fv_rank = _quality_rank(fv_silence, fv_similarity, fv_content_valid)
+                        if primary_best is None or fv_rank < primary_best["rank"]:
+                            if primary_best is not None:
+                                _cleanup_paths([primary_best["path"]])
+                            primary_best = {
+                                "path": fv_path,
+                                "text": fv_text,
+                                "model": fv_model_used,
+                                "silence": fv_silence,
+                                "similarity": fv_similarity,
+                                "content_valid": fv_content_valid,
+                                "rank": fv_rank,
+                                "voice_forced": True,
+                            }
+                        else:
+                            _cleanup_paths([fv_path])
+
             if primary_best is None:
                 self._record_segment_report(SegmentSynthesisReport(
                     segment_index=report_segment_index if report_segment_index is not None else -1,
@@ -1840,6 +2192,9 @@ class GeminiTTSWrapper(TTSInterface):
                     output_path=None,
                     group_id=report_group_id,
                     error="all attempts failed",
+                    voice_similarity=None,
+                    voice_validation="All attempts failed",
+                    voice_forced=False,
                 ))
                 raise RuntimeError(
                     f"Failed to synthesize segment for speaker {segment_data.speaker} after all attempts."
@@ -1854,6 +2209,7 @@ class GeminiTTSWrapper(TTSInterface):
                 f"content_valid: {primary_best['content_valid']})"
             )
             shutil.move(primary_best["path"], temp_output_path)
+            was_forced = bool(primary_best.get("voice_forced", False))
             self._record_segment_report(SegmentSynthesisReport(
                 segment_index=report_segment_index if report_segment_index is not None else -1,
                 speaker=segment_data.speaker,
@@ -1867,6 +2223,9 @@ class GeminiTTSWrapper(TTSInterface):
                 output_path=temp_output_path,
                 group_id=report_group_id,
                 error=f"validation failed (silence={primary_best['silence']:.2f}, content_valid={primary_best['content_valid']})",
+                voice_similarity=primary_best.get("similarity"),
+                voice_validation="Failed validation (best attempt used)",
+                voice_forced=was_forced,
             ))
             return primary_best["text"], primary_best["model"], False
         finally:
@@ -2029,7 +2388,9 @@ class GeminiTTSWrapper(TTSInterface):
                 if is_valid:
                     voice_valid, voice_reason, voice_similarity = self._validate_voice_consistency(
                         temp_attempt_path,
-                        voice_name
+                        voice_name,
+                        speaker_id=segment_data.speaker,
+                        reference_audio_path=segment_data.reference_audio_path,
                     )
 
                 content_valid = True
@@ -2422,6 +2783,8 @@ class GeminiTTSWrapper(TTSInterface):
                 candidate_alignments: Dict[int, SegmentAlignment] = {}
                 candidate_slice_paths: Dict[int, str] = {}
                 candidate_durations: Dict[int, float] = {}
+                slice_similarities: Dict[int, Optional[float]] = {}
+                slice_voice_reasons: Dict[int, str] = {}
                 invalid_local_indices: List[int] = []
                 for local_i, seg in enumerate(batch):
                     global_i = batch_indices[local_i]
@@ -2517,7 +2880,12 @@ class GeminiTTSWrapper(TTSInterface):
                     voice_name = self._resolve_voice_for_segment(seg)
                     voice_valid, voice_reason, sim = (True, "", None)
                     if is_valid:
-                        voice_valid, voice_reason, sim = self._validate_voice_consistency(slice_path, voice_name)
+                        voice_valid, voice_reason, sim = self._validate_voice_consistency(
+                            slice_path,
+                            voice_name,
+                            speaker_id=seg.speaker,
+                            reference_audio_path=seg.reference_audio_path,
+                        )
 
                     if not is_valid:
                         logger.info(
@@ -2552,6 +2920,8 @@ class GeminiTTSWrapper(TTSInterface):
                     )
                     candidate_slice_paths[local_i] = slice_path
                     candidate_durations[local_i] = duration
+                    slice_similarities[local_i] = sim
+                    slice_voice_reasons[local_i] = voice_reason
 
                 alignments: Dict[int, SegmentAlignment] = {
                     batch_indices[local_i]: alignment
@@ -2585,6 +2955,9 @@ class GeminiTTSWrapper(TTSInterface):
                         duration_seconds=duration,
                         output_path=seg.output_path or slice_path,
                         group_id=getattr(seg, "group_id", None),
+                        voice_similarity=slice_similarities.get(local_i),
+                        voice_validation=slice_voice_reasons.get(local_i),
+                        voice_forced=False,
                     ))
 
                     # Populate wrapper-level audio cache only after all batch
@@ -2689,42 +3062,64 @@ class GeminiTTSWrapper(TTSInterface):
         if cache_key in self._audio_cache:
             cached_path, duration = self._audio_cache[cache_key]
             if os.path.exists(cached_path):
-                logger.debug(f"Gemini: Using cached segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
-                shutil.copy(cached_path, segment_file_path)
-
-                # Save to output path if specified
-                if segment.output_path:
-                    os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
-                    shutil.copy(segment_file_path, segment.output_path)
-                    logger.debug(f"Saved segment audio to {segment.output_path}")
-
-                self._record_segment_report(SegmentSynthesisReport(
-                    segment_index=report_segment_index,
-                    speaker=segment.speaker,
-                    text=segment.text,
-                    requested_model=self.config.model,
-                    actual_model=self.config.model,
-                    attempts=0,
-                    used_fallback=False,
-                    success=True,
-                    duration_seconds=0.0,
-                    output_path=segment.output_path or segment_file_path,
-                    group_id=report_group_id,
-                ))
-
-                # Create alignment using cached duration
-                diarized = DiarizationSegment(
-                    start_time=0.0,
-                    end_time=duration,
-                    speaker=segment.speaker,
-                    text=segment.text,
-                    confidence=1.0
+                voice_name = self._resolve_voice_for_segment(segment)
+                cache_valid, cache_reason, cache_sim = self._validate_voice_consistency(
+                    cached_path,
+                    voice_name,
+                    speaker_id=segment.speaker,
+                    reference_audio_path=segment.reference_audio_path,
                 )
-                return SegmentAlignment(
-                    original_segment=segment,
-                    diarized_segment=diarized,
-                    alignment_confidence=1.0
-                )
+                if not cache_valid:
+                    logger.warning(
+                        f"Gemini: Cached segment {segment_index+1}/{total_segments} for speaker "
+                        f"'{segment.speaker}' failed voice re-validation ({cache_reason}) — "
+                        f"dropping cache entry and re-synthesizing."
+                    )
+                    try:
+                        os.remove(cached_path)
+                    except OSError:
+                        pass
+                    self._audio_cache.pop(cache_key, None)
+                else:
+                    logger.debug(f"Gemini: Using cached segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
+                    shutil.copy(cached_path, segment_file_path)
+
+                    # Save to output path if specified
+                    if segment.output_path:
+                        os.makedirs(os.path.dirname(segment.output_path), exist_ok=True)
+                        shutil.copy(segment_file_path, segment.output_path)
+                        logger.debug(f"Saved segment audio to {segment.output_path}")
+
+                    self._record_segment_report(SegmentSynthesisReport(
+                        segment_index=report_segment_index,
+                        speaker=segment.speaker,
+                        text=segment.text,
+                        requested_model=self.config.model,
+                        actual_model=self.config.model,
+                        attempts=0,
+                        used_fallback=False,
+                        success=True,
+                        duration_seconds=0.0,
+                        output_path=segment.output_path or segment_file_path,
+                        group_id=report_group_id,
+                        voice_similarity=cache_sim,
+                        voice_validation=f"cached; {cache_reason}",
+                        voice_forced=False,
+                    ))
+
+                    # Create alignment using cached duration
+                    diarized = DiarizationSegment(
+                        start_time=0.0,
+                        end_time=duration,
+                        speaker=segment.speaker,
+                        text=segment.text,
+                        confidence=1.0
+                    )
+                    return SegmentAlignment(
+                        original_segment=segment,
+                        diarized_segment=diarized,
+                        alignment_confidence=1.0
+                    )
 
         # If not cached, synthesize normally
         logger.debug(f"Gemini: Synthesizing segment {segment_index+1}/{total_segments} for speaker '{segment.speaker}'")
@@ -2846,6 +3241,11 @@ class GeminiTTSWrapper(TTSInterface):
         if not valid_segments:
             logger.warning("Warning: No valid segments found.")
             return []
+
+        # Collect speaker reference audio paths for voice consistency validation
+        for segment in valid_segments:
+            if segment.speaker and segment.reference_audio_path and segment.speaker not in self._speaker_to_ref_path:
+                self._speaker_to_ref_path[segment.speaker] = segment.reference_audio_path
 
         # Auto-pin voices for unmapped speakers with reference audio
         if self.config.enable_voice_matching and self.voice_matcher.audio_embedder:
@@ -3089,6 +3489,8 @@ class GeminiTTSWrapper(TTSInterface):
             shutil.rmtree(self._cache_dir, ignore_errors=True)
             self._cache_dir = None
         self._audio_cache.clear()
+        self._speaker_ref_embeddings.clear()
+        self._speaker_to_ref_path.clear()
         
         # Clear voice matcher
         if self.voice_matcher:

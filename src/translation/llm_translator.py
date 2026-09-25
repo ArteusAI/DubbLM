@@ -69,7 +69,7 @@ logger = get_logger(__name__)
 
 EditorReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh", "none"]
 EDITOR_SCHEMA_VERSION = "v2"
-DEFAULT_EDITOR_OPENROUTER_MODEL = "openai/gpt-5.4"
+DEFAULT_EDITOR_OPENROUTER_MODEL = "openai/gpt-5.6-terra"
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 EDITOR_REASONING_MIN_MAX_TOKENS: Dict[EditorReasoningEffort, int] = {
     "none": 16384,
@@ -80,6 +80,10 @@ EDITOR_REASONING_MIN_MAX_TOKENS: Dict[EditorReasoningEffort, int] = {
     "xhigh": 65536,
 }
 EDITOR_MODEL_MAX_OUTPUT_TOKENS: Dict[str, int] = {
+    "openai/gpt-5.6-terra": 128000,
+    "gpt-5.6-terra": 128000,
+    "openai/gpt-5.6-sol": 128000,
+    "gpt-5.6-sol": 128000,
     "openai/gpt-5.4": 128000,
     "gpt-5.4": 128000,
     "openai/gpt-5.4-pro": 128000,
@@ -118,6 +122,7 @@ class LLMTranslator(TranslationInterface):
         editor_reasoning_effort: Optional[EditorReasoningEffort] = None,
         tts_system: Optional[str] = None,
         tts_system_mapping: Optional[Dict[str, str]] = None,
+        tts_model: Optional[str] = None,
     ):
         """
         Initialize LLM translator.
@@ -201,6 +206,7 @@ class LLMTranslator(TranslationInterface):
             for speaker, system in raw_tts_mapping.items()
             if str(speaker).strip() and str(system).strip()
         }
+        self.tts_model = str(tts_model or "").strip() or None
 
     def set_speaker_metadata(self, speaker_metadata: Optional[Dict[str, Dict[str, Any]]]) -> None:
         """Persist speaker metadata for subsequent translation/refinement steps."""
@@ -273,26 +279,39 @@ class LLMTranslator(TranslationInterface):
             return self.tts_system_mapping["*"]
         return self.tts_system or "unknown"
 
+    def _openrouter_uses_qwen_tags(self) -> bool:
+        """Qwen demo tags only apply to qwen/* OpenRouter speech models."""
+        model = (self.tts_model or "").strip().lower()
+        if not model:
+            # Backward-compatible default when only tts_system=openrouter is set.
+            return True
+        return model.startswith("qwen/")
+
+    def _openrouter_is_grok_tts(self) -> bool:
+        model = (self.tts_model or "").strip().lower()
+        return model.startswith("x-ai/") or "grok-voice-tts" in model
+
     def _editor_tts_signature(self) -> str:
         mapping_signature = ",".join(
             f"{speaker}:{system}"
             for speaker, system in sorted(self.tts_system_mapping.items())
         )
-        return f"default={self.tts_system or 'unknown'}|mapping={mapping_signature}"
+        model_sig = (self.tts_model or "").strip() or "default"
+        return f"default={self.tts_system or 'unknown'}|model={model_sig}|mapping={mapping_signature}"
 
     def _build_editor_tts_guidance(self, batch_segments: List[Dict[str, Any]]) -> str:
         batch_tts_systems = {
             self._resolve_tts_system_for_speaker(segment.get("speaker"))
             for segment in batch_segments
         }
-        if "gemini" not in batch_tts_systems:
-            return ""
+        sections: List[str] = []
 
-        return """
+        if "gemini" in batch_tts_systems:
+            sections.append("""
 # Gemini TTS delivery guidance
 - Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup and pause markers directly in the output text.
 - Allowed Gemini-friendly markup includes tags such as [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
-- Pause markers: [short pause] (~0.3-0.5s), [medium pause] (~0.7-1.0s), [long pause] (~1.5-2.0s). Use them actively to break monotony and help the listener absorb information.
+- Pause markers: [short pause], [long pause]. Use them actively to break monotony and help the listener absorb information.
 - You SHOULD insert pause markers wherever they improve pacing and comprehension. Uninterrupted continuous speech is hard to follow in dubbing.
 - Good pause locations: after a completed clause or phrase; before an important term, number, or contrast; between list items or sequential steps; after a rhetorical setup and before the payoff; between distinct ideas inside a longer `long` variant.
 - For explanatory, instructional, or multi-clause lines, include at least one pause unless the line is very short (roughly under ~8 words).
@@ -305,9 +324,41 @@ class LLMTranslator(TranslationInterface):
 - Prefer pause markers over filler/breath tags for pacing and clarity. Most explanatory lines should use zero filler sounds, but pauses are encouraged.
 - Preserve the exact factual meaning and keep the text natural in the target language.
 - Avoid turning tags into standalone content. They should support delivery, not replace wording.
-- For non-Gemini slots, do not add markup tags or pause markers.
+- For non-Gemini slots, do not add Gemini markup tags or pause markers.
 - For very short variants (`very_short`), use fewer pauses; for `long` variants, use pauses more generously when the content has multiple beats.
-""".strip()
+""".strip())
+
+        if "openrouter" in batch_tts_systems:
+            if self._openrouter_uses_qwen_tags():
+                sections.append("""
+# OpenRouter Qwen TTS delivery guidance
+- Only for slots where `tts_system` is `openrouter`, you MAY add Qwen-Audio-3.0 demo tags in the output text.
+- Allowed tags ONLY (official demo whitelist): [excited], [panicked], [laughing], [amazed], [angry], [mischievously], [giggles], [sarcastic, speaking slowly].
+- Prefer at most one leading emotion/style tag. Combinations seen in the demo are allowed (e.g. [excited]...[laughing], [mischievously][giggles]).
+- Do NOT use Gemini-only markup ([uhm], [robotic], [short pause], [whispering], [extremely fast], etc.).
+- Do NOT invent new tag names. Unknown tags may be spoken aloud as words by the model.
+- Use tags sparingly; many lines should stay untagged.
+- Preserve exact factual meaning and natural target-language wording.
+- For non-OpenRouter slots, do not add Qwen tags.
+""".strip())
+            elif self._openrouter_is_grok_tts():
+                sections.append("""
+# OpenRouter Grok Voice TTS delivery guidance
+- Only for slots where `tts_system` is `openrouter` with Grok Voice TTS.
+- Do NOT add Qwen demo tags, Gemini markup, pause markers, or invented bracket tags.
+- Output plain natural target-language text only. Unknown tags may be spoken aloud.
+- Preserve exact factual meaning and natural wording.
+""".strip())
+            else:
+                sections.append("""
+# OpenRouter TTS delivery guidance
+- Only for slots where `tts_system` is `openrouter`.
+- Do NOT add Qwen demo tags, Gemini markup, or invented bracket tags unless this model is known to support them.
+- Prefer plain natural target-language text. Unknown tags may be spoken aloud.
+- Preserve exact factual meaning and natural wording.
+""".strip())
+
+        return "\n\n".join(sections)
 
     def _build_refinement_tts_guidance(self, translated_pairs: List[Dict[str, Any]]) -> str:
         """Build TTS markup guidance for the refinement pass."""
@@ -320,13 +371,16 @@ class LLMTranslator(TranslationInterface):
             f"{editor_guidance}\n\n"
             "# Refinement-specific markup rules\n"
             "- CRITICAL: Input translations may already include TTS markup tags in square brackets "
-            "(e.g. [excited], [short pause], [sigh]). You MUST preserve every existing tag when rephrasing.\n"
-            "- Do NOT strip, normalize away, or rewrite markup tags as plain words while improving flow, persona, or grammar.\n"
-            "- You SHOULD enhance delivery: keep existing tags, reposition them only when it clearly improves pacing, "
-            "add pause markers where comprehension or rhythm improves, and strengthen expressive tags when context supports them.\n"
-            "- Carry markup tags through to all required output variants (`text`, `long`, and shorter variants when present). "
-            "Shorter variants may use fewer pauses but must not drop intentional emotion tags without reason.\n"
-            "- If an input line has no tags yet, you MAY add subtle Gemini-friendly markup following the rules above."
+            "(e.g. [excited], [short pause], [sigh]). You MUST preserve every existing tag when rephrasing "
+            "only when the provider guidance above allows those tags.\n"
+            "- Do NOT strip, normalize away, or rewrite markup tags as plain words while improving flow, persona, or grammar "
+            "if those tags are allowed for the slot's TTS system.\n"
+            "- You SHOULD enhance delivery only within the provider rules above: keep existing allowed tags, "
+            "reposition them only when it clearly improves pacing, and do not invent tags for models that require plain text.\n"
+            "- Carry markup tags through to all required output variants (`text`, `long`, and shorter variants when present) "
+            "when the provider allows markup. Shorter variants may use fewer pauses but must not drop intentional emotion tags without reason.\n"
+            "- If an input line has no tags yet, you MAY add subtle provider-friendly markup following the rules above "
+            "(Gemini tags for gemini slots, Qwen demo tags for openrouter+qwen slots; plain text for Grok Voice TTS)."
         )
 
     def _translation_tts_guidance_signature(self) -> str:
@@ -334,41 +388,77 @@ class LLMTranslator(TranslationInterface):
             return "off"
         configured_systems = {self.tts_system or ""}
         configured_systems.update(self.tts_system_mapping.values())
-        if "gemini" not in configured_systems:
+        active = sorted(s for s in configured_systems if s in ("gemini", "gemini38", "openrouter"))
+        if not active:
             return "off"
-        return f"on|{self._editor_tts_signature()}"
+        model_sig = (self.tts_model or "").strip() or "default"
+        return f"on|{'+'.join(active)}|{model_sig}|{self._editor_tts_signature()}"
 
     def _build_translation_tts_guidance(self, speakers: Optional[List[str]]) -> str:
         if self.enable_llm_editor or self.enable_emotion_enrichment:
             return ""
 
         normalized_speakers = [str(speaker).strip() for speaker in speakers or [] if str(speaker).strip()]
+        sections: List[str] = []
+
         gemini_speakers = [
             speaker
             for speaker in normalized_speakers
-            if self._resolve_tts_system_for_speaker(speaker) == "gemini"
+            if self._resolve_tts_system_for_speaker(speaker) in ("gemini", "gemini38")
         ]
-
-        if not gemini_speakers and self._resolve_tts_system_for_speaker("*") != "gemini":
-            return ""
-
-        if gemini_speakers:
-            speaker_scope = ", ".join(gemini_speakers)
-        else:
-            speaker_scope = "all speakers in this chunk"
-
-        return f"""
+        if gemini_speakers or self._resolve_tts_system_for_speaker("*") in ("gemini", "gemini38"):
+            speaker_scope = ", ".join(gemini_speakers) if gemini_speakers else "all speakers in this chunk"
+            sections.append(f"""
 # Gemini TTS delivery guidance
 Gemini TTS speakers in this chunk: {speaker_scope}.
 - You MAY add subtle expressive markup directly in translated text for Gemini TTS speakers only.
 - Allowed Gemini-friendly markup includes [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
-- You MAY insert pause markers [short pause], [medium pause], or [long pause] where they sound natural and improve delivery.
+- You MAY insert pause markers [short pause] or [long pause] where they sound natural and improve delivery.
 - Insert tags only where context clearly supports them; many lines should stay untagged.
 - Do not add [uhm] just to sound conversational. Use it only for obvious hesitation, stumbling, or self-interruption already implied by the source.
 - Prefer pause markers or ordinary expressive tags over filler or breath tags.
 - Preserve exact meaning, facts, names, numbers, and natural target-language wording.
 - Do not add markup for non-Gemini speakers.
-""".strip()
+""".strip())
+
+        openrouter_speakers = [
+            speaker
+            for speaker in normalized_speakers
+            if self._resolve_tts_system_for_speaker(speaker) == "openrouter"
+        ]
+        if openrouter_speakers or self._resolve_tts_system_for_speaker("*") == "openrouter":
+            speaker_scope = ", ".join(openrouter_speakers) if openrouter_speakers else "all speakers in this chunk"
+            if self._openrouter_uses_qwen_tags():
+                sections.append(f"""
+# OpenRouter Qwen TTS delivery guidance
+OpenRouter TTS speakers in this chunk: {speaker_scope}.
+- You MAY add Qwen-Audio-3.0 demo tags for openrouter speakers only.
+- Allowed tags ONLY: [excited], [panicked], [laughing], [amazed], [angry], [mischievously], [giggles], [sarcastic, speaking slowly].
+- Prefer a single leading tag; use sparingly. Do not invent new tags.
+- Do not use Gemini pause/filler tags for openrouter speakers.
+- Preserve exact meaning, facts, names, numbers, and natural target-language wording.
+- Do not add markup for non-OpenRouter speakers.
+""".strip())
+            elif self._openrouter_is_grok_tts():
+                sections.append(f"""
+# OpenRouter Grok Voice TTS delivery guidance
+OpenRouter TTS speakers in this chunk: {speaker_scope}.
+- Do NOT add Qwen demo tags, Gemini markup, pause markers, or invented bracket tags.
+- Output plain natural target-language text only.
+- Preserve exact meaning, facts, names, numbers, and natural wording.
+- Do not add markup for non-OpenRouter speakers.
+""".strip())
+            else:
+                sections.append(f"""
+# OpenRouter TTS delivery guidance
+OpenRouter TTS speakers in this chunk: {speaker_scope}.
+- Prefer plain natural target-language text without invented bracket tags.
+- Do not use Gemini or Qwen markup unless this model is known to support it.
+- Preserve exact meaning, facts, names, numbers, and natural wording.
+- Do not add markup for non-OpenRouter speakers.
+""".strip())
+
+        return "\n\n".join(sections)
 
     def _normalize_term_key(self, term: str) -> str:
         return re.sub(r"[^a-z0-9.+_/#:-]+", "", term.strip().lower())
@@ -503,14 +593,14 @@ Gemini TTS speakers in this chunk: {speaker_scope}.
 Tags (use sparingly and only when they help delivery):
 - Expressive tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers]
 - Non-speech sounds: [sigh], [uhm]
-- Pauses: [short pause], [medium pause], [long pause]
+- Pauses: [short pause], [long pause]
 
 Rules:
 - Preserve the original words and meaning; only add lightweight tags.
 - Keep length close to the input; avoid doubling length.
 - Use tags sparingly - they work best when text content already implies the emotion/style.
 - Do not add [uhm] unless the line clearly implies hesitation, stumbling, or a self-interruption. Do not add filler sounds to neutral explanatory sentences.
-- Prefer [short pause], [medium pause], [long pause], or ordinary expressive tags over filler/breath tags.
+- Prefer [short pause], [long pause], or ordinary expressive tags over filler/breath tags.
 - The input may already contain markup tags from an earlier editing step; preserve good existing tags, improve them when useful, and avoid duplicating or stacking near-identical tags.
 - If a pause or emotion tag is already present, you may reposition, replace, or remove it to make the delivery better, but do not blindly add more tags on top.
 - Use bracket tags exactly as provided (e.g. [whispers], not \"whispering\"). Do not invent new tag syntax.
@@ -3220,14 +3310,13 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 
         # Build pause markers section only for Gemini TTS
         pause_markers_section = ""
-        if tts_system and tts_system.lower() == "gemini" and safe_ratio > 1.0:
+        if tts_system and tts_system.lower() in ("gemini", "gemini38") and safe_ratio > 1.0:
             logger.debug("Enabling pause markers for Gemini TTS lengthening")
             pause_markers_section = """
 # Pause Markers for Lengthening
 When lengthening text, if natural expansion is insufficient to reach the target length, you may strategically insert pause markers to extend the spoken duration:
-- [short pause] - Brief natural pause (~0.3-0.5 seconds)
-- [medium pause] - Moderate pause (~0.7-1.0 seconds)
-- [long pause] - Extended pause (~1.5-2.0 seconds)
+- [short pause] - Brief natural pause
+- [long pause] - Extended pause
 
 Use pause markers naturally at appropriate points:
 - After introductory phrases or transition words
@@ -3239,8 +3328,8 @@ Do NOT overuse pause markers. They should feel natural and enhance the delivery,
 """
 
         # Update lengthening guidance based on TTS system
-        if tts_system and tts_system.lower() == "gemini":
-            lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts. If natural expansion is still insufficient, strategically place pause markers [short pause], [medium pause], or [long pause] at appropriate locations to reach the target duration while maintaining natural flow."
+        if tts_system and tts_system.lower() in ("gemini", "gemini38"):
+            lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts. If natural expansion is still insufficient, strategically place pause markers [short pause] or [long pause] at appropriate locations to reach the target duration while maintaining natural flow."
             logger.debug("Using Gemini-specific lengthening guidance with pause markers")
         else:
             lengthening_guidance = "If lengthening: add natural connective phrases, brief clarifications, or gentle elaboration that does not introduce new facts."

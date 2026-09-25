@@ -54,6 +54,8 @@ class ProjectConfig(BaseModel):
     ttsSystem: Optional[str] = None
     ttsModel: Optional[str] = None
     ttsFallbackModel: Optional[str] = None
+    enableContextStyle: Optional[bool] = None
+    contextStyleMaxChars: Optional[int] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
@@ -117,6 +119,8 @@ class ProjectConfigUpdate(BaseModel):
     ttsSystem: Optional[str] = None
     ttsModel: Optional[str] = None
     ttsFallbackModel: Optional[str] = None
+    enableContextStyle: Optional[bool] = None
+    contextStyleMaxChars: Optional[int] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
@@ -357,6 +361,7 @@ class VoiceResponse(BaseModel):
     gender: Optional[str] = None
     language: Optional[str] = None
     preview_url: Optional[str] = None
+    description: Optional[str] = None
 
 
 class PersonaResponse(BaseModel):

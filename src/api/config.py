@@ -47,6 +47,23 @@ class Settings:
     # Project storage settings
     projects_dir: Path = field(default_factory=lambda: Path(os.getenv("PROJECTS_DIR", "./projects")).resolve())
     max_upload_size: int = 5 * 1024 * 1024 * 1024  # 5GB
+    keep_debug_artifacts: bool = field(
+        default_factory=lambda: os.getenv("KEEP_DEBUG_ARTIFACTS", "false").lower() in ("1", "true", "yes")
+    )
+
+    # S3 / Hetzner Object Storage (optional)
+    s3_endpoint_url: str | None = field(default_factory=lambda: os.getenv("S3_ENDPOINT_URL") or None)
+    s3_access_key: str | None = field(default_factory=lambda: os.getenv("S3_ACCESS_KEY") or None)
+    s3_secret_key: str | None = field(default_factory=lambda: os.getenv("S3_SECRET_KEY") or None)
+    s3_bucket: str | None = field(default_factory=lambda: os.getenv("S3_BUCKET") or None)
+    s3_region: str = field(default_factory=lambda: os.getenv("S3_REGION", "fsn1"))
+    s3_prefix: str = field(default_factory=lambda: (os.getenv("S3_PREFIX") or "dubblm").strip().strip("/"))
+    s3_enabled: bool = field(
+        default_factory=lambda: os.getenv("S3_ENABLED", "true").lower() in ("1", "true", "yes")
+    )
+    s3_presign_expires: int = field(
+        default_factory=lambda: int(os.getenv("S3_PRESIGN_EXPIRES", str(7 * 24 * 3600)))  # 7 days
+    )
     
     # Video download settings (yt-dlp)
     max_download_size: int = field(default_factory=lambda: int(os.getenv("MAX_DOWNLOAD_SIZE", str(8 * 1024 * 1024 * 1024))))  # 8GB

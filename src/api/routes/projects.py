@@ -155,7 +155,13 @@ async def delete_project(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
-    # Delete project files
+    # Delete remote archive first (uses project_id), then local files
+    try:
+        from ..services.object_storage import get_object_storage
+        get_object_storage().delete_project(project_id)
+    except Exception:
+        pass
+
     ProjectManager.cleanup_project(project_id)
     
     # Delete from database

@@ -22,6 +22,9 @@ class SegmentSynthesisReport:
     output_path: Optional[str] = None
     group_id: Optional[str] = None
     error: Optional[str] = None
+    voice_similarity: Optional[float] = None
+    voice_validation: Optional[str] = None
+    voice_forced: bool = False
 
 
 @dataclass
@@ -56,6 +59,21 @@ class TTSSegmentData(BaseModel):
     style_prompt: Optional[str] = Field(None, description="Specific style prompt for this segment, overriding any global speaker-to-style_prompt mappings.")
     reference_audio_path: Optional[str] = Field(None, description="Path to a reference audio file for voice cloning for this specific segment/speaker.")
     reference_text: Optional[str] = Field(None, description="Text corresponding to the reference_audio_path, if required by the TTS system.")
+    source_audio_path: Optional[str] = Field(
+        None,
+        description="Path to the original full source audio (or vocals stem) used to build multi-sample speaker reference profiles.",
+    )
+    speaker_time_ranges: Optional[List[Tuple[float, float]]] = Field(
+        None,
+        description="Time ranges (seconds) of this speaker's utterances in source_audio_path, used for multi-sample voice profiles.",
+    )
+    context_style: Optional[str] = Field(
+        None,
+        description=(
+            "Short delivery-context hint (e.g. a quoted previous line) merged into the TTS style. "
+            "Used by Gemini 3.8 to keep intonation continuous; never spoken."
+        ),
+    )
     output_path: Optional[str] = Field(None, description="Path to save the synthesized audio for this specific segment.")
     cohesion_with_prev: Optional[str] = Field(
         None,

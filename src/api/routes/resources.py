@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 
 from ..models.schemas import VoiceResponse, PersonaResponse
 from src.tts.gemini_voice_catalog import build_gemini_voice_entries
+from src.tts.openrouter_voice_catalog import build_openrouter_voice_entries
 from src.translation.prompts import get_available_personas
 
 router = APIRouter(prefix="/resources", tags=["resources"])
@@ -47,7 +48,7 @@ MINIMAX_VOICES = [
     {"id": "female-yujie", "name": "Yujie (Female)", "provider": "minimax", "gender": "female"},
 ]
 
-VOICES = OPENAI_VOICES + build_gemini_voice_entries() + MINIMAX_VOICES
+VOICES = OPENAI_VOICES + build_gemini_voice_entries() + MINIMAX_VOICES + build_openrouter_voice_entries()
 
 
 def _find_voice_sample_path(provider: str, voice_id: str) -> Path | None:

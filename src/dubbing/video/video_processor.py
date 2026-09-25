@@ -1277,7 +1277,7 @@ class VideoProcessor:
                                 keep_original_audio_ranges: Optional[List[Tuple[float, float]]] = None,
                                 source_language: str = "en",
                                 target_language: str = "es",
-                                normalize_audio: bool = True,
+                                normalize_audio: bool = False,
                                 use_two_pass_encoding: bool = False,
                                 pause_removal: str = "disabled",
                                 min_pause_duration: float = 3,
@@ -1307,7 +1307,7 @@ class VideoProcessor:
             keep_original_audio_ranges: Optional list of [start, end] tuples to keep original audio
             source_language: Source language code for metadata
             target_language: Target language code for metadata
-            normalize_audio: Whether to normalize audio volume (default: True)
+            normalize_audio: Whether to normalize audio volume (default: False)
             use_two_pass_encoding: Whether to use two-pass encoding for better quality
             pause_removal: Pause removal mode: 'cut' (remove pauses), 'disabled'
             min_pause_duration: Minimum silence duration to consider for processing (seconds)
@@ -1614,13 +1614,16 @@ class VideoProcessor:
             final_audio_stream_label = processed_dubbed_audio_stream_label
         
         # Apply final normalization to bring the entire mix to optimal loudness
-        all_filter_complex_parts.append(
-            f"{self._format_filter_input_label(final_audio_stream_label)}"
-            f"loudnorm=I=-14:TP=-1:LRA=11,"
-            f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
-        )
-        final_audio_stream_label = "[final_normalized]"
-        logger.debug("Applied final normalization to bring mix to optimal loudness")
+        if normalize_audio:
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(final_audio_stream_label)}"
+                f"loudnorm=I=-14:TP=-1:LRA=11,"
+                f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
+            )
+            final_audio_stream_label = "[final_normalized]"
+            logger.debug("Applied final normalization to bring mix to optimal loudness")
+        else:
+            logger.debug("Final audio normalization disabled; keeping raw mix levels")
             
         if all_filter_complex_parts:
             command.extend(["-filter_complex", ";".join(all_filter_complex_parts)])
@@ -1779,7 +1782,8 @@ class VideoProcessor:
                 keep_original_audio_ranges,
                 video_path,
                 dubbed_volume,
-                background_volume
+                background_volume,
+                normalize_audio
             )
             
             # Detect pauses in final audio
@@ -2112,7 +2116,8 @@ class VideoProcessor:
                                              keep_original_audio_ranges: Optional[List[Tuple[float, float]]],
                                              video_path: str,
                                              dubbed_volume: float = 1.0,
-                                             background_volume: float = 0.562341) -> str:
+                                             background_volume: float = 0.562341,
+                                             normalize_audio: bool = False) -> str:
         """Create the final audio mix for pause analysis.
         
         Args:
@@ -2175,12 +2180,13 @@ class VideoProcessor:
                 current_audio_label = "[final_audio]"
             
             # Apply final normalization to bring the entire mix to optimal loudness
-            filter_parts.append(
-                f"{self._format_filter_input_label(current_audio_label)}"
-                f"loudnorm=I=-14:TP=-1:LRA=11,"
-                f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
-            )
-            current_audio_label = "[final_normalized]"
+            if normalize_audio:
+                filter_parts.append(
+                    f"{self._format_filter_input_label(current_audio_label)}"
+                    f"loudnorm=I=-14:TP=-1:LRA=11,"
+                    f"alimiter=limit=0.95:attack=5:release=50[final_normalized]"
+                )
+                current_audio_label = "[final_normalized]"
             
             # Add filter complex if we have filters
             if filter_parts:

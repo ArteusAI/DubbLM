@@ -37,9 +37,15 @@ async def start_transcription(project_id: str, db: Session = Depends(get_db)):
     if project.status == ProjectStatus.DOWNLOADING:
         raise HTTPException(status_code=409, detail="Video download is still in progress")
 
-    # Check if project has a video
+    # Check if project has a video (restore from S3 if archived)
     pm = ProjectManager(project_id)
     source_video = pm.get_source_video_path()
+    if not source_video or not source_video.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            source_video = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     if not source_video or not source_video.exists():
         raise HTTPException(status_code=400, detail="No video uploaded for this project")
     
@@ -81,6 +87,12 @@ async def queue_auto_process(project_id: str, db: Session = Depends(get_db)):
     # If media is already available, start immediately
     pm = ProjectManager(project_id)
     source_video = pm.get_source_video_path()
+    if not source_video or not source_video.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            source_video = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     if project.status == ProjectStatus.DRAFT and source_video and source_video.exists():
         job = enqueue_transcription_job(db, project, allow_existing=False)
         return QueueAutoResponse(
@@ -115,6 +127,12 @@ async def start_retranslation(project_id: str, db: Session = Depends(get_db)):
         )
 
     source_video = ProjectManager(project_id).get_source_video_path()
+    if not source_video or not source_video.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            source_video = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     if not source_video or not source_video.exists():
         raise HTTPException(status_code=400, detail="No video uploaded for this project")
 
@@ -180,6 +198,12 @@ async def restart_processing(project_id: str, db: Session = Depends(get_db)):
 
     pm = ProjectManager(project_id)
     source_video = pm.get_source_video_path()
+    if not source_video or not source_video.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            source_video = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     if not source_video or not source_video.exists():
         raise HTTPException(status_code=400, detail="No video uploaded for this project")
 

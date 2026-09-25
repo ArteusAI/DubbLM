@@ -8,9 +8,9 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 import yaml
 from .log_config import get_logger
-from src.tts.gemini_tts_wrapper import (
-    DEFAULT_GEMINI_TTS_MODEL,
-    DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
+from src.tts.gemini38_tts_wrapper import (
+    DEFAULT_GEMINI38_TTS_MODEL,
+    DEFAULT_GEMINI38_TTS_FALLBACK_MODEL,
 )
 
 logger = get_logger(__name__)
@@ -39,9 +39,9 @@ class DubbingConfig:
             'start_time': None,
             'duration': None,
             'no_cache': False,
-            'tts_system': 'gemini',
-            'tts_model': DEFAULT_GEMINI_TTS_MODEL,
-            'tts_fallback_model': DEFAULT_GEMINI_TTS_FALLBACK_MODEL,
+            'tts_system': 'gemini38',
+            'tts_model': DEFAULT_GEMINI38_TTS_MODEL,
+            'tts_fallback_model': DEFAULT_GEMINI38_TTS_FALLBACK_MODEL,
             'transcription_system': 'assemblyai',
             'translator_type': 'llm',
             'llm_provider': 'gemini',
@@ -86,10 +86,13 @@ class DubbingConfig:
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
             'background_volume': 0.562341,
+            'normalize_audio': False,
             'enable_emotion_enrichment': False,
             'emotion_enrichment_model': 'gemini-2.5-pro',
             'emotion_enrichment_temperature': 0.7,
             'enable_content_validation': True,
+            'enable_context_style': True,
+            'context_style_max_chars': 140,
             'content_validator_provider': 'whisper',
             'content_validator_whisper_model': 'base',
             'content_validator_whisper_compute_type': 'int8',
@@ -309,7 +312,7 @@ class DubbingConfig:
         parser.add_argument('--start_time', type=float, help='Start time in seconds to begin processing')
         parser.add_argument('--duration', type=float, help='Duration in seconds to process')
         parser.add_argument('--no_cache', action='store_true', default=argparse.SUPPRESS, help='Disable caching of pipeline steps')
-        parser.add_argument('--tts_system', type=str, choices=['coqui', 'openai', 'f5_tts', 'gemini'], help='Text-to-speech system to use')
+        parser.add_argument('--tts_system', type=str, choices=['coqui', 'openai', 'f5_tts', 'gemini', 'gemini38', 'minimax', 'openrouter', 'f5'], help="Text-to-speech system to use ('gemini' is deprecated, use 'gemini38')")
         parser.add_argument('--tts_model', type=str, help='Model name for the selected TTS provider')
         parser.add_argument('--tts_fallback_model', type=str, help='Fallback model name for the TTS provider (used by Gemini)')
         parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx'], help='Transcription system to use')
@@ -339,6 +342,8 @@ class DubbingConfig:
         parser.add_argument('--watermark_path', type=str, help='Path to the watermark PNG image')
         parser.add_argument('--watermark_text', type=str, help='Text to display under the watermark')
         parser.add_argument('--voice_auto_selection', type=lambda x: (str(x).lower() == 'true'), help='Enable automatic voice selection for TTS (True/False)')
+        parser.add_argument('--enable_context_style', type=lambda x: (str(x).lower() == 'true'), help='Pass the previous line as delivery context to Gemini 3.8 TTS (True/False)')
+        parser.add_argument('--context_style_max_chars', type=int, help='Max characters of the quoted previous line used as TTS delivery context')
         parser.add_argument('--content_validator_provider', type=str, choices=['whisper', 'assemblyai'], help='ASR provider for TTS content validation')
         parser.add_argument('--content_validator_whisper_model', type=str, help='Local Whisper model for TTS content validation')
         parser.add_argument('--content_validator_whisper_compute_type', type=str, help='faster-whisper compute type for TTS content validation')
@@ -363,6 +368,7 @@ class DubbingConfig:
         parser.add_argument('--keyframe_buffer', default=0.2, type=float, help='Buffer around keyframes to preserve during pause removal (seconds)')
         parser.add_argument('--use_two_pass_encoding', type=lambda x: (str(x).lower() == 'true'), help='Use two-pass encoding for better video quality during re-encoding (True/False)')
         parser.add_argument('--dubbed_volume', type=float, help='Gain multiplier for translated track (e.g., 1.2 for +1.6 dB)')
+        parser.add_argument('--normalize_audio', type=lambda x: (str(x).lower() == 'true'), help='Apply final loudness normalization (loudnorm) to the output mix (True/False)')
         parser.add_argument('--background_volume', type=float, help='Gain multiplier for background track when keep_background=true (e.g., 0.56 ≈ -5 dB)')
         parser.add_argument('--speakers_expected', type=int, help='Expected number of speakers for diarization (if not specified, auto-detect)')
         parser.add_argument('--exit_before_synthesis', action='store_true', default=argparse.SUPPRESS, 

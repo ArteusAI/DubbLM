@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "options_page": "options.html",
+  "name": "DubbLM Cookie Sync",
+  "version": "1.0",
+  "description": "Automatically syncs cookies from YouTube and other media sites to your DubbLM server.",
+  "permissions": ["cookies", "activeTab", "storage"],
+  "host_permissions": [
+    "*://*.youtube.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

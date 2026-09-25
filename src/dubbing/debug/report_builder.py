@@ -268,6 +268,9 @@ class ReportBuilder:
                 "duration_seconds": float(rep.duration_seconds) if rep else 0.0,
                 "output_path": (rep.output_path if rep else None) or meta.get("output_path"),
                 "error": rep.error if rep else None,
+                "voice_similarity": rep.voice_similarity if rep else None,
+                "voice_validation": rep.voice_validation if rep else None,
+                "voice_forced": bool(rep.voice_forced) if rep else False,
             }
             out.append(entry)
         return out
@@ -676,6 +679,8 @@ def _render_segment_table(rows: List[Dict[str, Any]]) -> List[str]:
         model = row.get("actual_model") or "—"
         if row.get("used_fallback"):
             model = f"{model} (fallback)"
+        elif row.get("voice_forced"):
+            model = f"{model} (forced voice)"
         success_mark = "" if row.get("success", True) else " ❌"
         time_sec = float(row.get("duration_seconds", 0) or 0)
         text_cell = (row.get("text_preview") or "").replace("|", "\\|").replace("\n", " ")

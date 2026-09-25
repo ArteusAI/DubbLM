@@ -225,7 +225,8 @@ Important configuration areas:
 
 Supported provider paths include:
 
-- **Gemini TTS** - Highest quality path, supports Gemini voice catalog, prompt styles, fallback model, emotion enrichment, and long-form segment handling.
+- **Gemini 3.8 TTS (`gemini38`)** - New default for new projects: `gemini-3.8-flash-tts` / `gemini-3.8-flash-lite-tts` via the Interactions API. Per-segment synthesis (no ASR-based track splitting), multi-sample speaker references for voice matching, turn-level `speech_metadata` styles and inline vocal tags. The previous translated line can be quoted into the style as delivery context (`enableContextStyle`); it is never spoken and a content-validation guard retries without it if it ever leaks into speech.
+- **Gemini TTS (`gemini`, deprecated)** - Previous generation (`gemini-2.5-*`, `gemini-3.1-flash-tts-preview`) with multi-speaker batching. Hidden from the UI; kept for existing projects and API clients. New work should use `gemini38`.
 - **OpenAI TTS** - Reliable and faster for balanced jobs.
 - **MiniMax TTS** - Additional voice model support via `MINIMAX_API_KEY`.
 - **F5/Coqui/local paths** - Available for local or experimental setups when dependencies and references are configured.

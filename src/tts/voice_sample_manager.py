@@ -33,6 +33,17 @@ logger = get_logger(__name__)
 
 SAMPLE_RATE = 24000
 
+# Heuristic extra seconds contributed by inline pause tags when estimating
+# duration. The Gemini 3.8 prompting guide defines only <short pause> and
+# <long pause> and does not specify their durations, so these values are
+# project-tuned planning estimates (long pauses render noticeably longer).
+# Legacy [medium pause] is treated as short because 3.8 has no such tag.
+PAUSE_TAG_SECONDS: Dict[str, float] = {
+    "short pause": 0.4,
+    "medium pause": 0.4,
+    "long pause": 1.2,
+}
+
 
 class AudioFileUtils:
     """Utility class for audio file operations."""
@@ -478,7 +489,34 @@ class AudioValidator:
 
 class TextAnalysisUtils:
     """Utility class for text analysis operations."""
-    
+
+    # Inline TTS markup: [legacy tags], <3.8 angle tags> and |backchannels|.
+    _MARKUP_TAG_RE = re.compile(r"\[[^\[\]]{1,40}\]|<[^<>]{1,40}>|\|[^|]{1,60}\|")
+
+    @staticmethod
+    def strip_markup(text: str) -> str:
+        """Remove inline TTS markup tags/pipes before text analysis."""
+        if not text:
+            return ""
+        cleaned = TextAnalysisUtils._MARKUP_TAG_RE.sub(" ", text)
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @staticmethod
+    def pause_tag_seconds(text: str) -> float:
+        """Estimated seconds added by inline pause tags.
+
+        Counts angle-bracket and legacy square-bracket pause tags; other
+        markup (emotion tags) adds no speech time.
+        """
+        if not text:
+            return 0.0
+        lowered = text.lower()
+        total = 0.0
+        for tag, seconds in PAUSE_TAG_SECONDS.items():
+            total += lowered.count(f"<{tag}>") * seconds
+            total += lowered.count(f"[{tag}]") * seconds
+        return total
+
     @staticmethod
     def count_words(text: str) -> int:
         """Count words in text, handling punctuation and multiple spaces."""
@@ -825,12 +863,61 @@ class VoiceSampleManager:
         """Get appropriate audio extension for the TTS provider."""
         if self.tts_provider == "gemini":
             return "wav"
-        elif self.tts_provider == "openai":
-            return "mp3"
-        elif self.tts_provider == "minimax":
+        elif self.tts_provider in ("openai", "minimax", "openrouter"):
             return "mp3"
         else:
             return "wav"
+
+    def regenerate_voice_sample(self, voice_name: str) -> bool:
+        """Re-render a single voice sample, recompute its embedding, and persist.
+
+        Used when a cached sample embedding is detected as contaminated (e.g. the
+        sample was rendered with the wrong gender voice), which would otherwise
+        make every voice-consistency validation against that voice a no-op.
+        """
+        if not self._sample_generator:
+            logger.error("Sample generator not set. Call set_sample_generator() first.")
+            return False
+
+        sample_file_path = self.samples_dir / f"{voice_name}.{self._get_audio_extension()}"
+        try:
+            if sample_file_path.exists():
+                sample_file_path.unlink()
+        except OSError as exc:
+            logger.warning(f"Could not delete old sample file for '{voice_name}': {exc}")
+
+        try:
+            success = self._sample_generator(voice_name, str(sample_file_path))
+        except Exception as exc:
+            logger.error(f"Error regenerating sample for {voice_name}: {exc}")
+            return False
+        if not success or not sample_file_path.exists():
+            logger.error(f"Failed to regenerate sample for {voice_name}")
+            return False
+
+        new_embedding = None
+        if self.enable_voice_matching and self.voice_matcher and self.audio_embedder:
+            new_embedding = self.voice_matcher.extract_embedding_for_audio_file(sample_file_path)
+            if new_embedding is not None:
+                self.voice_matcher.sample_embeddings[voice_name] = new_embedding
+
+        try:
+            combined_data: Dict[str, Any] = {}
+            if self.stats_file.exists():
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    combined_data = json.load(f)
+            embeddings_map = combined_data.get('embeddings') or {}
+            if new_embedding is not None:
+                embeddings_map[voice_name] = new_embedding.tolist()
+            combined_data['embeddings'] = embeddings_map
+            combined_data.setdefault('voice_stats', self.duration_database.dict())
+            with open(self.stats_file, 'w', encoding='utf-8') as f:
+                json.dump(combined_data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"Could not persist regenerated embedding for '{voice_name}': {exc}")
+
+        logger.info(f"Regenerated voice sample for '{voice_name}'")
+        return True
     
     def _get_expected_embedding_dim(self) -> Optional[int]:
         """Get expected embedding dimension from current AudioEmbedder."""
@@ -877,10 +964,12 @@ class VoiceSampleManager:
         voice_stats = self.duration_database.get_or_create_stats(voice_name)
         
         text = text.strip()
-        word_count = TextAnalysisUtils.count_words(text)
-        char_count = TextAnalysisUtils.count_characters(text)
-        complexity_factor = TextAnalysisUtils.estimate_speech_complexity(text)
-        punctuation_pause_sec = TextAnalysisUtils.estimate_punctuation_pause_seconds(text)
+        analysis_text = TextAnalysisUtils.strip_markup(text)
+        pause_seconds = TextAnalysisUtils.pause_tag_seconds(text)
+        word_count = TextAnalysisUtils.count_words(analysis_text)
+        char_count = TextAnalysisUtils.count_characters(analysis_text)
+        complexity_factor = TextAnalysisUtils.estimate_speech_complexity(analysis_text)
+        punctuation_pause_sec = TextAnalysisUtils.estimate_punctuation_pause_seconds(analysis_text)
         
         logger.debug(
             f"Length estimation for voice '{voice_name}': {word_count} words, {char_count} chars, "
@@ -913,8 +1002,11 @@ class VoiceSampleManager:
         else:
             estimated_duration = base_duration
         
-        # Apply complexity and punctuation
-        estimated_duration = max(0.0, estimated_duration * complexity_factor + punctuation_pause_sec)
+        # Apply complexity, punctuation and inline pause tags
+        estimated_duration = max(
+            0.0,
+            estimated_duration * complexity_factor + punctuation_pause_sec + pause_seconds,
+        )
         
         # Language multiplier
         lang = (language or "").lower()

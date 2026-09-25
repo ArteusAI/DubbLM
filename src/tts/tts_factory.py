@@ -8,14 +8,19 @@ logger = logging.getLogger(__name__)
 from .f5_tts_wrapper import F5TTSWrapper
 from .openai_tts_wrapper import OpenAITTSWrapper
 from .gemini_tts_wrapper import GeminiTTSWrapper
+from .gemini38_tts_wrapper import Gemini38TTSWrapper
 from .minimax_tts_wrapper import MinimaxTTSWrapper
+from .openrouter_tts_wrapper import OpenRouterTTSWrapper
 
 # Define available TTS providers
 TTS_PROVIDERS: Dict[str, Type[TTSInterface]] = {
     "f5": F5TTSWrapper,
     "openai": OpenAITTSWrapper,
+    # deprecated: legacy provider, kept for existing projects; use "gemini38"
     "gemini": GeminiTTSWrapper,
+    "gemini38": Gemini38TTSWrapper,
     "minimax": MinimaxTTSWrapper,
+    "openrouter": OpenRouterTTSWrapper,
 }
 
 class TTSConfig:
@@ -143,11 +148,11 @@ class TTSFactory:
             init_args["model"] = config.model
         if config.default_voice is not None:
             init_args["default_voice"] = config.default_voice
-        if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini", "minimax"):
+        if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini", "gemini38", "minimax", "openrouter"):
             init_args["cost_tracker"] = config.cost_tracker
         
         # Add provider-specific args
-        if provider_name_lower == "gemini":
+        if provider_name_lower in ("gemini", "gemini38"):
             if config.prompt_prefix is not None:
                 init_args["prompt_prefix"] = config.prompt_prefix
             if config.blocked_voices:

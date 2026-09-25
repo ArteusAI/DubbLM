@@ -493,6 +493,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             config_data = project.config or {}
             auto_process_enabled = bool(config_data.get("autoProcess"))
             source_file = pm.get_source_video_path()
+            if not source_file or not source_file.exists():
+                try:
+                    from ..services.object_storage import get_object_storage
+                    source_file = get_object_storage().ensure_local_source(project_id, project)
+                except Exception as restore_exc:
+                    logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
             
             # Debug: log config loaded from database
             logger.info(f"[WORKER TRANSCRIBE] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
@@ -578,6 +584,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "enable_context_style": config_data.get("enableContextStyle", True),
+                "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
                 "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
                 "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
                 "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
@@ -607,6 +615,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "normalize_audio": normalize_bool(
+                    config_data.get(
+                        "normalizeAudio",
+                        preset_config.get("normalize_audio", False),
+                    )
+                ),
                 "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 "video_quality_preset": video_quality_preset,
@@ -837,6 +851,8 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "enable_context_style": config_data.get("enableContextStyle", True),
+                "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
                 "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
                 "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
                 "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
@@ -863,6 +879,12 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "normalize_audio": normalize_bool(
+                    config_data.get(
+                        "normalizeAudio",
+                        preset_config.get("normalize_audio", False),
+                    )
+                ),
                 "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 "video_quality_preset": video_quality_preset,
@@ -971,6 +993,12 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             
             config_data = project.config or {}
             source_file = pm.get_source_video_path()
+            if not source_file or not source_file.exists():
+                try:
+                    from ..services.object_storage import get_object_storage
+                    source_file = get_object_storage().ensure_local_source(project_id, project)
+                except Exception as restore_exc:
+                    logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
             
             # Debug: log config loaded from database
             logger.info(f"[WORKER DUB] Loaded config from DB: sourceLang={config_data.get('sourceLang')}, speakerCount={config_data.get('speakerCount')}, targetLang={config_data.get('targetLang')}")
@@ -1070,6 +1098,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
+                "enable_context_style": config_data.get("enableContextStyle", True),
+                "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
                 "content_validator_provider": config_data.get("contentValidatorProvider", "whisper"),
                 "content_validator_whisper_model": config_data.get("contentValidatorWhisperModel", "base"),
                 "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
@@ -1079,6 +1109,12 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                "normalize_audio": normalize_bool(
+                    config_data.get(
+                        "normalizeAudio",
+                        preset_config.get("normalize_audio", False),
+                    )
+                ),
                 "keep_original_audio_ranges": config_data.get("keepOriginalAudioRanges"),
                 "use_two_pass_encoding": config_data.get("useTwoPassEncoding", True),
                 "video_quality_preset": video_quality_preset,
@@ -1234,6 +1270,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 source_language=config_data.get("sourceLang", "en"),
                 target_language=config_data.get("targetLang", "ru"),
                 keep_original_audio_ranges=dubbing_config.get("keep_original_audio_ranges"),
+                normalize_audio=dubbing_config.get("normalize_audio", False),
                 pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
@@ -1308,18 +1345,80 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
         except Exception as result_probe_exc:
             logger.warning("Failed to probe result video for %s: %s", project_id, result_probe_exc)
 
-        # Clear autoProcess flag
-        db = get_db_session()
+        # Archive source + results to S3 and free local disk (optional)
         try:
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project and project.config:
-                config = dict(project.config)
-                config["autoProcess"] = False
-                project.config = config
-                flag_modified(project, "config")
-                db.commit()
-        finally:
-            db.close()
+            from ..services.object_storage import get_object_storage
+
+            store = get_object_storage()
+            if store.is_enabled():
+                update_job_progress(job_id, 98, "storage", "Uploading results to S3")
+                storage_meta = store.archive_project_media(project_id)
+                # Persist storage BEFORE local cleanup so stream works even if rm fails
+                db = get_db_session(fresh=True)
+                try:
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    if project:
+                        config = dict(project.config or {})
+                        config["storage"] = storage_meta
+                        config["autoProcess"] = False
+                        project.config = config
+                        flag_modified(project, "config")
+                        db.commit()
+                finally:
+                    db.close()
+
+                cleanup_stats = store.cleanup_local_after_archive(project_id)
+                db = get_db_session(fresh=True)
+                try:
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    if project:
+                        try:
+                            from ..services.video_info import compute_project_size
+                            project.total_size = compute_project_size(ProjectManager(project_id))
+                            db.commit()
+                        except Exception:
+                            pass
+                finally:
+                    db.close()
+                if cleanup_stats.get("errors"):
+                    logger.warning(
+                        "Archived %s to S3; local cleanup had %s error(s)",
+                        project_id,
+                        len(cleanup_stats["errors"]),
+                    )
+                else:
+                    logger.info("Archived project %s to S3 and cleaned local media", project_id)
+            else:
+                # Clear autoProcess flag when S3 is disabled
+                db = get_db_session()
+                try:
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    if project and project.config:
+                        config = dict(project.config)
+                        config["autoProcess"] = False
+                        project.config = config
+                        flag_modified(project, "config")
+                        db.commit()
+                finally:
+                    db.close()
+        except Exception as s3_exc:
+            logger.warning(
+                "S3 archive failed for %s (keeping local files): %s",
+                project_id,
+                s3_exc,
+                exc_info=True,
+            )
+            db = get_db_session()
+            try:
+                project = db.query(Project).filter(Project.id == project_id).first()
+                if project and project.config:
+                    config = dict(project.config)
+                    config["autoProcess"] = False
+                    project.config = config
+                    flag_modified(project, "config")
+                    db.commit()
+            finally:
+                db.close()
         
         return {"status": "success", "output": str(output_video_path)}
         
@@ -1387,7 +1486,7 @@ def generate_preview(
             from src.tts.models import TTSSegmentData
             
             # Create TTS instance
-            tts_system = segment.provider or config_data.get("ttsSystem", "gemini")
+            tts_system = segment.provider or config_data.get("ttsSystem", "gemini38")
             
             # Build TTS prompt prefix from the selected style
             target_lang = config_data.get("targetLang", "ru")

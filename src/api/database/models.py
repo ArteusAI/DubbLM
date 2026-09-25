@@ -57,9 +57,10 @@ class JobStatus(str, enum.Enum):
 class TTSProvider(str, enum.Enum):
     """TTS provider enumeration."""
     OPENAI = "openai"
-    GEMINI = "gemini"
+    GEMINI = "gemini"  # deprecated: use "gemini38"; kept for existing projects
     COQUI = "coqui"
     MINIMAX = "minimax"
+    OPENROUTER = "openrouter"
 
 
 def generate_uuid() -> str:

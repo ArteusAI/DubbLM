@@ -194,6 +194,18 @@ DEFAULT_PRICING_CATALOG: Dict[str, Any] = {
                     "output_per_1m_tokens": 20.00,
                     "audio_output_tokens_per_second": 25.0,
                 },
+                # Gemini 3.8 TTS pricing (standard tier from Jan 1, 2027;
+                # free of charge through Dec 31, 2026).
+                "gemini-3.8-flash-tts": {
+                    "input_per_1m_tokens": 1.00,
+                    "output_per_1m_tokens": 18.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
+                "gemini-3.8-flash-lite-tts": {
+                    "input_per_1m_tokens": 1.00,
+                    "output_per_1m_tokens": 12.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
             }
         },
         "openai": {
@@ -216,6 +228,13 @@ DEFAULT_PRICING_CATALOG: Dict[str, Any] = {
                 "speech-02-turbo": {"per_1m_chars": 60.00},
                 "speech-2.6-turbo": {"per_1m_chars": 60.00},
                 "speech-2.8-turbo": {"per_1m_chars": 60.00},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "qwen/qwen-audio-3.0-tts-flash": {"per_1m_chars": 15.00},
+                "qwen/qwen-audio-3.0-tts-plus": {"per_1m_chars": 20.00},
+                "x-ai/grok-voice-tts-1.0": {"per_1m_chars": 15.00},
             }
         },
     },
@@ -486,6 +505,12 @@ class CostTracker:
         if not provider_cfg:
             return None
         model_cfg = self._lookup_model_cfg(provider_cfg, model) or {}
+        models_cfg = provider_cfg.get("models") if isinstance(provider_cfg, dict) else None
+        # If the catalog enumerates models explicitly but does not contain the
+        # requested one, let the caller fall through to the builtin catalog
+        # (e.g. a project YAML from before Gemini 3.8 existed).
+        if model and isinstance(models_cfg, dict) and models_cfg and not model_cfg:
+            return None
         keys = (
             "input_per_1m_tokens",
             "output_per_1m_tokens",

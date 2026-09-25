@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2, RotateCcw, Link2, Download, Cookie, X, ChevronDown, HelpCircle } from 'lucide-react';
+import { Plus, FolderOpen, Clock, Trash2, Video, FileText, Upload, Sparkles, StopCircle, CheckSquare, Square, Settings, AlertCircle, Loader2, RotateCcw, Link2, Download, Cookie, X, ChevronDown, HelpCircle, Search, ArrowDownWideNarrow, ArrowUpWideNarrow } from 'lucide-react';
 import { Project, ProjectStatus, PresetId } from '../types';
 import { PRESETS, LANGUAGES } from '../constants';
 import { api } from '../api';
@@ -756,6 +756,8 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest');
   const [urlInput, setUrlInput] = useState('');
   const [downloadQuality, setDownloadQuality] = useState<'best' | '1080p' | '720p' | '480p'>('best');
   const [isSubmittingUrl, setIsSubmittingUrl] = useState(false);
@@ -764,6 +766,23 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   const [cookiesStatus, setCookiesStatus] = useState<{ configured: boolean; source: string } | null>(null);
   const [isCookiesLoading, setIsCookiesLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const visibleProjects = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    let list = projects;
+    if (q) {
+      list = list.filter((p) => {
+        const name = p.name?.toLowerCase() ?? '';
+        const source = p.sourceFilename?.toLowerCase() ?? '';
+        return name.includes(q) || source.includes(q);
+      });
+    }
+    return [...list].sort((a, b) => {
+      const ta = a.createdAt instanceof Date ? a.createdAt.getTime() : new Date(a.createdAt).getTime();
+      const tb = b.createdAt instanceof Date ? b.createdAt.getTime() : new Date(b.createdAt).getTime();
+      return sortOrder === 'newest' ? tb - ta : ta - tb;
+    });
+  }, [projects, searchQuery, sortOrder]);
 
   // Dynamically detect when the Chrome extension is installed/active
   useEffect(() => {
@@ -949,12 +968,19 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   };
 
   const toggleSelectAll = () => {
-    if (selectedIds.size === projects.length) {
+    const visibleIds = visibleProjects.map((p) => p.id);
+    const allVisibleSelected =
+      visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+    if (allVisibleSelected) {
       setSelectedIds(new Set());
     } else {
-      setSelectedIds(new Set(projects.map(p => p.id)));
+      setSelectedIds(new Set(visibleIds));
     }
   };
+
+  const allVisibleSelected =
+    visibleProjects.length > 0 &&
+    visibleProjects.every((p) => selectedIds.has(p.id));
 
   const handleBulkAutoProcess = () => {
     onAutoProcess(Array.from(selectedIds));
@@ -994,28 +1020,68 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
       <div className="max-w-7xl mx-auto space-y-10 pb-32">
         
         {/* Header */}
-        <div className="flex items-end justify-between border-b border-zinc-800/50 pb-6">
-          <div className="flex items-center gap-6">
+        <div className="flex flex-col gap-4 border-b border-zinc-800/50 pb-6 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex items-center gap-6 min-w-0">
             <img 
                 src="https://github.com/ArteusAI/DubbLM/blob/master/logo.png?raw=true" 
                 alt="DubbLM Logo" 
-                className="w-12 h-12 rounded-xl"
+                className="w-12 h-12 rounded-xl shrink-0"
             />
-            <div>
+            <div className="min-w-0">
               <h1 className="text-4xl font-extrabold text-white tracking-tight mb-2">DubbLM</h1>
               <p className="text-zinc-400">Manage your dubbing projects</p>
             </div>
-            {projects.length > 0 && (
+            {visibleProjects.length > 0 && (
               <button 
                 onClick={toggleSelectAll}
-                className="flex items-center gap-2 text-sm font-medium text-zinc-500 hover:text-zinc-300 transition-colors ml-4 mb-1"
+                className="flex items-center gap-2 text-sm font-medium text-zinc-500 hover:text-zinc-300 transition-colors ml-4 mb-1 shrink-0"
               >
-                {selectedIds.size === projects.length && projects.length > 0 ? <CheckSquare className="w-4 h-4 text-brand-500" /> : <Square className="w-4 h-4" />}
+                {allVisibleSelected ? <CheckSquare className="w-4 h-4 text-brand-500" /> : <Square className="w-4 h-4" />}
                 Select All
               </button>
             )}
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap sm:justify-end">
+            {projects.length > 0 && (
+              <>
+                <div className="relative flex-1 min-w-[12rem] max-w-xs">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
+                  <input
+                    type="search"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    placeholder="Search projects…"
+                    className="w-full pl-9 pr-8 py-2.5 bg-zinc-900 border border-zinc-800 rounded-lg text-sm text-white placeholder-zinc-600 outline-none focus:border-brand-500/50 focus:ring-1 focus:ring-brand-500/20 transition-all"
+                    aria-label="Search projects by title"
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-zinc-500 hover:text-zinc-300 rounded"
+                      title="Clear search"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSortOrder((prev) => (prev === 'newest' ? 'oldest' : 'newest'))}
+                  className="flex items-center gap-2 px-3 py-2.5 text-sm font-medium text-zinc-300 hover:text-white bg-zinc-900 border border-zinc-800 hover:border-zinc-700 rounded-lg transition-colors shrink-0"
+                  title={sortOrder === 'newest' ? 'Showing newest first — click for oldest first' : 'Showing oldest first — click for newest first'}
+                >
+                  {sortOrder === 'newest' ? (
+                    <ArrowDownWideNarrow className="w-4 h-4 text-brand-400" />
+                  ) : (
+                    <ArrowUpWideNarrow className="w-4 h-4 text-brand-400" />
+                  )}
+                  <span className="hidden sm:inline">
+                    {sortOrder === 'newest' ? 'Newest' : 'Oldest'}
+                  </span>
+                </button>
+              </>
+            )}
             <button 
               onClick={onOpenSettings}
               className="p-2.5 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors border border-zinc-800 hover:border-zinc-700"
@@ -1147,8 +1213,25 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
               <p className="text-xl font-semibold text-zinc-300">No projects yet</p>
               <p className="text-sm mt-2 max-w-sm text-center">Get started by clicking "Add Media", dragging your video files directly onto this area, or pasting a video URL above.</p>
             </div>
+          ) : visibleProjects.length === 0 ? (
+            <div className="col-span-full flex flex-col items-center justify-center py-24 text-zinc-500 border-2 border-dashed border-zinc-800 rounded-3xl bg-zinc-900/30">
+              <div className="w-16 h-16 bg-zinc-900 rounded-full flex items-center justify-center mb-5 shadow-inner">
+                <Search className="w-8 h-8 text-zinc-600" />
+              </div>
+              <p className="text-lg font-semibold text-zinc-300">No projects match</p>
+              <p className="text-sm mt-2 max-w-sm text-center">
+                Nothing found for “{searchQuery.trim()}”. Try another title or clear the search.
+              </p>
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="mt-4 text-sm font-medium text-brand-400 hover:text-brand-300 transition-colors"
+              >
+                Clear search
+              </button>
+            </div>
           ) : (
-            projects.map((project) => (
+            visibleProjects.map((project) => (
               <ProjectCard
                 key={project.id}
                 project={project}

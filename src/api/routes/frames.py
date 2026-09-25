@@ -69,6 +69,12 @@ async def get_video_frame(
     
     pm = ProjectManager(project_id)
     video_path = pm.get_source_video_path()
+    if not video_path or not video_path.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            video_path = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     
     if not video_path or not video_path.exists():
         logger.warning(f"Video not found for project {project_id}: {video_path}")
@@ -126,6 +132,12 @@ async def get_video_thumbnail(
     
     pm = ProjectManager(project_id)
     video_path = pm.get_source_video_path()
+    if not video_path or not video_path.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            video_path = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=404, detail="Source video not found")
@@ -164,6 +176,12 @@ async def get_video_info(
     
     pm = ProjectManager(project_id)
     video_path = pm.get_source_video_path()
+    if not video_path or not video_path.exists():
+        try:
+            from ..services.object_storage import get_object_storage
+            video_path = get_object_storage().ensure_local_source(project_id, project)
+        except Exception as restore_exc:
+            logger.warning("Failed to restore source from S3 for %s: %s", project_id, restore_exc)
     
     if not video_path or not video_path.exists():
         raise HTTPException(status_code=404, detail="Source video not found")

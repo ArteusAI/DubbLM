@@ -10,6 +10,7 @@ import tiktoken
 from ..debug.cost_tracker import CostTracker
 from .log_config import get_logger
 from src.tts.gemini_tts_wrapper import DEFAULT_GEMINI_TTS_MODEL
+from src.tts.gemini38_tts_wrapper import DEFAULT_GEMINI38_TTS_MODEL
 from src.translation.prompts import (
     REFINEMENT_PROMPTS,
     CONTEXT_ANALYSIS_PROMPT_TEMPLATE,
@@ -207,7 +208,7 @@ class CostEstimator:
 
     def _estimate_tts(self, duration_seconds: float, estimated_tokens: float) -> None:
         tts_system = (self._config.get("tts_system") or "").lower()
-        if tts_system not in ("gemini", "openai"):
+        if tts_system not in ("gemini", "gemini38", "openai"):
             logger.info(
                 "TTS system '%s' has no pricing configured; skipping TTS estimate.",
                 tts_system,
@@ -215,9 +216,10 @@ class CostEstimator:
             return
 
         model_name = self._resolve_tts_model_name(tts_system)
+        pricing_provider = "gemini" if tts_system == "gemini38" else tts_system
         try:
             self._tracker.estimate_tts_cost(
-                tts_system,
+                pricing_provider,
                 model_name,
                 estimated_tokens,
                 expected_audio_seconds=duration_seconds,
@@ -262,11 +264,16 @@ class CostEstimator:
         model = self._config.get("tts_model")
         if model:
             return model
+        if system == "gemini38":
+            fallback = self._config.get("tts_fallback_model")
+            return fallback or DEFAULT_GEMINI38_TTS_MODEL
         if system == "gemini":
             fallback = self._config.get("tts_fallback_model")
             return fallback or DEFAULT_GEMINI_TTS_MODEL
         if system == "openai":
             return "tts-1"
+        if system == "openrouter":
+            return "qwen/qwen-audio-3.0-tts-flash"
         return None
 
     def _estimate_chunk_count(self, estimated_tokens: float) -> int:
