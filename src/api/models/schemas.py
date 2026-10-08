@@ -59,6 +59,8 @@ class ProjectConfig(BaseModel):
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    enableLaughterDetection: Optional[bool] = None
+    laughterMode: Optional[Literal["dub", "preserve"]] = None
     enableContentValidation: Optional[bool] = None
     contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
     contentValidatorWhisperModel: Optional[str] = None
@@ -124,6 +126,8 @@ class ProjectConfigUpdate(BaseModel):
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    enableLaughterDetection: Optional[bool] = None
+    laughterMode: Optional[Literal["dub", "preserve"]] = None
     enableContentValidation: Optional[bool] = None
     contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
     contentValidatorWhisperModel: Optional[str] = None

@@ -1,6 +1,7 @@
 """Subtitle utilities for the Smart Dubbing system."""
 
 import os
+import re
 from typing import List, Dict
 from nltk.tokenize import sent_tokenize
 
@@ -9,6 +10,23 @@ from src.utils.sent_split import greedy_sent_split
 from src.dubbing.core.log_config import get_logger
 
 logger = get_logger(__name__)
+
+# Mirrors src.tts.gemini38_tags.strip_tts_markup, but kept local so subtitle
+# generation does not import the heavy TTS package.
+_LEGACY_TAG_RE = re.compile(r"\[[^\[\]]{1,40}\]")
+_ANGLE_TAG_RE = re.compile(r"<[^<>]{1,40}>")
+_PIPE_RE = re.compile(r"\|([^|]{1,60})\|")
+
+
+def strip_tts_markup(text: str) -> str:
+    """Remove TTS markup tags so they never leak into subtitles."""
+    if not text:
+        return ""
+    cleaned = _LEGACY_TAG_RE.sub(" ", text)
+    cleaned = _ANGLE_TAG_RE.sub(" ", cleaned)
+    cleaned = _PIPE_RE.sub(lambda match: f" {match.group(1)} ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
 
 
 class SubtitleManager:
@@ -38,6 +56,9 @@ class SubtitleManager:
             start_time = segment["start"]
             end_time = segment["end"]
             text = segment["text"] if subtitle_type == "original" else segment["translation"]
+            text = strip_tts_markup(text)
+            if not text:
+                continue
             duration = end_time - start_time
             
             # Split text into sentences

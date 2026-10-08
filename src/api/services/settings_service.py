@@ -116,6 +116,8 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "tts_prompt_prefix": "ttsPromptPrefix",
         "voice_auto_selection": "voiceAutoSelection",
         "enable_emotion_enrichment": "enableEmotionEnrichment",
+        "enable_laughter_detection": "enableLaughterDetection",
+        "laughter_mode": "laughterMode",
         "enable_content_validation": "enableContentValidation",
         "enable_context_style": "enableContextStyle",
         "context_style_max_chars": "contextStyleMaxChars",

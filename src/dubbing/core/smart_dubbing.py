@@ -61,6 +61,115 @@ warnings.filterwarnings("ignore")
 # Get logger
 logger = get_logger(__name__)
 
+# Laughter annotation: tags are inserted into synthesis text variants and are
+# converted to the provider dialect by the TTS wrapper (gemini38 -> <laugh>).
+LAUGHTER_TAG = "[laughs]"
+LAUGHTER_TAG_MARKERS = ("[laughs]", "[laugh]", "[laughing]", "[giggles]", "<laugh>", "<giggle>")
+LAUGHTER_NEAREST_GAP_SECONDS = 3.0
+LAUGHTER_TEXT_VARIANT_KEYS = (
+    "translation",
+    "long_translation",
+    "short_translation",
+    "very_short_translation",
+    "chosen_text",
+)
+
+
+def insert_laugh_tag(text: str, fraction: float, tag: str = LAUGHTER_TAG) -> Tuple[str, bool]:
+    """Insert a laughter tag at a word boundary; idempotent per text."""
+    lowered = text.lower()
+    if any(marker in lowered for marker in LAUGHTER_TAG_MARKERS):
+        return text, False
+    words = text.split()
+    if not words:
+        return text, False
+    position = len(words)
+    if fraction <= 0.15:
+        position = 0
+    elif fraction < 0.85:
+        position = max(1, min(len(words) - 1, int(round(fraction * len(words)))))
+    return " ".join(words[:position] + [tag] + words[position:]), True
+
+
+def apply_laugh_tag(segment: Dict, fraction: float, tag: str = LAUGHTER_TAG) -> bool:
+    """Add the laughter tag to every non-empty synthesis text variant."""
+    changed = False
+    for key in LAUGHTER_TEXT_VARIANT_KEYS:
+        text = segment.get(key)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        updated, did_change = insert_laugh_tag(text, fraction, tag)
+        if did_change:
+            segment[key] = updated
+            changed = True
+    return changed
+
+
+def laughter_signature(segments: List[Dict]) -> str:
+    """Stable hash of laughter-annotated texts, used in synthesis cache keys."""
+    parts: List[str] = []
+    for index, segment in enumerate(segments or []):
+        for key in LAUGHTER_TEXT_VARIANT_KEYS:
+            value = segment.get(key)
+            if isinstance(value, str) and any(
+                marker in value.lower() for marker in LAUGHTER_TAG_MARKERS
+            ):
+                parts.append(f"{index}:{key}:{value}")
+    if not parts:
+        return ""
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def split_translation_at_fraction(
+    text: str, fraction: float, min_words: int = 2
+) -> Optional[Tuple[str, str]]:
+    """Split a translated line into two parts at a word boundary.
+
+    Returns ``(pre, post)`` or ``None`` when the split would leave a part with
+    fewer than ``min_words`` words (caller should then skip preservation for
+    that range).
+    """
+    if not isinstance(text, str):
+        return None
+    words = text.split()
+    if len(words) < min_words * 2:
+        return None
+    position = int(round(max(0.0, min(1.0, fraction)) * len(words)))
+    position = max(min_words, min(len(words) - min_words, position))
+    pre = " ".join(words[:position]).strip()
+    post = " ".join(words[position:]).strip()
+    if len(pre.split()) < min_words or len(post.split()) < min_words:
+        return None
+    return pre, post
+
+
+def build_laughter_preserve_ranges(
+    events: List[Any],
+    pad_seconds: float = 0.15,
+    merge_gap: float = 0.25,
+    min_duration: float = 0.25,
+    max_end: Optional[float] = None,
+) -> List[Tuple[float, float]]:
+    """Pad, merge and clamp detected laughter events into preserve ranges."""
+    ranges: List[Tuple[float, float]] = []
+    for event in sorted(events or [], key=lambda item: float(item.start)):
+        start = max(0.0, float(event.start) - pad_seconds)
+        end = float(event.end) + pad_seconds
+        if max_end is not None:
+            end = min(end, float(max_end))
+        if end <= start:
+            continue
+        ranges.append((start, end))
+
+    merged: List[Tuple[float, float]] = []
+    for start, end in ranges:
+        if merged and start - merged[-1][1] <= merge_gap:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    return [(s, e) for (s, e) in merged if (e - s) >= min_duration]
+
 
 @dataclass
 class VideoSpeedSegment:
@@ -148,6 +257,19 @@ class SmartDubbing:
         # Populated at the end of synthesize_speech so the report builder can
         # correlate drained TTS telemetry with the final chosen_text/group_id.
         self._last_synthesis_segments_metadata: List[Dict[str, Any]] = []
+
+        # Detected laughter moments (LaughterEvent objects) applied at synthesis.
+        self._laughter_events: Optional[List[Any]] = None
+
+        # Preserved-laughter state (laughter_mode == 'preserve')
+        self._laughter_preserve_ranges: List[Tuple[float, float]] = []
+        self._preserved_laughter_output: List[Dict[str, float]] = []
+        self._preserved_laughter_stats: Dict[str, Any] = {
+            "ranges": 0,
+            "segments_split": 0,
+            "skipped": 0,
+            "seconds": 0.0,
+        }
         
         # Initialize translator
         self._initialize_translator()
@@ -284,6 +406,9 @@ class SmartDubbing:
                 content_validator_whisper_compute_type=self.config.get('content_validator_whisper_compute_type', 'int8'),
                 content_validator_whisper_cpu_threads=self.config.get('content_validator_whisper_cpu_threads', 2),
                 content_validator_speech_model=self.config.get('content_validator_speech_model', 'nano'),
+                enable_content_repetition_check=self.config.get('enable_content_repetition_check', True),
+                content_repetition_min_words=self.config.get('content_repetition_min_words', 4),
+                content_repetition_extra_allowance=self.config.get('content_repetition_extra_allowance', 0),
                 cost_tracker=self.cost_tracker,
                 translator=self.translator if self.config.get('enable_llm_text_adjustment', True) else None,
                 target_language=self.config.get('target_language', 'en'),  # Pass target language for language-specific TTS configuration
@@ -397,6 +522,13 @@ class SmartDubbing:
                 if save_translated_subtitles:
                     self.subtitle_manager.save_subtitles(segments_for_output, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
             
+            # Detect laughter moments before synthesis (tags are injected inside synthesize_speech)
+            if self.config.get('enable_laughter_detection', False):
+                try:
+                    self.detect_laughter_events(audio_file)
+                except Exception as laughter_exc:
+                    logger.warning(f"Laughter detection failed: {laughter_exc}")
+
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
                 translated_audio_path = self.synthesize_speech(segments_for_output, speakers_rolls, audio_file)
@@ -694,7 +826,544 @@ class SmartDubbing:
         self._save_transcription_file(transcription)
         
         return speakers_rolls, transcription
-    
+
+    # ------------------------------------------------------------------
+    # Laughter detection and annotation
+    # ------------------------------------------------------------------
+
+    def set_laughter_events(self, events: Optional[List[Any]]) -> None:
+        """Store detected laughter events for the synthesis stage."""
+        self._laughter_events = list(events or [])
+        self.debug_data["laughter"] = [
+            {"start": event.start, "end": event.end, "score": event.score}
+            for event in self._laughter_events
+        ]
+
+    def detect_laughter_events(self, audio_file: str) -> List[Any]:
+        """Detect laughter moments in the source audio (cached per audio/config)."""
+        import json
+        from ..audio.laughter_detector import (
+            DETECTOR_VERSION,
+            LaughterDetector,
+            LaughterEvent,
+        )
+
+        base_key = self.cache_manager.generate_cache_key(
+            audio_file,
+            self.config.get('source_language'),
+            self.config.get('target_language'),
+            self.config.get('whisper_model', 'large-v3'),
+            self.config.get('start_time'),
+            self.config.get('duration'),
+        )
+        cache_key = f"{base_key}_{DETECTOR_VERSION}"
+        step_name = "laughter_events"
+
+        events: Optional[List[LaughterEvent]] = None
+        if self.cache_manager.cache_exists(step_name, cache_key):
+            try:
+                cached = self.cache_manager.load_from_cache(step_name, cache_key)
+                if cached is not None:
+                    events = [
+                        LaughterEvent(
+                            start=float(item["start"]),
+                            end=float(item["end"]),
+                            score=float(item.get("score", 0.0)),
+                        )
+                        for item in cached
+                    ]
+                    logger.debug("Loaded %d laughter event(s) from cache", len(events))
+            except Exception as cache_exc:
+                logger.warning("Failed to load laughter cache, re-detecting: %s", cache_exc)
+
+        if events is None:
+            self.performance_tracker.start_timing("emotion_analysis")
+            try:
+                detector = LaughterDetector(
+                    hf_cache_dir=self.config.get("laughter_model_cache_dir"),
+                )
+                events = detector.detect(audio_file)
+            except Exception as detect_exc:
+                logger.warning("Laughter detection failed: %s", detect_exc)
+                events = []
+            finally:
+                self.performance_tracker.end_timing("emotion_analysis")
+            self.cache_manager.save_to_cache(
+                step_name,
+                cache_key,
+                [{"start": e.start, "end": e.end, "score": e.score} for e in events],
+            )
+
+        self.set_laughter_events(events)
+
+        try:
+            debug_dir = Path("artifacts/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "laughter_events.json", "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "version": DETECTOR_VERSION,
+                        "audio": audio_file,
+                        "events": [
+                            {"start": e.start, "end": e.end, "score": e.score}
+                            for e in events
+                        ],
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as debug_exc:
+            logger.debug("Failed to write laughter debug file: %s", debug_exc)
+
+        logger.info("Detected %d laughter moment(s)", len(events))
+        return events
+
+    def inject_laughter_tags(
+        self,
+        segments: List[Dict],
+        events: Optional[List[Any]] = None,
+        tag: str = LAUGHTER_TAG,
+    ) -> Dict[str, int]:
+        """Insert laughter tags into synthesized text variants (gemini38 only)."""
+        event_list = list(self._laughter_events or []) if events is None else list(events)
+        stats = {"events": len(event_list), "tagged_segments": 0, "skipped": 0, "already_tagged": 0}
+        if not event_list or not segments:
+            return stats
+
+        eligible: List[Tuple[int, Dict]] = []
+        for index, segment in enumerate(segments):
+            speaker = segment.get("speaker")
+            if self._get_tts_system_for_speaker(speaker or "") != "gemini38":
+                continue
+            start = segment.get("start")
+            end = segment.get("end")
+            if start is None or end is None or float(end) <= float(start):
+                continue
+            eligible.append((index, segment))
+
+        if not eligible:
+            stats["skipped"] = len(event_list)
+            return stats
+
+        tagged_indices: set = set()
+        for event in sorted(event_list, key=lambda item: item.start):
+            best_index: Optional[int] = None
+            best_segment: Optional[Dict] = None
+            best_overlap = 0.0
+            for index, segment in eligible:
+                overlap = min(float(segment["end"]), event.end) - max(float(segment["start"]), event.start)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_index = index
+                    best_segment = segment
+
+            if best_segment is not None:
+                span = max(float(best_segment["end"]) - float(best_segment["start"]), 1e-6)
+                fraction = ((event.start + event.end) / 2.0 - float(best_segment["start"])) / span
+                fraction = min(max(fraction, 0.0), 1.0)
+            else:
+                nearest_index: Optional[int] = None
+                nearest_segment: Optional[Dict] = None
+                nearest_gap = float("inf")
+                append_to_end = True
+                for index, segment in eligible:
+                    gap_to_end = abs(event.start - float(segment["end"]))
+                    gap_to_start = abs(float(segment["start"]) - event.end)
+                    gap = min(gap_to_end, gap_to_start)
+                    if gap < nearest_gap:
+                        nearest_gap = gap
+                        nearest_index = index
+                        nearest_segment = segment
+                        append_to_end = gap_to_end <= gap_to_start
+                if nearest_segment is None or nearest_gap > LAUGHTER_NEAREST_GAP_SECONDS:
+                    stats["skipped"] += 1
+                    continue
+                best_index = nearest_index
+                best_segment = nearest_segment
+                fraction = 1.0 if append_to_end else 0.0
+
+            if best_index in tagged_indices:
+                stats["skipped"] += 1
+                continue
+
+            if apply_laugh_tag(best_segment, fraction, tag):
+                tagged_indices.add(best_index)
+                stats["tagged_segments"] += 1
+            else:
+                stats["already_tagged"] += 1
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # Original-laughter preservation (laughter_mode == 'preserve')
+    # ------------------------------------------------------------------
+
+    def _laughter_preserve_config(self) -> Dict[str, Any]:
+        return {
+            "pad": float(self.config.get('laughter_preserve_pad_seconds', 0.15) or 0.0),
+            "merge_gap": float(self.config.get('laughter_preserve_merge_gap', 0.25) or 0.0),
+            "min_duration": float(self.config.get('laughter_preserve_min_duration', 0.25) or 0.0),
+            "boundary_snap": float(self.config.get('laughter_preserve_boundary_snap_seconds', 1.5) or 0.0),
+            "target_dbfs": float(self.config.get('laughter_preserve_target_dbfs', -20.0)),
+        }
+
+    def build_laughter_preserve_ranges(self, audio_file: Optional[str] = None) -> List[Tuple[float, float]]:
+        """Merge/pad detected laughter events into preserve ranges (window timeline)."""
+        cfg = self._laughter_preserve_config()
+        max_end = None
+        try:
+            total = self.audio_processor.get_total_duration()
+            if total:
+                max_end = float(total)
+        except Exception:
+            max_end = None
+        ranges = build_laughter_preserve_ranges(
+            self._laughter_events or [],
+            pad_seconds=cfg["pad"],
+            merge_gap=cfg["merge_gap"],
+            min_duration=cfg["min_duration"],
+            max_end=max_end,
+        )
+        self._laughter_preserve_ranges = ranges
+        return ranges
+
+    def prepare_laughter_preservation(
+        self,
+        segments: List[Dict],
+        audio_file: Optional[str] = None,
+    ) -> Tuple[List[Dict], Dict[str, Any]]:
+        """Split segments around preserved laughter so dubbed speech never overlaps it.
+
+        Returns ``(synthesis_segments, stats)``. The original ``segments`` list is
+        left intact so subtitle export keeps whole sentences.
+        """
+        stats = {
+            "ranges": 0,
+            "segments_split": 0,
+            "segments_snapped": 0,
+            "segments_removed": 0,
+            "skipped": 0,
+            "seconds": 0.0,
+        }
+        ranges = self.build_laughter_preserve_ranges(audio_file)
+        stats["ranges"] = len(ranges)
+        stats["seconds"] = sum(e - s for s, e in ranges)
+        if not ranges or not segments:
+            self._preserved_laughter_stats = stats
+            return list(segments), stats
+
+        opt_cfg = self.config.get('segments_optimization', {}) or {}
+        min_duration = float(opt_cfg.get('min_segment_duration', 0.5))
+        snap = float(self._laughter_preserve_config().get("boundary_snap", 1.5))
+        eps = 1e-6
+
+        result: List[Dict] = []
+        for segment in segments:
+            seg_start = segment.get("start")
+            seg_end = segment.get("end")
+            if seg_start is None or seg_end is None or float(seg_end) <= float(seg_start):
+                result.append(segment)
+                continue
+
+            seg_start_f = float(seg_start)
+            seg_end_f = float(seg_end)
+            overlapping = [
+                (ls, le, idx)
+                for idx, (ls, le) in enumerate(ranges)
+                if min(le, seg_end_f) - max(ls, seg_start_f) > 0.05
+            ]
+            if not overlapping:
+                result.append(segment)
+                continue
+
+            # Classify ranges as edge-adjacent (snap the segment boundary) or
+            # interior (split the segment around them).
+            one_sided_start: List[Tuple[float, float, int]] = []
+            one_sided_end: List[Tuple[float, float, int]] = []
+            both_edges: List[Tuple[float, float, int]] = []
+            middle: List[Tuple[float, float, int]] = []
+            for ls, le, idx in overlapping:
+                touches_start = (ls - seg_start_f) <= snap
+                touches_end = (seg_end_f - le) <= snap
+                if touches_start and touches_end:
+                    both_edges.append((ls, le, idx))
+                elif touches_start:
+                    one_sided_start.append((ls, le, idx))
+                elif touches_end:
+                    one_sided_end.append((ls, le, idx))
+                else:
+                    middle.append((ls, le, idx))
+
+            effective_start = seg_start_f
+            effective_end = seg_end_f
+            for _, le, _ in one_sided_start:
+                effective_start = max(effective_start, le)
+            for ls, _, _ in one_sided_end:
+                effective_end = min(effective_end, ls)
+
+            # A laugh touching both edges: prefer the side that keeps more
+            # speech; if nothing is left, drop the segment (all laughter).
+            for ls, le, _ in both_edges:
+                remaining_if_start_snap = effective_end - max(effective_start, le)
+                remaining_if_end_snap = min(effective_end, ls) - effective_start
+                if remaining_if_start_snap <= 0 and remaining_if_end_snap <= 0:
+                    effective_start = effective_end
+                    continue
+                if remaining_if_start_snap >= remaining_if_end_snap:
+                    effective_start = max(effective_start, le)
+                else:
+                    effective_end = min(effective_end, ls)
+
+            snapped = (
+                effective_start > seg_start_f + eps or effective_end < seg_end_f - eps
+            )
+
+            # Build kept intervals between the interior laughter ranges.
+            intervals: List[Tuple[float, float]] = []
+            cursor = effective_start
+            for ls, le, _ in sorted(middle, key=lambda item: item[0]):
+                ls = max(ls, effective_start)
+                le = min(le, effective_end)
+                if le <= cursor:
+                    continue
+                if ls - cursor >= min_duration:
+                    intervals.append((cursor, ls))
+                cursor = max(cursor, le)
+            if effective_end - cursor >= min_duration:
+                intervals.append((cursor, effective_end))
+
+            if not intervals:
+                # No room left for speech: preserve the whole segment as laughter.
+                stats["segments_removed"] += 1
+                continue
+
+            # Split every non-empty text variant proportionally.
+            span = max(effective_end - effective_start, eps)
+            variant_splits: Dict[str, List[List[str]]] = {}
+            valid = True
+            for key in ("text",) + LAUGHTER_TEXT_VARIANT_KEYS:
+                value = segment.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                words = value.split()
+                if len(intervals) == 1:
+                    variant_splits[key] = [words]
+                    continue
+                if len(words) < 2 * len(intervals):
+                    valid = False
+                    break
+                boundaries = [
+                    int(round((start - effective_start) / span * len(words)))
+                    for start, _ in intervals
+                ]
+                boundaries.append(len(words))
+                boundaries = [
+                    boundaries[i] if i == 0 else max(boundaries[i], boundaries[i - 1])
+                    for i in range(len(boundaries))
+                ]
+                pieces = []
+                ok = True
+                for i in range(len(intervals)):
+                    lo, hi = boundaries[i], boundaries[i + 1]
+                    if hi <= lo:
+                        ok = False
+                        break
+                    pieces.append(words[lo:hi])
+                if not ok:
+                    valid = False
+                    break
+                variant_splits[key] = pieces
+
+            if not valid or "text" not in variant_splits:
+                stats["skipped"] += len(overlapping)
+                result.append(segment)
+                continue
+
+            snapped_tag = []
+            if effective_start > seg_start_f + eps:
+                snapped_tag.append("start")
+            if effective_end < seg_end_f - eps:
+                snapped_tag.append("end")
+
+            for i, (interval_start, interval_end) in enumerate(intervals):
+                part = {k: v for k, v in segment.items() if k != "words"}
+                for key, pieces in variant_splits.items():
+                    part[key] = " ".join(pieces[i])
+                part["start"] = interval_start
+                part["end"] = interval_end
+                part["laughter_preserve"] = True
+                if snapped_tag:
+                    part["laughter_snapped"] = "+".join(snapped_tag)
+                result.append(part)
+
+            if snapped:
+                stats["segments_snapped"] += 1
+            if len(intervals) > 1:
+                stats["segments_split"] += 1
+
+        self._preserved_laughter_stats = stats
+        logger.info(
+            "Laughter preservation: %d range(s) (%.2fs), %d segment(s) split, "
+            "%d snapped, %d removed, %d skipped",
+            stats["ranges"],
+            stats["seconds"],
+            stats["segments_split"],
+            stats["segments_snapped"],
+            stats["segments_removed"],
+            stats["skipped"],
+        )
+        return result, stats
+
+    def _is_laughter_gap(self, prev_segment: Dict, segment: Dict) -> bool:
+        """True when the gap between two segments contains a preserved laugh."""
+        ranges = getattr(self, "_laughter_preserve_ranges", None)
+        if not ranges:
+            return False
+        try:
+            gap_start = float(prev_segment.get("end"))
+            gap_end = float(segment.get("start"))
+        except (TypeError, ValueError):
+            return False
+        if gap_end <= gap_start:
+            return False
+        for ls, le in ranges:
+            if min(le, gap_end) - max(ls, gap_start) > 0.05:
+                return True
+        return False
+
+    @staticmethod
+    def map_original_to_output(
+        positions: List[Dict], time_value: float
+    ) -> Optional[float]:
+        """Map an original-timeline time to the assembled output timeline."""
+        if not positions:
+            return None
+        ordered = sorted(positions, key=lambda item: float(item.get("original_start", 0.0)))
+        first = ordered[0]
+        last = ordered[-1]
+        first_orig = float(first.get("original_start", 0.0))
+        last_orig = float(last.get("original_end", 0.0))
+        if time_value < first_orig:
+            return float(first.get("start", 0.0)) - (first_orig - time_value)
+        if time_value > last_orig:
+            return float(last.get("end", 0.0)) + (time_value - last_orig)
+
+        # Inside a segment (works for the single-position case too).
+        for p in ordered:
+            p_start = float(p.get("original_start", 0.0))
+            p_end = float(p.get("original_end", 0.0))
+            if p_start <= time_value <= p_end:
+                span = max(p_end - p_start, 1e-6)
+                frac = (time_value - p_start) / span
+                return float(p.get("start", 0.0)) + frac * (
+                    float(p.get("end", 0.0)) - float(p.get("start", 0.0))
+                )
+
+        # Inside a gap between two segments.
+        for i in range(len(ordered) - 1):
+            a = ordered[i]
+            b = ordered[i + 1]
+            a_end = float(a.get("original_end", 0.0))
+            b_start = float(b.get("original_start", 0.0))
+            if a_end < time_value < b_start:
+                gap = max(b_start - a_end, 1e-6)
+                frac = (time_value - a_end) / gap
+                return float(a.get("end", 0.0)) + frac * (
+                    float(b.get("start", 0.0)) - float(a.get("end", 0.0))
+                )
+        return float(last.get("end", 0.0))
+
+    def splice_preserved_laughter(
+        self,
+        combined_audio: AudioSegment,
+        audio_file: str,
+        real_segment_positions: List[Dict],
+    ) -> AudioSegment:
+        """Replace dubbed gaps with the original laughter from the source audio."""
+        ranges = getattr(self, "_laughter_preserve_ranges", None)
+        if not ranges or not audio_file or not os.path.exists(audio_file):
+            return combined_audio
+        try:
+            source = AudioSegment.from_file(audio_file)
+        except Exception as exc:
+            logger.warning("Could not load source audio for laughter preservation: %s", exc)
+            return combined_audio
+
+        target_db = self._laughter_preserve_config()["target_dbfs"]
+        self._preserved_laughter_output = []
+
+        for ls, le in ranges:
+            out_start = self.map_original_to_output(real_segment_positions, ls)
+            out_end = self.map_original_to_output(real_segment_positions, le)
+            if out_start is None or out_end is None or out_end <= out_start:
+                continue
+            src = source[int(max(0, ls) * 1000):int(max(0, le) * 1000)]
+            if len(src) <= 0:
+                continue
+            try:
+                if src.dBFS != float("-inf"):
+                    gain = target_db - src.dBFS
+                    gain = max(-12.0, min(12.0, gain))
+                    src = src.apply_gain(gain)
+            except Exception:
+                pass
+            src = src.fade_in(30).fade_out(30)
+
+            out_start_ms = int(round(out_start * 1000))
+            out_end_ms = int(round(out_end * 1000))
+            gap_ms = max(0, out_end_ms - out_start_ms)
+            if gap_ms <= 0:
+                continue
+            if len(src) < gap_ms:
+                src = src + AudioSegment.silent(duration=gap_ms - len(src))
+            elif len(src) > gap_ms:
+                src = src[:gap_ms]
+
+            if out_end_ms > len(combined_audio):
+                out_end_ms = len(combined_audio)
+            if out_start_ms >= out_end_ms:
+                continue
+            combined_audio = (
+                combined_audio[:out_start_ms] + src + combined_audio[out_end_ms:]
+            )
+            self._preserved_laughter_output.append(
+                {
+                    "original_start": ls,
+                    "original_end": le,
+                    "output_start": out_start_ms / 1000.0,
+                    "output_end": out_end_ms / 1000.0,
+                }
+            )
+
+        if self._preserved_laughter_output:
+            logger.info(
+                "Spliced %d original laughter moment(s) into the dubbed track",
+                len(self._preserved_laughter_output),
+            )
+            try:
+                import json as _json
+
+                debug_dir = Path("artifacts/debug")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                with open(debug_dir / "laughter_preserved.json", "w", encoding="utf-8") as handle:
+                    _json.dump(
+                        {
+                            "ranges": [
+                                {"start": s, "end": e}
+                                for s, e in ranges
+                            ],
+                            "spliced": self._preserved_laughter_output,
+                        },
+                        handle,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+            except Exception as debug_exc:
+                logger.debug("Failed to write laughter preserve debug file: %s", debug_exc)
+
+        return combined_audio
+
     def clone_speakers_voices(self, speakers_rolls: Dict, audio_file: str) -> Dict[str, str]:
         """
         Clone voices for specified speakers.
@@ -892,11 +1561,21 @@ class SmartDubbing:
                 "editor_schema_v1"
             ).encode("utf-8")
         ).hexdigest()[:12]
+        refinement_signature = hashlib.md5(
+            (
+                f"{self.config.get('refinement_llm_provider') or 'default'}|"
+                f"{self.config.get('refinement_model_name') or 'default'}|"
+                f"{self.config.get('refinement_temperature', 1.0)}|"
+                f"{self.config.get('refinement_persona') or 'normal'}|"
+                "refinement_cache_v1"
+            ).encode("utf-8")
+        ).hexdigest()[:12]
         cache_key = (
             f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
             f"_{self._segment_normalization_cache_suffix()}"
             f"_{self.config.get('target_language')}_gender_{speaker_metadata_hash}_keep_{int(preserve_segment_boundaries)}"
             f"_editor_{editor_signature}"
+            f"_refine_{refinement_signature}"
         )
         step_name = "translation"
         
@@ -1347,7 +2026,7 @@ class SmartDubbing:
         # Start timing
         self.performance_tracker.start_timing("speech_synthesis")
         
-        cache_key = (
+        base_cache_key = (
             f"{self.cache_manager.generate_cache_key(audio_file, self.config.get('source_language'), self.config.get('target_language'), self.config.get('whisper_model', 'large-v3'), self.config.get('start_time'), self.config.get('duration'))}"
             f"_{self._segment_normalization_cache_suffix()}"
             f"_{self.config.get('target_language')}_{self.config.get('tts_system')}"
@@ -1356,7 +2035,7 @@ class SmartDubbing:
         
         # Check for editable segments file first
         segments_step_name = "segments_for_synthesis"
-        editable_data = self.cache_manager.load_segments_json(segments_step_name, cache_key, "_editable")
+        editable_data = self.cache_manager.load_segments_json(segments_step_name, base_cache_key, "_editable")
         
         if editable_data and editable_data.get("segments"):
             logger.info("=" * 70)
@@ -1376,6 +2055,46 @@ class SmartDubbing:
             # Use edited segments
             segments = edited_segments
 
+        # Apply detected laughter moments as TTS tags once, after any editable
+        # override, so edited files created before the feature also get them.
+        # In 'preserve' mode the laughter is kept from the original audio and the
+        # translated speech is split around it instead (no TTS tags).
+        preserve_mode = (
+            self.config.get('laughter_mode') == 'preserve' and bool(self._laughter_events)
+        )
+        laughter_stats = None
+        synthesis_segments = segments
+        preserve_stats: Optional[Dict[str, Any]] = None
+        if preserve_mode:
+            synthesis_segments, preserve_stats = self.prepare_laughter_preservation(
+                segments, audio_file
+            )
+            logger.info(
+                "Laughter preservation: %d range(s), %d segment(s) split, %d skipped",
+                preserve_stats.get("ranges", 0),
+                preserve_stats.get("segments_split", 0),
+                preserve_stats.get("skipped", 0),
+            )
+        elif self._laughter_events:
+            laughter_stats = self.inject_laughter_tags(segments)
+            logger.info(
+                "Laughter annotation: %d moment(s), %d segment(s) tagged, %d skipped, %d already tagged",
+                laughter_stats.get("events", 0),
+                laughter_stats.get("tagged_segments", 0),
+                laughter_stats.get("skipped", 0),
+                laughter_stats.get("already_tagged", 0),
+            )
+        laugh_signature = laughter_signature(segments)
+        cache_key = (
+            f"{base_cache_key}_laugh_{laugh_signature}"
+            if laugh_signature
+            else base_cache_key
+        )
+        if preserve_mode and preserve_stats is not None:
+            cache_key = (
+                f"{cache_key}_preserve_{preserve_stats.get('ranges', 0)}_"
+                f"{int(preserve_stats.get('seconds', 0.0) * 1000)}"
+            )
         # Prepare segments for saving (add force_resynthesize field, remove words to reduce size)
         segments_to_save = []
         for seg in segments:
@@ -1395,7 +2114,7 @@ class SmartDubbing:
             "tts_system": self.config.get('tts_system')
         }
         editable_path = self.cache_manager.save_segments_json(
-            segments_step_name, cache_key, segments_to_save, metadata, "_editable"
+            segments_step_name, base_cache_key, segments_to_save, metadata, "_editable"
         )
         
         # If exit_before_synthesis is True, save editable copy and exit
@@ -1432,6 +2151,10 @@ class SmartDubbing:
                 return output_path
         
         logger.info(f"Synthesizing translated speech using multiple TTS systems...")
+
+        # From here on, synthesize the (possibly laughter-split) segments; the
+        # original list is preserved for subtitles and the editable file.
+        segments = synthesis_segments
         
         # Create segment cache directory if needed
         segment_cache_path = self.cache_manager.get_cache_path("segment_synthesis")
@@ -1869,13 +2592,25 @@ class SmartDubbing:
                 tts_locks[tts_system] = tts_lock
                 setattr(tts_instance, "_synthesis_lock", tts_lock)
 
+            base_content_valid: Optional[bool] = None
+            base_content_reason: Optional[str] = None
             try:
                 with tts_lock:
-                    tts_instance.synthesize(
+                    base_alignments = tts_instance.synthesize(
                         segments_data=[final_segment_data],
                         language=target_language,
                         previous_context=previous_texts
                     )
+                if base_alignments:
+                    base_content_valid = getattr(base_alignments[0], "content_valid", None)
+                    base_content_reason = getattr(
+                        base_alignments[0], "content_validation_reason", None
+                    )
+                    if base_content_valid is False:
+                        logger.warning(
+                            f"Segment {segment_index+1}: content validation rejected the "
+                            f"synthesized audio ({base_content_reason}) — will try alternative texts."
+                        )
             except Exception as synth_exc:
                 logger.error(f"Failed to synthesize segment {segment_index+1} ({tts_system}): {synth_exc}")
                 segment_dict['synthesized_speech_len'] = 0
@@ -1913,13 +2648,23 @@ class SmartDubbing:
                 hasattr(tts_instance, 'is_fallback_output')
                 and tts_instance.is_fallback_output(current_segment_output_path)
             )
-            if self.cache_manager.use_cache and len(audio_info) > 0 and not is_fallback:
+            if (
+                self.cache_manager.use_cache
+                and len(audio_info) > 0
+                and not is_fallback
+                and base_content_valid is not False
+            ):
                 try:
                     shutil.copy(current_segment_output_path, segment_cached_file_path)
                 except Exception as cache_exc:
                     logger.error(f"Error caching segment {segment_index+1}: {cache_exc}")
             elif is_fallback:
                 logger.debug(f"Skipping pipeline cache for fallback segment {segment_index+1}")
+            elif base_content_valid is False:
+                logger.debug(
+                    f"Skipping pipeline cache for segment {segment_index+1}: "
+                    f"content validation failed ({base_content_reason})"
+                )
 
             original_dur = segment_dict["end"] - segment_dict["start"]
             actual_dur = segment_dict['synthesized_speech_len']
@@ -1930,17 +2675,27 @@ class SmartDubbing:
             with metadata_lock:
                 estimation_stats["total_segments"] += 1
 
-            if not (COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO) or segment_stretch_mode == 'video':
-                # Estimation was inaccurate - outside comfort zone
-                with metadata_lock:
-                    estimation_stats["inaccurate_estimations"] += 1
+            duration_miss = not (
+                COMFORT_MIN_ADJUSTMENT_RATIO <= ratio <= COMFORT_MAX_ADJUSTMENT_RATIO
+            ) or segment_stretch_mode == 'video'
+            content_rejected = base_content_valid is False
+            if duration_miss or content_rejected:
+                if duration_miss:
+                    # Estimation was inaccurate - outside comfort zone
+                    with metadata_lock:
+                        estimation_stats["inaccurate_estimations"] += 1
 
-                logger.info(
-                    f"[MISS] Segment duration estimation MISS - "
-                    f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
-                    f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s."
-                )
-                
+                    logger.info(
+                        f"[MISS] Segment duration estimation MISS - "
+                        f"Ratio={ratio:.2f} (expected {COMFORT_MIN_ADJUSTMENT_RATIO:.2f}-{COMFORT_MAX_ADJUSTMENT_RATIO:.2f}), "
+                        f"Deviation={deviation:.1%}, Original={original_dur:.2f}s, Actual={actual_dur:.2f}s."
+                    )
+                else:
+                    logger.info(
+                        f"[REJECT] Segment {segment_index+1}: synthesized audio failed content "
+                        f"validation ({base_content_reason}) — resynthesizing with alternative texts."
+                    )
+
                 # Mode: audio - aggressive audio speed changes, allow going beyond comfort zone
                 logger.info("Mode 'audio': Resynthesizing with aggressive audio adjustments...")
                 with tts_lock:
@@ -1951,6 +2706,7 @@ class SmartDubbing:
                         COMFORT_MAX_ADJUSTMENT_RATIO,
                         current_ratio=ratio,
                         segments=segments,
+                        content_rejected=content_rejected,
                     )                    
             else:
                 # Estimation was accurate - within comfort zone
@@ -2023,6 +2779,14 @@ class SmartDubbing:
             segments, 
             progress_callback=grouping_progress_callback
         )
+
+        # Restore the original laughter audio into the reserved gaps so the
+        # dubbed track never overlaps it (laughter_mode == 'preserve').
+        if preserve_mode and self._laughter_preserve_ranges:
+            combined_audio = self.splice_preserved_laughter(
+                combined_audio, audio_file, real_segment_positions
+            )
+
         output_path = "artifacts/audio/output.wav"
         combined_audio.export(output_path, format="wav")
         
@@ -2127,6 +2891,19 @@ class SmartDubbing:
                 segments_metadata=self._last_synthesis_segments_metadata,
                 config=self.config.config if hasattr(self.config, "config") else self.config,
                 project_id=self.config.get("project_id"),
+                extra_metrics=(
+                    {
+                        "laughter_preservation": {
+                            **getattr(self, "_preserved_laughter_stats", {}),
+                            "spliced": len(getattr(self, "_preserved_laughter_output", [])),
+                            "spliced_ranges": list(getattr(self, "_preserved_laughter_output", [])),
+                            "mode": self.config.get("laughter_mode", "dub"),
+                        }
+                    }
+                    if getattr(self, "_preserved_laughter_stats", {}).get("ranges")
+                    or getattr(self, "_preserved_laughter_output", [])
+                    else None
+                ),
             ).build_and_write()
         except Exception as exc:
             logger.warning(f"Failed to build summary report: {exc}", exc_info=True)
@@ -2233,7 +3010,8 @@ class SmartDubbing:
         min_ratio: float,
         max_ratio: float,
         current_ratio: Optional[float] = None,
-        segments: Optional[List[Dict]] = None
+        segments: Optional[List[Dict]] = None,
+        content_rejected: bool = False,
     ) -> None:
         """Attempt to resynthesize a segment using alternative translations,
         focusing on minimizing deviation from the target ratio range.
@@ -2245,6 +3023,10 @@ class SmartDubbing:
             max_ratio: Maximum acceptable ratio original/actual.
             current_ratio: Current ratio to help prioritize alternatives.
             segments: Optional list of all segments for context extraction.
+            content_rejected: True when the current audio failed content
+                validation (e.g. repeated/stuttered speech). Any content-valid
+                candidate is then accepted even if its duration deviation is
+                worse than the rejected baseline.
         """
 
         from src.tts.models import TTSSegmentData
@@ -2281,7 +3063,9 @@ class SmartDubbing:
             logger.debug(f"Current ratio: {current_ratio:.2f}, current deviation: {current_deviation:.2%}")
         
         best_alternative = None
-        best_deviation_from_range = current_deviation  # Start with current deviation as baseline
+        best_deviation_from_range = (
+            float('inf') if content_rejected else current_deviation
+        )  # Start with current deviation as baseline
         best_ratio = None
         best_key = None
 
@@ -2310,11 +3094,21 @@ class SmartDubbing:
             new_segment_data = TTSSegmentData(**{**base_args, "text": alt_text, "output_path": temp_output_path})
 
             try:
-                tts_instance.synthesize(
+                candidate_alignments = tts_instance.synthesize(
                     segments_data=[new_segment_data],
                     language=self.config.get('target_language'),
                     previous_context=metadata.get('previous_context', [])
                 )
+
+                if candidate_alignments and getattr(candidate_alignments[0], "content_valid", None) is False:
+                    logger.info(
+                        f"Rejecting alternative '{key}' for segment {metadata['index']+1}: "
+                        f"content validation failed "
+                        f"({getattr(candidate_alignments[0], 'content_validation_reason', None)})"
+                    )
+                    if os.path.exists(temp_output_path):
+                        os.remove(temp_output_path)
+                    continue
 
                 if not os.path.exists(temp_output_path):
                     continue
@@ -2404,13 +3198,21 @@ class SmartDubbing:
                         new_segment_data = TTSSegmentData(**{**base_args, "text": adjusted_text, "output_path": temp_output_path})
 
                         try:
-                            tts_instance.synthesize(
+                            llm_alignments = tts_instance.synthesize(
                                 segments_data=[new_segment_data],
                                 language=self.config.get('target_language'),
                                 previous_context=metadata.get('previous_context', [])
                             )
 
-                            if os.path.exists(temp_output_path):
+                            if llm_alignments and getattr(llm_alignments[0], "content_valid", None) is False:
+                                logger.info(
+                                    f"Rejecting LLM-adjusted candidate for segment {metadata['index']+1}: "
+                                    f"content validation failed "
+                                    f"({getattr(llm_alignments[0], 'content_validation_reason', None)})"
+                                )
+                                if os.path.exists(temp_output_path):
+                                    os.remove(temp_output_path)
+                            elif os.path.exists(temp_output_path):
                                 audio_info = AudioSegment.from_file(temp_output_path)
                                 actual_duration_llm = len(audio_info) / 1000.0
                                 if actual_duration_llm > 0:
@@ -2445,7 +3247,11 @@ class SmartDubbing:
             logger.warning(f"LLM adjustment step encountered an error: {e}")
 
         # Use the best alternative found only if it's actually better than current
-        if best_alternative and os.path.exists(best_alternative) and deviation_key(best_deviation_from_range) < deviation_key(current_deviation):
+        should_adopt = bool(best_alternative) and os.path.exists(best_alternative) and (
+            content_rejected
+            or deviation_key(best_deviation_from_range) < deviation_key(current_deviation)
+        )
+        if should_adopt:
             # Move the best alternative to the final output path
             if os.path.exists(output_path):
                 os.remove(output_path)
@@ -2474,14 +3280,25 @@ class SmartDubbing:
                 except Exception:
                     pass
 
-            logger.info(f"Resynthesis successful for segment {metadata['index']+1} using '{best_key}' "
-                        f"(improved from {current_deviation:.2%} to {best_deviation_from_range:.2%} deviation)")
+            if content_rejected:
+                logger.info(
+                    f"Resynthesis successful for segment {metadata['index']+1} using '{best_key}' "
+                    f"(replaced audio that failed content validation; deviation {best_deviation_from_range:.2%})"
+                )
+            else:
+                logger.info(f"Resynthesis successful for segment {metadata['index']+1} using '{best_key}' "
+                            f"(improved from {current_deviation:.2%} to {best_deviation_from_range:.2%} deviation)")
         else:
             # Clean up the best alternative if it exists but isn't better
             if best_alternative and os.path.exists(best_alternative):
                 os.remove(best_alternative)
             
-            if current_ratio is not None:
+            if content_rejected:
+                logger.warning(
+                    f"No content-valid alternative found for segment {metadata['index']+1}. "
+                    f"Keeping the rejected original synthesis."
+                )
+            elif current_ratio is not None:
                 logger.info(f"No alternative found that improves deviation for segment {metadata['index']+1} "
                            f"(current: {current_deviation:.2%}). Keeping original synthesis.")
             else:
@@ -2631,6 +3448,10 @@ class SmartDubbing:
                     is_interleaved_by_other_speaker = current_timeline_pos != prev_timeline_pos + 1
                     
                     if pause_duration > SPLITTING_PAUSE_THRESHOLD_SECONDS:
+                        start_new_group = True
+                    # Never merge across a preserved laughter window: the gap must
+                    # stay unstretched so the original laugh can be spliced there.
+                    if self._is_laughter_gap(prev_segment, segment):
                         start_new_group = True
                     # In sequential modes, never merge same-speaker segments across
                     # intervening segments from other speakers.

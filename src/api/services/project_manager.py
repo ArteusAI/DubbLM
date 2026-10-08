@@ -9,6 +9,11 @@ from typing import Optional
 
 from ..config import get_settings
 
+# Source containers whose codecs cannot be muxed by the dubbing pipeline
+# (audio is always encoded as AAC, video may be re-encoded to h264).
+UNSAFE_RESULT_VIDEO_CONTAINERS = {".webm"}
+RESULT_VIDEO_CONTAINER_FALLBACK = ".mp4"
+
 
 def sanitize_filename(filename: str) -> str:
     """Sanitize filename by replacing problematic characters.
@@ -119,7 +124,10 @@ class ProjectManager:
         self.ensure_directories()
         source = self.get_source_video_path()
         if source:
-            return self.results_dir / f"{source.stem}_{target_lang}{source.suffix}"
+            suffix = source.suffix.lower()
+            if suffix in UNSAFE_RESULT_VIDEO_CONTAINERS:
+                suffix = RESULT_VIDEO_CONTAINER_FALLBACK
+            return self.results_dir / f"{source.stem}_{target_lang}{suffix}"
         return self.results_dir / f"output_{target_lang}.mp4"
     
     def get_result_subtitles_path(self, target_lang: str, sub_type: str = "srt") -> Path:

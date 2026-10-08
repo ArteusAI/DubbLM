@@ -217,6 +217,7 @@ Important configuration areas:
 - `tts_system`, `tts_model`, `tts_fallback_model`, `tts_prompt_prefix`
 - `voice_auto_selection`, `voice_name`, `voice_prompt`, `tts_system_mapping`
 - `keep_background`, `keep_original_audio_ranges`, `dubbed_volume`, `background_volume`
+- `enable_laughter_detection` — detect laughter moments and voice them with TTS laughter tags. Enabled in the `ultra` preset; requires a one-time download of the `omine-me/LaughterSegmentation` model (research use only) plus its wav2vec2 base model into the Hugging Face cache.
 - `segment_stretch`, `segments_optimization`
 - `save_original_subtitles`, `save_translated_subtitles`
 - `pricing` for cost estimation/reporting

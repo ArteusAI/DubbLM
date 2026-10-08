@@ -25,6 +25,11 @@ class SegmentSynthesisReport:
     voice_similarity: Optional[float] = None
     voice_validation: Optional[str] = None
     voice_forced: bool = False
+    laughter_required: bool = False
+    laughter_detected: Optional[bool] = None
+    laughter_score: Optional[float] = None
+    laughter_fallback: bool = False
+    laughter_attempts: int = 0
 
 
 @dataclass
@@ -239,3 +244,15 @@ class SegmentAlignment(BaseModel):
     original_segment: TTSSegmentData = Field(..., description="Original segment from input")
     diarized_segment: DiarizationSegment = Field(..., description="Corresponding diarized segment")
     alignment_confidence: float = Field(..., description="Confidence of this alignment")
+    content_valid: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the synthesized audio passed content validation. None means the "
+            "backend does not report content validity. Callers may use False to reject "
+            "a candidate (e.g. repeated/stuttered speech) even when its duration fits."
+        ),
+    )
+    content_validation_reason: Optional[str] = Field(
+        default=None,
+        description="Human-readable reason from the content validation step.",
+    )

@@ -49,6 +49,8 @@ export interface PresetConfig {
   voiceAutoSelection?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableLaughterDetection?: boolean;
+  laughterMode?: 'dub' | 'preserve';
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;
@@ -171,6 +173,8 @@ export interface AppConfig {
   voiceAutoSelection?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableLaughterDetection?: boolean;
+  laughterMode?: 'dub' | 'preserve';
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;

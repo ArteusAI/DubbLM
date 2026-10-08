@@ -75,6 +75,16 @@ class DubbingConfig:
             'voice_prompt': None,
             'voice_auto_selection': True,
             'enable_emotion_analysis': False,
+            'enable_laughter_detection': False,
+            # Laughter handling mode: 'dub' (voice laughter via TTS tags) or
+            # 'preserve' (keep the original laughter audio, rearrange the
+            # translated speech so nothing overlaps it).
+            'laughter_mode': 'dub',
+            'laughter_preserve_pad_seconds': 0.15,
+            'laughter_preserve_merge_gap': 0.25,
+            'laughter_preserve_min_duration': 0.25,
+            'laughter_preserve_boundary_snap_seconds': 1.5,
+            'laughter_preserve_target_dbfs': -20.0,
             'include_original_audio': False,
             'output': None, 
             'keep_original_audio_ranges': None,
@@ -98,6 +108,9 @@ class DubbingConfig:
             'content_validator_whisper_compute_type': 'int8',
             'content_validator_whisper_cpu_threads': 2,
             'content_validator_speech_model': 'nano',
+            'enable_content_repetition_check': True,
+            'content_repetition_min_words': 4,
+            'content_repetition_extra_allowance': 0,
             # Parallel ffmpeg workers for per-segment video speed adjustments.
             # None = auto: min(8, max(2, cpu_count//4)). x264 is cache/RAM-bandwidth
             # bound so oversubscribing CPU cores thrashes throughput and exhausts RAM.
@@ -286,6 +299,13 @@ class DubbingConfig:
             except (ValueError, TypeError) as e:
                 logger.warning(f"Warning: Invalid speakers_expected value '{speakers_expected}': {e}. Ignoring.")
                 self.config['speakers_expected'] = None
+
+        # Normalize laughter_mode
+        laughter_mode = str(self.config.get('laughter_mode') or 'dub').strip().lower()
+        if laughter_mode not in ('dub', 'preserve'):
+            logger.warning(f"Warning: Invalid laughter_mode '{laughter_mode}'. Falling back to 'dub'.")
+            laughter_mode = 'dub'
+        self.config['laughter_mode'] = laughter_mode
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
@@ -349,7 +369,12 @@ class DubbingConfig:
         parser.add_argument('--content_validator_whisper_compute_type', type=str, help='faster-whisper compute type for TTS content validation')
         parser.add_argument('--content_validator_whisper_cpu_threads', type=int, help='CPU threads for local Whisper TTS content validation')
         parser.add_argument('--content_validator_speech_model', type=str, help='AssemblyAI speech model for TTS content validation')
+        parser.add_argument('--enable_content_repetition_check', type=lambda x: (str(x).lower() == 'true'), help='Fail TTS content validation when the ASR transcript repeats words not present in the expected text (True/False)')
+        parser.add_argument('--content_repetition_min_words', type=int, help='N-gram size used for unexpected TTS repetition detection')
+        parser.add_argument('--content_repetition_extra_allowance', type=int, help='Allowed extra ASR occurrences of an n-gram before flagging a TTS repetition')
         parser.add_argument('--enable_emotion_analysis', type=lambda x: (str(x).lower() == 'true'), help='Enable emotion analysis for speech synthesis (True/False)')
+        parser.add_argument('--enable_laughter_detection', type=lambda x: (str(x).lower() == 'true'), help='Detect laughter moments and voice them with TTS laughter tags (True/False)')
+        parser.add_argument('--laughter_mode', type=str, choices=['dub', 'preserve'], help="Laughter handling: 'dub' voices laughter via TTS tags, 'preserve' keeps the original laughter audio")
         parser.add_argument('--run_step', type=str, choices=['combine_video'], 
                             help='Run only a specific, advanced pipeline step. This is intended for debugging or resuming a failed run where prior steps have successfully created their expected output files in the default locations. \
                                   Example: --run_step combine_video (Assumes audio/output.wav and potentially audio/background.wav exist from prior steps). \

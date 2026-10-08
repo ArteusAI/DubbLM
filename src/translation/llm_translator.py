@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Tuple, Set, Literal, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable, Literal, TYPE_CHECKING
 import time
 import json
 import os
@@ -2583,6 +2583,79 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         except Exception as e:
             logger.error(f"Error writing debug file for chunk {chunk_idx+1}: {str(e)}")
     
+    # Errors that mean the refinement provider (usually OpenRouter) cannot
+    # serve requests and the pipeline should fall back to the primary LLM.
+    REFINEMENT_FALLBACK_ERROR_MARKERS = (
+        "error code: 401",
+        "error code: 402",
+        "error code: 403",
+        "key limit exceeded",
+        "insufficient credits",
+        "total limit",
+        "quota",
+    )
+
+    def _is_refinement_quota_error(self, exc: BaseException) -> bool:
+        """Return True when the refinement error is an auth/credit/limit failure."""
+        text = str(exc).lower()
+        return any(marker in text for marker in self.REFINEMENT_FALLBACK_ERROR_MARKERS)
+
+    def _downgrade_refinement_provider(self) -> bool:
+        """Switch refinement to the primary provider after a provider limit error.
+
+        Called once per translator instance. When refinement is configured for
+        OpenRouter and the primary translation provider is something else
+        (Gemini), recreate the refinement client with the primary provider and
+        model so the remaining batches can still be refined.
+        """
+        if getattr(self, "_refinement_provider_downgraded", False):
+            return False
+        if self.refinement_llm_provider != "openrouter" or self.llm_provider == "openrouter":
+            return False
+
+        fallback_model = self.model_name
+        try:
+            self.refinement_llm = self._create_llm(
+                provider=self.llm_provider,
+                model_name=fallback_model,
+                temperature=self.refinement_temperature,
+                max_tokens=self.refinement_max_tokens,
+                purpose="refinement",
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to initialize fallback refinement LLM "
+                f"({self.llm_provider}/{fallback_model}): {exc}"
+            )
+            return False
+
+        self.refinement_llm_provider = self.llm_provider
+        self.refinement_model_name = fallback_model
+        self._refinement_provider_downgraded = True
+        if self.cost_tracker is not None and hasattr(self.cost_tracker, "record_refinement_downgrade"):
+            self.cost_tracker.record_refinement_downgrade()
+        logger.warning(
+            f"Refinement provider fallback: OpenRouter unavailable, "
+            f"switching refinement to {self.llm_provider}/{fallback_model}"
+        )
+        return True
+
+    def _call_refinement_llm(self, prompt: str, progress_callback: Optional[Callable] = None) -> Any:
+        """Call the refinement LLM, falling back to the primary provider on limit errors."""
+        try:
+            return robust_llm_call(self.refinement_llm.complete, prompt)
+        except Exception as exc:
+            if not self._is_refinement_quota_error(exc) or not self._downgrade_refinement_provider():
+                raise
+            if callable(progress_callback):
+                progress_callback(
+                    "refinement_downgraded",
+                    0,
+                    0,
+                    f"{self.refinement_llm_provider}/{self.refinement_model_name}",
+                )
+            return robust_llm_call(self.refinement_llm.complete, prompt)
+
     def _refine_translation(
         self,
         translated_chunks: List[Dict],
@@ -2667,6 +2740,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             batches.append(current_batch)
             
         logger.debug(f"Split {len(translated_chunks)} chunks into {len(batches)} batches for refinement")
+        progress_callback = kwargs.get("progress_callback")
         
         # Add glossary section to the refinement prompt if glossary exists
         glossary_section = ""
@@ -2777,13 +2851,14 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             refined_pairs = None
             llm_response_text = ""
             refinement_success = False
+            last_batch_error: Optional[BaseException] = None
 
             try:
                 effective_refinement_prompt = (
                     f"# Additional context (optional):\n{self.prompt_prefix}\n\n{refinement_prompt}"
                     if self.prompt_prefix else refinement_prompt
                 )
-                refinement_response = robust_llm_call(self.refinement_llm.complete, effective_refinement_prompt)
+                refinement_response = self._call_refinement_llm(effective_refinement_prompt, progress_callback)
                 if hasattr(refinement_response, "text"):
                     llm_response_text = refinement_response.text.strip()
                 else:  # openrouter
@@ -2820,6 +2895,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 refinement_success = True
 
             except Exception as e:
+                last_batch_error = e
                 logger.error(f"Refinement failed for batch {batch_idx+1}: {str(e)}")
                 if debug and session_dir:
                     try:
@@ -2892,13 +2968,19 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             # If refinement still failed or we've hit max depth, use the original chunks for this batch
             if not refinement_success:
                 logger.error(f"Refinement failed for batch {batch_idx+1}. Using original translations.")
+                if self.cost_tracker is not None and hasattr(self.cost_tracker, "record_refinement_failure"):
+                    self.cost_tracker.record_refinement_failure()
                 refined_chunks.extend(batch)
-                
-                # Report progress even for failed batch
-                progress_callback = kwargs.get("progress_callback")
-                if progress_callback:
-                    progress_callback("refinement", batch_idx + 1, len(batches), "")
-                
+
+                # Surface the fallback so job logs/UI can show it instead of silently continuing
+                if callable(progress_callback):
+                    progress_callback(
+                        "refinement_failed",
+                        batch_idx + 1,
+                        len(batches),
+                        str(last_batch_error or ""),
+                    )
+
                 continue
 
             # Record end time for batch refinement

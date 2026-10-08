@@ -37,7 +37,7 @@ STAGE_LABELS: Dict[str, str] = {
     "segment_normalization": "Segment normalization",
     "context_analysis": "Context analysis",
     "translation": "Translation",
-    "emotion_analysis": "Emotion analysis",
+    "emotion_analysis": "Laughter detection",
     "speech_synthesis": "Speech synthesis",
     "background_audio": "Background audio",
     "audio_normalization": "Audio normalization",
@@ -63,6 +63,7 @@ class ReportBuilder:
         config: Dict[str, Any],
         project_id: Optional[str] = None,
         api_prefix: str = "/api/v1",
+        extra_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.performance_tracker = performance_tracker
         self.cost_tracker = cost_tracker
@@ -71,6 +72,7 @@ class ReportBuilder:
         self.config = config or {}
         self.project_id = project_id
         self.api_prefix = api_prefix.rstrip("/")
+        self.extra_metrics = extra_metrics or {}
 
     def build_and_write(self) -> Optional[Path]:
         """Build the report and persist both JSON + Markdown. Returns md path."""
@@ -132,10 +134,13 @@ class ReportBuilder:
                 "batches_with_fallback": sum(
                     1 for b in batches if not b.get("success", True) or b.get("fallback_segment_count", 0) > 0
                 ),
+                "refinement_failures": int(getattr(self.cost_tracker, "refinement_failures", 0) or 0),
+                "refinement_downgrades": int(getattr(self.cost_tracker, "refinement_downgrades", 0) or 0),
             },
             "stages": stages,
             "api_costs": api_costs,
             "transcription_usage": transcription_usage,
+            "laughter_preservation": self.extra_metrics.get("laughter_preservation"),
             "segments": segments,
             "batches": batches,
             "artifacts": artifacts,
@@ -271,6 +276,11 @@ class ReportBuilder:
                 "voice_similarity": rep.voice_similarity if rep else None,
                 "voice_validation": rep.voice_validation if rep else None,
                 "voice_forced": bool(rep.voice_forced) if rep else False,
+                "laughter_required": bool(rep.laughter_required) if rep else False,
+                "laughter_detected": rep.laughter_detected if rep else None,
+                "laughter_score": rep.laughter_score if rep else None,
+                "laughter_fallback": bool(rep.laughter_fallback) if rep else False,
+                "laughter_attempts": int(rep.laughter_attempts) if rep else 0,
             }
             out.append(entry)
         return out
@@ -385,6 +395,18 @@ class ReportBuilder:
             f"**Segments:** {totals.get('segments', 0)} "
             f"(failed: {totals.get('failed_segments', 0)})"
         )
+        refinement_failures = int(totals.get("refinement_failures") or 0)
+        if refinement_failures:
+            lines.append(
+                f"**WARNING:** refinement fell back to unrefined translations "
+                f"for {refinement_failures} batch(es)"
+                + (
+                    f" (provider downgrades: {int(totals.get('refinement_downgrades') or 0)})"
+                    if totals.get("refinement_downgrades")
+                    else ""
+                )
+                + "."
+            )
         lines.append("")
 
         lines.append("## API Costs")

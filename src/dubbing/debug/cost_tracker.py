@@ -315,6 +315,10 @@ class CostTracker:
         }
         self.api_costs: List[Dict[str, Any]] = []
 
+        # Refinement resilience metrics (best-effort, surfaced in reports)
+        self.refinement_failures: int = 0
+        self.refinement_downgrades: int = 0
+
     # ----- Helpers -----
     def set_audio_duration(self, seconds: Optional[float]) -> None:
         self.audio_duration_sec = seconds
@@ -1043,6 +1047,14 @@ class CostTracker:
         return cost
 
     # ----- Summary -----
+    def record_refinement_failure(self) -> None:
+        """Record a refinement batch that fell back to unrefined translations."""
+        self.refinement_failures += 1
+
+    def record_refinement_downgrade(self) -> None:
+        """Record a refinement provider downgrade (e.g. OpenRouter -> Gemini)."""
+        self.refinement_downgrades += 1
+
     def get_api_cost_rows(self) -> List[Dict[str, Any]]:
         """Return detailed actual API cost rows for reports."""
         return list(self.api_costs)

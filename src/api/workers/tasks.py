@@ -684,6 +684,20 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Before segments created: max 35%
             # Translation: 15-22%, Refinement: 22-29%, Editor: 29-35%
             def translation_progress(phase: str, current: int, total: int, text: str = None):
+                if phase == "refinement_downgraded":
+                    add_job_log(
+                        job_id,
+                        f"Refinement provider fallback: OpenRouter unavailable, switching to {text or 'fallback model'}",
+                        "warning",
+                    )
+                    return
+                if phase == "refinement_failed":
+                    add_job_log(
+                        job_id,
+                        f"Refinement failed for batch {current}/{total}; using unrefined translation",
+                        "warning",
+                    )
+                    return
                 if phase == "translation":
                     progress = 15 + int((current / total) * 7)
                     step_name = "translation"
@@ -917,6 +931,20 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             update_job_progress(job_id, 15, "translation", "Re-translating segments")
 
             def translation_progress(phase: str, current: int, total: int, text: str = None):
+                if phase == "refinement_downgraded":
+                    add_job_log(
+                        job_id,
+                        f"Refinement provider fallback: OpenRouter unavailable, switching to {text or 'fallback model'}",
+                        "warning",
+                    )
+                    return
+                if phase == "refinement_failed":
+                    add_job_log(
+                        job_id,
+                        f"Refinement failed for batch {current}/{total}; using unrefined translation",
+                        "warning",
+                    )
+                    return
                 if phase == "translation":
                     progress = 15 + int((current / total) * 7)
                     step_name = "translation"
@@ -1097,6 +1125,8 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_laughter_detection": config_data.get("enableLaughterDetection", preset_config.get("enable_laughter_detection", False)),
+                "laughter_mode": config_data.get("laughterMode", preset_config.get("laughter_mode", "dub")),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
                 "enable_context_style": config_data.get("enableContextStyle", True),
                 "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
@@ -1169,6 +1199,31 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 dubbing_config.get("start_time"),
                 dubbing_config.get("duration")
             )
+            
+            # Detect laughter moments before synthesis so they can be voiced by
+            # the TTS (tags are injected inside synthesize_speech).
+            if config_data.get("enableLaughterDetection", preset_config.get("enable_laughter_detection", False)):
+                update_job_progress(job_id, 46, "emotion_analysis", "Detecting laughter")
+                try:
+                    events = dubber.detect_laughter_events(audio_file)
+                    if events:
+                        summary = ", ".join(f"{e.start:.1f}-{e.end:.1f}s" for e in events[:5])
+                        add_job_log(
+                            job_id,
+                            f"Laughter detection: {len(events)} moment(s) [{summary}"
+                            + (" ...]" if len(events) > 5 else "]"),
+                        )
+                    else:
+                        add_job_log(job_id, "Laughter detection: no laughter moments found")
+                    if events and dubbing_config.get("laughter_mode") == "preserve":
+                        add_job_log(
+                            job_id,
+                            "Laughter preservation: keeping original laughter audio, "
+                            "rearranging translated speech around it",
+                        )
+                except Exception as laughter_exc:
+                    logger.warning("Laughter detection failed for %s: %s", project_id, laughter_exc)
+                    add_job_log(job_id, f"Laughter detection failed: {laughter_exc}", "warning")
             
             # Restore speakers_rolls from segments
             speakers_rolls = {}

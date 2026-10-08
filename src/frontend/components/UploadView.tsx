@@ -947,6 +947,26 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           <InfoTip text="Enrich TTS prompts with detected emotions" />
                         </label>
                         <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input 
+                            type="checkbox" 
+                            checked={config.enableLaughterDetection ?? currentPreset.enableLaughterDetection ?? false}
+                            onChange={(e) => onConfigChange({ enableLaughterDetection: e.target.checked })}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                          />
+                          <span className="text-[10px] text-zinc-400">Laughter</span>
+                          <InfoTip text="Detect laughter moments in the source audio. 'Voice it' dubs laughter with Gemini 3.8 laughter tags (with validation); 'Keep original' preserves the source laughter audio and arranges the translated speech around it so nothing overlaps." />
+                        </label>
+                        {(config.enableLaughterDetection ?? currentPreset.enableLaughterDetection ?? false) && (
+                          <select
+                            value={config.laughterMode ?? currentPreset.laughterMode ?? 'dub'}
+                            onChange={(e) => onConfigChange({ laughterMode: e.target.value as 'dub' | 'preserve' })}
+                            className="bg-zinc-950 border border-zinc-700/50 rounded px-1.5 py-1 text-[10px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                          >
+                            <option value="dub">Voice it</option>
+                            <option value="preserve">Keep original</option>
+                          </select>
+                        )}
+                        <label className="flex items-center gap-1.5 cursor-pointer">
                           <input
                             type="checkbox"
                             checked={config.enableContentValidation ?? currentPreset.enableContentValidation ?? true}

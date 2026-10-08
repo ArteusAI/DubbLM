@@ -39,6 +39,7 @@ from .gemini_voice_catalog import (
     resolve_default_gemini_voice,
 )
 from .gemini38_tags import build_gemini38_prompt, quoted_fragment_leak, sanitize_angle_tags, strip_tts_markup
+from .content_validation_utils import find_unexpected_repetition
 from .models import (
     DiarizationSegment,
     SegmentAlignment,
@@ -121,6 +122,14 @@ MAX_CHAR_LIMIT_PER_REQUEST = 30000
 MIN_REFERENCE_DURATION_SECONDS = 3.0
 SILENCE_THRESHOLD_FOR_REPHRASING = 0.03
 MAX_REPHRASE_ATTEMPTS = 3
+LAUGHTER_FALLBACK_PREFIX = "Ха-ха-ха! "
+_LAUGHTER_TEXT_MARKERS = ("<laugh", "[laugh", "<giggle", "[giggle")
+
+
+def _text_has_laughter_tag(text: Optional[str]) -> bool:
+    """True when the synthesis text asks for an audible laughter cue."""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _LAUGHTER_TEXT_MARKERS)
 
 DURATION_SAMPLE_TEXTS = [
     "Hello, this is a quick test of voice speed and clarity.",
@@ -203,12 +212,25 @@ class Gemini38TTSConfig(BaseModel):
     content_trailing_word_count: int = 3
     content_trailing_fuzzy_threshold: float = 70.0
     content_validation_min_expected_chars: int = 8
+    # Repetition guard: Gemini sometimes stutters and speaks the same sentence
+    # twice (often with slightly different wording) inside one response. The
+    # token-set similarity above is duplicate-insensitive and misses this, so
+    # repeated ASR n-grams not present in the expected text fail validation and
+    # trigger the existing retry/rephrase path.
+    enable_content_repetition_check: bool = True
+    content_repetition_min_words: int = 4
+    content_repetition_extra_allowance: int = 0
 
     # Emotion enrichment
     enable_emotion_enrichment: bool = False
     enable_llm_editor: bool = False
     emotion_enrichment_model: str = "gemini-2.5-pro"
     emotion_enrichment_temperature: float = 0.7
+
+    # Laughter verification for segments carrying laughter tags
+    enable_laughter_verification: bool = True
+    laughter_validation_threshold: float = 0.5
+    laughter_min_seconds: float = 0.04
 
     # Duration statistics
     duration_smoothing_alpha: float = 0.35
@@ -522,6 +544,12 @@ class Gemini38TTSWrapper(TTSInterface):
             "content_trailing_word_count",
             "content_trailing_fuzzy_threshold",
             "content_validation_min_expected_chars",
+            "enable_content_repetition_check",
+            "content_repetition_min_words",
+            "content_repetition_extra_allowance",
+            "enable_laughter_verification",
+            "laughter_validation_threshold",
+            "laughter_min_seconds",
             "duration_smoothing_alpha",
             "duration_stats_auto_save",
             "duration_stats_save_interval",
@@ -540,6 +568,10 @@ class Gemini38TTSWrapper(TTSInterface):
         self.translator = translator
 
         self.api_client = Gemini38APIClient(self.config)
+
+        # Lazy singleton used to verify that laughter-tagged segments actually
+        # contain laughter; False means the verifier is unavailable.
+        self._laughter_verifier: Optional[Any] = None
 
         audio_embedder = None
         if self.config.enable_voice_matching:
@@ -811,10 +843,15 @@ class Gemini38TTSWrapper(TTSInterface):
                         voice_validation=f"cached; {reason}",
                     )
                 )
-                return self._make_alignment(segment, cached_duration)
+                return self._make_alignment(
+                    segment,
+                    cached_duration,
+                    content_valid=True,
+                    content_validation_reason=f"cached; {reason}",
+                )
 
         try:
-            text_used, model_used, is_valid = self._synthesize_segment(
+            text_used, model_used, is_valid, validation_reason, laughter_info = self._synthesize_segment(
                 segment,
                 segment_path,
                 language,
@@ -850,9 +887,19 @@ class Gemini38TTSWrapper(TTSInterface):
                     duration_seconds=duration,
                     output_path=segment.output_path or segment_path,
                     group_id=report_group,
+                    laughter_required=bool(laughter_info.get("required")),
+                    laughter_detected=laughter_info.get("detected"),
+                    laughter_score=laughter_info.get("score"),
+                    laughter_fallback=bool(laughter_info.get("fallback")),
+                    laughter_attempts=int(laughter_info.get("attempts") or 0),
                 )
             )
-            return self._make_alignment(segment, duration)
+            return self._make_alignment(
+                segment,
+                duration,
+                content_valid=is_valid,
+                content_validation_reason=validation_reason,
+            )
         except Exception as exc:
             logger.error(
                 "Error synthesizing segment %d for speaker '%s': %s",
@@ -885,7 +932,12 @@ class Gemini38TTSWrapper(TTSInterface):
         shutil.copy(source_path, segment.output_path)
 
     @staticmethod
-    def _make_alignment(segment: TTSSegmentData, duration: float) -> SegmentAlignment:
+    def _make_alignment(
+        segment: TTSSegmentData,
+        duration: float,
+        content_valid: Optional[bool] = None,
+        content_validation_reason: Optional[str] = None,
+    ) -> SegmentAlignment:
         diarized = DiarizationSegment(
             start_time=0.0,
             end_time=duration,
@@ -897,6 +949,8 @@ class Gemini38TTSWrapper(TTSInterface):
             original_segment=segment,
             diarized_segment=diarized,
             alignment_confidence=1.0,
+            content_valid=content_valid,
+            content_validation_reason=content_validation_reason,
         )
 
     # ------------------------------------------------------------------
@@ -910,7 +964,7 @@ class Gemini38TTSWrapper(TTSInterface):
         language: str,
         previous_segments: Optional[List[str]] = None,
         usage_tracker: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[str, Optional[str], bool]:
+    ) -> Tuple[str, Optional[str], bool, str, Dict[str, Any]]:
         working_text = segment.text or ""
         if self.config.enable_emotion_enrichment and self.emotion_enricher:
             working_text = self.emotion_enricher.enrich_text(working_text, previous_segments=previous_segments)
@@ -922,12 +976,89 @@ class Gemini38TTSWrapper(TTSInterface):
         if self.config.enable_context_style and segment.context_style and segment.context_style.strip():
             context_style = segment.context_style.strip()
 
-        prompt = self._build_prompt(segment, working_text, context_style=context_style)
         voice_name = self._resolve_voice_for_segment(segment)
 
         models: List[str] = [self.config.model]
         if self.config.fallback_model and self.config.fallback_model != self.config.model:
             models.append(self.config.fallback_model)
+
+        requires_laughter = bool(
+            self.config.enable_laughter_verification and _text_has_laughter_tag(working_text)
+        )
+        laughter_info: Dict[str, Any] = {
+            "required": requires_laughter,
+            "detected": None,
+            "score": None,
+            "attempts": 0,
+            "fallback": False,
+        }
+
+        attempt_text = working_text
+        attempt_index = 0
+        while True:
+            text_used, model_used, is_valid, validation_reason = self._synthesize_text_once(
+                segment,
+                attempt_text,
+                output_path,
+                language,
+                voice_name,
+                models,
+                usage_tracker,
+                context_style,
+            )
+            laughter_info["attempts"] = attempt_index + 1
+            if not is_valid:
+                return text_used, model_used, False, validation_reason, laughter_info
+            if not requires_laughter:
+                return text_used, model_used, True, validation_reason, laughter_info
+
+            ok, score = self._verify_laughter(output_path)
+            laughter_info["detected"] = ok
+            laughter_info["score"] = score
+            if ok:
+                # The verbal fallback is synthesised only; subtitles and duration
+                # stats must keep the tag-only text.
+                result_text = working_text if laughter_info["fallback"] else text_used
+                return result_text, model_used, True, validation_reason, laughter_info
+
+            attempt_index += 1
+            if attempt_index == 1:
+                logger.info(
+                    "Laughter not detected for speaker '%s' (score=%.3f) — retrying the same line",
+                    segment.speaker,
+                    score or 0.0,
+                )
+                attempt_text = working_text
+                continue
+            if attempt_index == 2:
+                logger.info(
+                    "Laughter still missing for speaker '%s' — retrying with verbal laughter fallback",
+                    segment.speaker,
+                )
+                attempt_text = f"{LAUGHTER_FALLBACK_PREFIX}{working_text.strip()}"
+                laughter_info["fallback"] = True
+                continue
+
+            logger.warning(
+                "Laughter validation failed after %d attempts for speaker '%s' (score=%.3f) — keeping audio",
+                attempt_index,
+                segment.speaker,
+                score or 0.0,
+            )
+            return working_text, model_used, True, validation_reason, laughter_info
+
+    def _synthesize_text_once(
+        self,
+        segment: TTSSegmentData,
+        working_text: str,
+        output_path: str,
+        language: str,
+        voice_name: str,
+        models: List[str],
+        usage_tracker: Optional[Dict[str, Any]],
+        context_style: Optional[str],
+    ) -> Tuple[str, Optional[str], bool, str]:
+        prompt = self._build_prompt(segment, working_text, context_style=context_style)
 
         last_good_model: Optional[str] = None
         last_reason = "not attempted"
@@ -963,7 +1094,7 @@ class Gemini38TTSWrapper(TTSInterface):
                             output_path, strip_tts_markup(prompt.text), context_style=context_style
                         )
                         if content_valid:
-                            return working_text, model, True
+                            return working_text, model, True, content_reason
                         reason = content_reason
                         if context_style and "quote leak" in content_reason.lower():
                             logger.warning(
@@ -1003,12 +1134,17 @@ class Gemini38TTSWrapper(TTSInterface):
                 AudioFileUtils.save_wave_file(output_path, audio_bytes)
                 valid, reason = self._validate_audio(output_path)
                 if valid:
-                    logger.info(
-                        "Gemini 3.8 rephrase attempt %d succeeded for speaker '%s'",
-                        attempt + 1,
-                        segment.speaker,
+                    content_valid, content_reason, _score = self._validate_segment_content(
+                        output_path, strip_tts_markup(prompt.text), context_style=context_style
                     )
-                    return rephrased, self.config.model, True
+                    if content_valid:
+                        logger.info(
+                            "Gemini 3.8 rephrase attempt %d succeeded for speaker '%s'",
+                            attempt + 1,
+                            segment.speaker,
+                        )
+                        return rephrased, self.config.model, True, content_reason
+                    reason = content_reason
                 working_text = rephrased
                 last_reason = reason
 
@@ -1018,8 +1154,35 @@ class Gemini38TTSWrapper(TTSInterface):
                 segment.speaker,
                 last_reason,
             )
-            return working_text, last_good_model, False
-        return working_text, None, False
+            return working_text, last_good_model, False, last_reason
+        return working_text, None, False, last_reason
+
+    def _get_laughter_verifier(self) -> Optional[Any]:
+        if self._laughter_verifier is None:
+            try:
+                from src.dubbing.audio.laughter_detector import LaughterDetector
+
+                self._laughter_verifier = LaughterDetector()
+            except Exception as exc:
+                logger.warning("Laughter verifier unavailable: %s", exc)
+                self._laughter_verifier = False
+        return self._laughter_verifier or None
+
+    def _verify_laughter(self, audio_path: str) -> Tuple[bool, Optional[float]]:
+        """Verify that a synthesized clip actually contains laughter."""
+        verifier = self._get_laughter_verifier()
+        if verifier is None:
+            return True, None
+        try:
+            ok, measurement = verifier.has_laughter(
+                audio_path,
+                threshold=self.config.laughter_validation_threshold,
+                min_seconds=self.config.laughter_min_seconds,
+            )
+            return ok, measurement.max_prob
+        except Exception as exc:
+            logger.warning("Laughter verification failed: %s", exc)
+            return True, None
 
     def _build_prompt(self, segment: TTSSegmentData, text: str, context_style: Optional[str] = None):
         speaker_prompt = self.voice_prompt_mapping.get(segment.speaker, "")
@@ -1279,6 +1442,22 @@ class Gemini38TTSWrapper(TTSInterface):
         tail_count = max(1, int(self.config.content_trailing_word_count))
         tail_text = " ".join(expected_words[-tail_count:])
         tail_score = float(_rapidfuzz_fuzz.partial_ratio(tail_text, asr_normalized))
+
+        if self.config.enable_content_repetition_check:
+            repetition = find_unexpected_repetition(
+                asr_normalized,
+                cleaned_expected,
+                min_words=self.config.content_repetition_min_words,
+                max_extra_occurrences=self.config.content_repetition_extra_allowance,
+            )
+            if repetition is not None:
+                phrase, asr_count, expected_count = repetition
+                return (
+                    False,
+                    f"Content repetition: '{phrase}' spoken {asr_count}x "
+                    f"(expected {expected_count}x; overall={overall:.1f}, tail={tail_score:.1f})",
+                    overall,
+                )
 
         if tail_score < float(self.config.content_trailing_fuzzy_threshold):
             return (

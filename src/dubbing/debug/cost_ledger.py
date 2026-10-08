@@ -83,6 +83,12 @@ def import_cost_snapshots(
 ) -> int:
     """Import persisted cost rows into a live CostTracker."""
     rows = load_cost_snapshot_rows(debug_dir, snapshots=snapshots)
+    metrics = load_cost_snapshot_metrics(debug_dir, snapshots=snapshots)
+    if metrics:
+        for key in ("refinement_failures", "refinement_downgrades"):
+            value = int(metrics.get(key) or 0)
+            if value and hasattr(cost_tracker, key):
+                setattr(cost_tracker, key, int(getattr(cost_tracker, key) or 0) + value)
     if not rows:
         return 0
     importer = getattr(cost_tracker, "import_api_cost_rows", None)
@@ -91,10 +97,33 @@ def import_cost_snapshots(
     return int(importer(rows) or 0)
 
 
+def load_cost_snapshot_metrics(
+    debug_dir: Path | str,
+    snapshots: Sequence[str] = SNAPSHOT_ORDER,
+) -> Dict[str, int]:
+    """Load refinement resilience counters persisted alongside cost rows."""
+    metrics = {"refinement_failures": 0, "refinement_downgrades": 0}
+    for snapshot_name in snapshots:
+        path = _snapshot_path(debug_dir, snapshot_name)
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load cost snapshot %s: %s", path, exc)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in metrics:
+            metrics[key] += int(payload.get(key) or 0)
+    return metrics
+
+
 def write_cost_snapshot(
     debug_dir: Path | str,
     snapshot_name: str,
     rows: Iterable[Dict[str, Any]],
+    extra: Dict[str, Any] | None = None,
 ) -> Path:
     """Overwrite one snapshot with exactly the supplied rows."""
     path = _snapshot_path(debug_dir, snapshot_name)
@@ -107,6 +136,8 @@ def write_cost_snapshot(
         "total_cost_usd": sum(float(row.get("cost_usd") or 0.0) for row in clean_rows),
         "api_costs": clean_rows,
     }
+    if extra:
+        payload.update(extra)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
@@ -120,7 +151,13 @@ def write_cost_snapshot_from_tracker(
     get_rows = getattr(cost_tracker, "get_api_cost_rows", None)
     rows = list(get_rows() or []) if callable(get_rows) else []
     filtered = filter_api_cost_rows(rows, snapshot_name)
-    write_cost_snapshot(debug_dir, snapshot_name, filtered)
+    extra: Dict[str, Any] = {}
+    failures = int(getattr(cost_tracker, "refinement_failures", 0) or 0)
+    downgrades = int(getattr(cost_tracker, "refinement_downgrades", 0) or 0)
+    if failures or downgrades:
+        extra["refinement_failures"] = failures
+        extra["refinement_downgrades"] = downgrades
+    write_cost_snapshot(debug_dir, snapshot_name, filtered, extra=extra or None)
     return len(filtered)
 
 
