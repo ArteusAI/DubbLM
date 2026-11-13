@@ -51,6 +51,20 @@ MINIMAX_VOICES = [
 VOICES = OPENAI_VOICES + build_gemini_voice_entries() + MINIMAX_VOICES + build_openrouter_voice_entries()
 
 
+def _openrouter_voices(live: bool) -> List[dict]:
+    """OpenRouter voices, optionally refreshed from the live Fish library."""
+    return build_openrouter_voice_entries(allow_live=live)
+
+
+def _all_voices(live: bool = False) -> List[dict]:
+    """All known voices; `live` refreshes the Fish Audio voice library."""
+    if not live:
+        return list(VOICES)
+    openrouter = _openrouter_voices(live=True)
+    others = [voice for voice in VOICES if voice.get("provider") != "openrouter"]
+    return others + openrouter
+
+
 def _find_voice_sample_path(provider: str, voice_id: str) -> Path | None:
     provider_name = (provider or "").strip().lower()
     lookup_voice = (voice_id or "").strip()
@@ -87,16 +101,19 @@ def _build_preview_url(provider: str, voice_id: str) -> str:
 @router.get("/voices", response_model=List[VoiceResponse])
 async def list_voices(provider: str = None):
     """Get list of available voices."""
-    voices = VOICES
+    # The Fish Audio library (Drama 3 voices) is fetched live; it is cached
+    # inside the catalog, so this only hits the network once per hour.
+    voices = _all_voices(live=True)
     if provider:
         voices = [v for v in voices if v["provider"] == provider]
 
     response_payload: List[VoiceResponse] = []
     for voice in voices:
         data = dict(voice)
-        sample_path = _find_voice_sample_path(data["provider"], data["id"])
-        if sample_path:
-            data["preview_url"] = _build_preview_url(data["provider"], data["id"])
+        if not data.get("preview_url"):
+            sample_path = _find_voice_sample_path(data["provider"], data["id"])
+            if sample_path:
+                data["preview_url"] = _build_preview_url(data["provider"], data["id"])
         response_payload.append(VoiceResponse(**data))
 
     return response_payload

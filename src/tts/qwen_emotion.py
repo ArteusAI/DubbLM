@@ -9,12 +9,10 @@ must be encoded in the speech ``input`` text (inline tags and/or NL prefixes).
 
 from __future__ import annotations
 
-import os
 import re
 from typing import List, Optional, Sequence, Set
 
 from src.dubbing.core.log_config import get_logger
-from src.utils.llm_call import robust_llm_call
 
 logger = get_logger(__name__)
 
@@ -275,7 +273,7 @@ class QwenEmotionEnricher:
 
     def __init__(
         self,
-        model: str = "gemini-2.5-pro",
+        model: str = "~google/gemini-flash-latest",
         temperature: float = 0.7,
     ) -> None:
         self.model = model
@@ -284,22 +282,15 @@ class QwenEmotionEnricher:
 
     def initialize(self) -> None:
         try:
-            from llama_index.llms.gemini import Gemini
-        except ImportError:
-            logger.error("llama_index.llms.gemini not available for Qwen emotion enrichment")
+            from src.utils.openrouter_client import get_openrouter_api_key
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("OpenRouter client unavailable for Qwen emotion enrichment: %s", exc)
             return
-
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("GOOGLE_API_KEY/GEMINI_API_KEY not found for Qwen emotion enrichment")
+        if not get_openrouter_api_key():
+            logger.error("OPENROUTER_API_KEY not found for Qwen emotion enrichment")
             return
-
-        try:
-            self.llm = Gemini(model=self.model, temperature=self.temperature)
-            logger.info(f"Qwen emotion enricher LLM initialized: {self.model}")
-        except Exception as exc:
-            logger.error(f"Failed to initialize Qwen emotion enricher LLM: {exc}")
-            self.llm = None
+        self.llm = "openrouter"
+        logger.info(f"Qwen emotion enricher initialized via OpenRouter: {self.model}")
 
     @property
     def enrichment_prompt(self) -> str:
@@ -338,8 +329,15 @@ Current text to enrich:
 
         prompt = self.enrichment_prompt.format(context_section=context_section, text=text)
         try:
-            response = robust_llm_call(self.llm.complete, prompt)
-            response_text = response.text if hasattr(response, "text") else str(response)
+            from src.utils.openrouter_client import chat_completion, extract_message_text
+
+            payload = chat_completion(
+                [{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=float(self.temperature),
+                max_tokens=max(256, min(2048, len(text) * 2)),
+            )
+            response_text = extract_message_text(payload).strip()
             if not response_text:
                 return prepare_qwen_speech_text(text)
 

@@ -20,7 +20,7 @@ PresetType = Literal["fast", "hq", "ultra"]
 async def external_translate(
     file: UploadFile = File(...),
     targetLang: str = Form(...),
-    preset: PresetType = Form("hq"),
+    preset: PresetType = Form("ultra"),
     sourceLang: str = Form("auto"),
     minimalDiarizationMerge: bool = Form(False),
     keepBackground: bool = Form(False),

@@ -22,6 +22,7 @@ class SegmentSynthesisReport:
     output_path: Optional[str] = None
     group_id: Optional[str] = None
     error: Optional[str] = None
+    voice: Optional[str] = None
     voice_similarity: Optional[float] = None
     voice_validation: Optional[str] = None
     voice_forced: bool = False
@@ -30,6 +31,8 @@ class SegmentSynthesisReport:
     laughter_score: Optional[float] = None
     laughter_fallback: bool = False
     laughter_attempts: int = 0
+    vocal_events_required: Optional[str] = None
+    vocal_events_missing: Optional[str] = None
 
 
 @dataclass
@@ -59,6 +62,22 @@ class TTSSegmentData(BaseModel):
     text: str = Field(..., description="The text to be synthesized for this speaker.")
     
     emotion: Optional[str] = Field(None, description="Emotion for this segment (e.g., \"Happy\", \"Sad\").")
+    emotion_note: Optional[str] = Field(
+        None,
+        description=(
+            "Short director's note describing the delivery (tone, pace, volume, breath). "
+            "Produced by the video+audio emotion analysis and merged into the TTS "
+            "instruction; never spoken."
+        ),
+    )
+    voice_note: Optional[str] = Field(
+        None,
+        description=(
+            "Short voice advice for this speaker (timbre, e.g. 'low, slightly raspy'). "
+            "Produced by the video+audio delivery analysis and merged into the TTS "
+            "instruction; never spoken."
+        ),
+    )
     speed: Optional[float] = Field(None, description="Speed factor for this segment (e.g., 1.0 for normal, 1.2 for faster).")
     voice: Optional[str] = Field(None, description="Specific voice name to use for this segment, overriding any global speaker-to-voice mappings.")
     style_prompt: Optional[str] = Field(None, description="Specific style prompt for this segment, overriding any global speaker-to-style_prompt mappings.")

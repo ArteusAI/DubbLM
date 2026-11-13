@@ -18,6 +18,7 @@ from ..services.settings_service import (
     get_defaults,
     mask_api_key,
     API_KEY_PROVIDERS,
+    save_openrouter_key,
 )
 from ..services.cookies_manager import (
     save_cookies_file,
@@ -84,7 +85,10 @@ async def update_api_key(provider: str, data: ApiKeyUpdate):
             detail=f"Invalid provider. Must be one of: {', '.join(API_KEY_PROVIDERS.keys())}"
         )
     
-    set_api_key(provider, data.key)
+    if provider == "openrouter":
+        save_openrouter_key(data.key)
+    else:
+        set_api_key(provider, data.key)
     
     return {
         "provider": provider,
@@ -175,26 +179,38 @@ async def remove_cookies():
 EXTENSION_DIR = Path(__file__).resolve().parents[3] / "extension"
 
 
-@router.get("/extension/download")
-async def download_extension(request: Request):
-    """Download the Chrome extension packaged as a ZIP, with the correct API URL and Bearer Token pre-configured."""
-    if not EXTENSION_DIR.exists() or not EXTENSION_DIR.is_dir():
-        raise HTTPException(status_code=404, detail="Extension source folder not found")
+def _external_base_url(request: Request) -> str:
+    """Resolve the public base URL, preserving a non-default port.
 
-    # Determine the external API URL. If referer is present, parse it to preserve the original port
+    The frontend nginx proxy forwards the original host (including port) in
+    X-Forwarded-Host. The Referer is the next best fallback for direct browser
+    downloads; request.base_url is the last resort.
+    """
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_host:
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+        return f"{scheme}://{forwarded_host}".rstrip("/")
+
     referer = request.headers.get("referer")
     if referer:
         try:
             from urllib.parse import urlparse
             parsed = urlparse(referer)
             if parsed.scheme and parsed.netloc:
-                external_api_url = f"{parsed.scheme}://{parsed.netloc}"
-            else:
-                external_api_url = str(request.base_url).rstrip("/")
+                return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         except Exception:
-            external_api_url = str(request.base_url).rstrip("/")
-    else:
-        external_api_url = str(request.base_url).rstrip("/")
+            pass
+
+    return str(request.base_url).rstrip("/")
+
+
+@router.get("/extension/download")
+async def download_extension(request: Request):
+    """Download the Chrome extension packaged as a ZIP, with the correct API URL and Bearer Token pre-configured."""
+    if not EXTENSION_DIR.exists() or not EXTENSION_DIR.is_dir():
+        raise HTTPException(status_code=404, detail="Extension source folder not found")
+
+    external_api_url = _external_base_url(request)
 
     api_token = os.getenv("DUBBLM_API_TOKEN") or os.getenv("API_TOKEN") or ""
 

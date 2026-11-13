@@ -22,11 +22,19 @@ window.addEventListener('DUBBLM_PING_EXTENSION', () => {
   injectPresence();
 });
 
-// Listen to request from the webpage to sync cookies
-window.addEventListener('DUBBLM_SYNC_COOKIES', (event) => {
-  const serverUrl = event.detail?.serverUrl || window.location.origin;
-  const apiToken = event.detail?.apiToken || '';
-  chrome.runtime.sendMessage({ action: 'sync_cookies', serverUrl, apiToken }, (response) => {
+// Listen to request from the webpage to sync cookies.
+// The server URL and token are intentionally NOT taken from the page event:
+// any website could otherwise ask the extension to upload YouTube cookies to
+// an attacker-controlled server. The background worker always uses the
+// configured DubbLM server from extension storage.
+window.addEventListener('DUBBLM_SYNC_COOKIES', () => {
+  chrome.runtime.sendMessage({ action: 'sync_cookies' }, (response) => {
+    if (chrome.runtime.lastError) {
+      window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_ERROR', {
+        detail: { error: chrome.runtime.lastError.message }
+      }));
+      return;
+    }
     if (response?.success) {
       window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_SUCCESS'));
     } else {

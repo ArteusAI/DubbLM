@@ -36,6 +36,7 @@ from .gemini_voice_catalog import (
     ALL_GEMINI_VOICES,
     GEMINI_VOICE_GENDERS,
     get_gemini_voice_gender,
+    get_gemini_voice_traits,
     resolve_default_gemini_voice,
 )
 from .gemini38_tags import build_gemini38_prompt, quoted_fragment_leak, sanitize_angle_tags, strip_tts_markup
@@ -48,10 +49,10 @@ from .models import (
 )
 from .speaker_reference import SpeakerReferenceBuilder, SpeakerReferenceProfile, best_voice_for_profile
 from .tts_interface import TTSInterface
+from .voice_advisor import profile_for_speaker, rank_voices_by_profile
 from .voice_sample_manager import AudioFileUtils, AudioValidator, VoiceSampleManager
 from src.dubbing.core.log_config import get_logger
 from src.utils.audio_embedder import AudioEmbedder
-from src.utils.llm_call import robust_llm_call
 from src.utils.sent_split import greedy_sent_split
 from src.utils.speaker_gender import (
     build_effective_speaker_gender_map,
@@ -119,17 +120,49 @@ SPEAKER_REFERENCE_DIR = Path("artifacts/speakers_ref")
 
 SAMPLE_RATE = 24000
 MAX_CHAR_LIMIT_PER_REQUEST = 30000
+# OpenRouter's Gemini TTS endpoint exposes an 8192-token prompt limit.  Russian
+# text is token-dense, so keep a conservative character budget and use the
+# existing sentence splitter for longer segments.
+OPENROUTER_MAX_CHAR_LIMIT = 6000
 MIN_REFERENCE_DURATION_SECONDS = 3.0
 SILENCE_THRESHOLD_FOR_REPHRASING = 0.03
 MAX_REPHRASE_ATTEMPTS = 3
 LAUGHTER_FALLBACK_PREFIX = "Ха-ха-ха! "
 _LAUGHTER_TEXT_MARKERS = ("<laugh", "[laugh", "<giggle", "[giggle")
 
+# Non-verbal vocal tags that can be verified against the synthesized audio
+# (AST AudioSet detector). Laughter has its own omine verifier and verbal
+# fallback path.
+_VOCAL_TEXT_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "cry": ("<sob", "[crying]", "[sob]", "<cry>"),
+    "scream": ("<scream", "[screaming]"),
+    "shout": ("<shout", "[shout]"),
+    "whisper": ("<whispers", "[whispers]", "[whisper]"),
+    "gasp": ("<gasp", "[gasp"),
+    "pant": ("<pant", "[pant"),
+    "sigh": ("<sigh", "[sigh"),
+    "groan": ("<groan", "[groan"),
+    "grunt": ("<grunt", "[grunt"),
+    "whimper": ("<whimper", "[whimper"),
+    "breath": ("<breath", "[breath]"),
+    "snort": ("<snort", "[snort]"),
+}
+
 
 def _text_has_laughter_tag(text: Optional[str]) -> bool:
     """True when the synthesis text asks for an audible laughter cue."""
     lowered = (text or "").lower()
     return any(marker in lowered for marker in _LAUGHTER_TEXT_MARKERS)
+
+
+def _text_vocal_kinds(text: Optional[str]) -> List[str]:
+    """Non-laugh vocal event kinds requested by the synthesis text."""
+    lowered = (text or "").lower()
+    return [
+        kind
+        for kind, markers in _VOCAL_TEXT_MARKERS.items()
+        if any(marker in lowered for marker in markers)
+    ]
 
 DURATION_SAMPLE_TEXTS = [
     "Hello, this is a quick test of voice speed and clarity.",
@@ -153,6 +186,9 @@ class Gemini38TTSConfig(BaseModel):
 
     model: str = DEFAULT_GEMINI38_TTS_MODEL
     fallback_model: Optional[str] = DEFAULT_GEMINI38_TTS_FALLBACK_MODEL
+    # "openrouter" routes the same Gemini 3.8 models through OpenRouter's
+    # /audio/speech endpoint; "google" keeps the legacy direct Interactions API.
+    tts_transport: str = "openrouter"
     default_voice: str = "Kore"
     prompt_prefix: str = ""
     blocked_voices: List[str] = Field(default_factory=list)
@@ -224,13 +260,21 @@ class Gemini38TTSConfig(BaseModel):
     # Emotion enrichment
     enable_emotion_enrichment: bool = False
     enable_llm_editor: bool = False
-    emotion_enrichment_model: str = "gemini-2.5-pro"
+    emotion_enrichment_model: str = "~google/gemini-flash-latest"
     emotion_enrichment_temperature: float = 0.7
 
     # Laughter verification for segments carrying laughter tags
     enable_laughter_verification: bool = True
     laughter_validation_threshold: float = 0.5
     laughter_min_seconds: float = 0.04
+
+    # Non-verbal vocal event verification (scream, sob, gasp, ...) using the
+    # AST AudioSet detector; laughter keeps the omine verifier above.
+    # Off by default so a standalone wrapper never loads the AST model unless
+    # the pipeline asks for vocal event handling.
+    enable_vocal_event_verification: bool = False
+    vocal_event_validation_threshold: float = 0.25
+    vocal_event_min_seconds: float = 0.15
 
     # Duration statistics
     duration_smoothing_alpha: float = 0.35
@@ -239,14 +283,37 @@ class Gemini38TTSConfig(BaseModel):
 
 
 class Gemini38APIClient:
-    """Thin client around the Gemini Interactions API for TTS."""
+    """Thin client for Gemini 3.8 TTS (OpenRouter or Google Interactions API)."""
 
     def __init__(self, config: Gemini38TTSConfig):
         self.config = config
         self.client: Optional[Any] = None
         self.current_model: str = config.model
+        self.transport: str = str(getattr(config, "tts_transport", "openrouter") or "openrouter").lower()
 
     def initialize(self) -> None:
+        if self.transport == "openrouter":
+            from src.utils.openrouter_client import get_openrouter_api_key
+
+            if get_openrouter_api_key():
+                self.client = "openrouter"
+                self.current_model = self.config.model
+                logger.info(
+                    "Gemini 3.8 TTS client initialized via OpenRouter (model=%s)",
+                    self.current_model,
+                )
+                return
+            if GEMINI_AVAILABLE and os.environ.get("GOOGLE_API_KEY"):
+                self.transport = "google"
+                logger.warning(
+                    "OPENROUTER_API_KEY is not configured; falling back to the legacy "
+                    "direct Google Gemini TTS transport."
+                )
+            else:
+                from src.utils.openrouter_client import require_openrouter_api_key
+
+                require_openrouter_api_key()
+
         if not GEMINI_AVAILABLE or genai is None:
             raise ImportError("Google GenAI SDK is not installed.")
         api_key = os.environ.get("GOOGLE_API_KEY")
@@ -259,7 +326,8 @@ class Gemini38APIClient:
                 "Upgrade to google-genai>=2.3.0 (voice library needs >=2.25.0)."
             )
         self.current_model = self.config.model
-        logger.info("Gemini 3.8 TTS client initialized (model=%s)", self.current_model)
+        logger.info("Gemini 3.8 TTS client initialized via Google (model=%s)", self.current_model)
+
 
     def set_model(self, model: str) -> None:
         self.current_model = model
@@ -290,6 +358,35 @@ class Gemini38APIClient:
             "store": False,
         }
 
+    @staticmethod
+    def _normalize_openrouter_model(model: str) -> str:
+        value = str(model or DEFAULT_GEMINI38_TTS_MODEL).strip()
+        if value.startswith("google/"):
+            return value
+        return f"google/{value}"
+
+    def _synthesize_openrouter(
+        self,
+        text: str,
+        style: str,
+        voice: str,
+        model: str,
+    ) -> bytes:
+        from src.utils.openrouter_client import OpenRouterError, synthesize_speech
+
+        audio, _headers = synthesize_speech(
+            text,
+            model=self._normalize_openrouter_model(model),
+            voice=voice,
+            instructions=style or None,
+            response_format="pcm",
+            api_key=None,
+            max_attempts=1,
+        )
+        if not audio:
+            raise OpenRouterError("OpenRouter TTS returned empty audio")
+        return self._normalize_audio_bytes(audio)
+
     def synthesize_chunk(self, text: str, style: str, voice: str, model: Optional[str] = None) -> bytes:
         """Synthesize one chunk and return raw 24kHz mono 16-bit PCM bytes."""
         if not text or not text.strip():
@@ -299,30 +396,35 @@ class Gemini38APIClient:
 
         effective_model = model or self.current_model
         attempts = self._attempts_for(effective_model)
-        payload = self._build_request(text, style, voice, effective_model)
 
         for attempt in range(attempts):
             try:
-                interaction = self.client.interactions.create(**payload)
-                raw = self._extract_audio_bytes(interaction)
+                if self.transport == "openrouter":
+                    raw = self._synthesize_openrouter(text, style, voice, effective_model)
+                else:
+                    payload = self._build_request(text, style, voice, effective_model)
+                    interaction = self.client.interactions.create(**payload)
+                    raw = self._extract_audio_bytes(interaction)
                 if raw:
                     return raw
-                raise RuntimeError("Interaction returned empty audio")
+                raise RuntimeError("TTS provider returned empty audio")
             except Exception as exc:
                 if attempt + 1 >= attempts:
                     logger.error(
-                        "Gemini 3.8 TTS failed after %d attempt(s) with model '%s': %s",
+                        "Gemini 3.8 TTS failed after %d attempt(s) with model '%s' via %s: %s",
                         attempts,
                         effective_model,
+                        self.transport,
                         exc,
                     )
                     return b""
                 delay = self.config.retry_delay_base ** attempt
                 logger.warning(
-                    "Gemini 3.8 TTS attempt %d/%d failed (model=%s): %s — retrying in %.1fs",
+                    "Gemini 3.8 TTS attempt %d/%d failed (model=%s, transport=%s): %s — retrying in %.1fs",
                     attempt + 1,
                     attempts,
                     effective_model,
+                    self.transport,
                     exc,
                     delay,
                 )
@@ -393,26 +495,18 @@ class Gemini38EmotionEnricher:
 
     def initialize(self) -> None:
         try:
-            from llama_index.llms.gemini import Gemini
-        except ImportError:
-            logger.error("llama_index.llms.gemini not available for emotion enrichment")
+            from src.utils.openrouter_client import get_openrouter_api_key
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("OpenRouter client unavailable for emotion enrichment: %s", exc)
             return
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            logger.error("GOOGLE_API_KEY not found for emotion enrichment")
+        if not get_openrouter_api_key():
+            logger.error("OPENROUTER_API_KEY not found for emotion enrichment")
             return
-        try:
-            self.llm = Gemini(
-                model=self.config.emotion_enrichment_model,
-                temperature=self.config.emotion_enrichment_temperature,
-            )
-            logger.info(
-                "Gemini 3.8 emotion enrichment LLM initialized (model=%s)",
-                self.config.emotion_enrichment_model,
-            )
-        except Exception as exc:
-            logger.error("Failed to initialize emotion enrichment LLM: %s", exc)
-            self.llm = None
+        self.llm = "openrouter"
+        logger.info(
+            "Gemini 3.8 emotion enrichment initialized via OpenRouter (model=%s)",
+            self.config.emotion_enrichment_model,
+        )
 
     @property
     def enrichment_prompt(self) -> str:
@@ -449,9 +543,15 @@ class Gemini38EmotionEnricher:
                 context_lines = "\n".join(f"- {segment}" for segment in previous_segments[-5:])
                 context_section = f"Previous conversation context:\n{context_lines}\n"
             prompt = self.enrichment_prompt.format(context_section=context_section, text=text)
-            response = robust_llm_call(self.llm.complete, prompt)
-            response_text = getattr(response, "text", None) or (str(response) if response else "")
-            enriched = (response_text or "").strip()
+            from src.utils.openrouter_client import chat_completion, extract_message_text
+
+            payload = chat_completion(
+                [{"role": "user", "content": prompt}],
+                model=self.config.emotion_enrichment_model,
+                temperature=float(self.config.emotion_enrichment_temperature),
+                max_tokens=max(512, min(4096, len(text) * 2)),
+            )
+            enriched = extract_message_text(payload).strip()
             if enriched and len(enriched) <= len(text) * 3:
                 return enriched
             return text
@@ -486,14 +586,18 @@ class Gemini38TTSWrapper(TTSInterface):
         translator: Optional[Any] = None,
         target_language: Optional[str] = None,
         speaker_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        speaker_voice_profiles: Optional[Dict[str, Any]] = None,
+        voice_advice_max_candidates: int = 8,
         **kwargs: Any,
     ):
-        if not GEMINI_AVAILABLE:
+        requested_transport = str(kwargs.get("tts_transport") or os.environ.get("TTS_TRANSPORT") or "openrouter").lower()
+        if not GEMINI_AVAILABLE and requested_transport != "openrouter":
             raise ImportError("Google GenAI SDK is not installed.")
 
         config_kwargs: Dict[str, Any] = {
             "model": model or DEFAULT_GEMINI38_TTS_MODEL,
             "fallback_model": fallback_model,
+            "tts_transport": str(kwargs.get("tts_transport") or os.environ.get("TTS_TRANSPORT") or "openrouter"),
             "default_voice": default_voice,
             "embedding_model_device": embedding_model_device,
             "enable_voice_matching": enable_voice_matching,
@@ -503,7 +607,7 @@ class Gemini38TTSWrapper(TTSInterface):
             "blocked_voices": list(blocked_voices or []),
             "enable_emotion_enrichment": enable_emotion_enrichment,
             "enable_llm_editor": enable_llm_editor,
-            "emotion_enrichment_model": emotion_enrichment_model or "gemini-2.5-pro",
+            "emotion_enrichment_model": emotion_enrichment_model or "~google/gemini-flash-latest",
             "emotion_enrichment_temperature": (
                 emotion_enrichment_temperature if emotion_enrichment_temperature is not None else 0.7
             ),
@@ -550,6 +654,9 @@ class Gemini38TTSWrapper(TTSInterface):
             "enable_laughter_verification",
             "laughter_validation_threshold",
             "laughter_min_seconds",
+            "enable_vocal_event_verification",
+            "vocal_event_validation_threshold",
+            "vocal_event_min_seconds",
             "duration_smoothing_alpha",
             "duration_stats_auto_save",
             "duration_stats_save_interval",
@@ -572,6 +679,8 @@ class Gemini38TTSWrapper(TTSInterface):
         # Lazy singleton used to verify that laughter-tagged segments actually
         # contain laughter; False means the verifier is unavailable.
         self._laughter_verifier: Optional[Any] = None
+        # Lazy singleton for non-verbal event verification (AST AudioSet).
+        self._vocal_event_verifier: Optional[Any] = None
 
         audio_embedder = None
         if self.config.enable_voice_matching:
@@ -612,6 +721,9 @@ class Gemini38TTSWrapper(TTSInterface):
 
         self.voice_mapping: Dict[str, str] = {}
         self.voice_prompt_mapping: Dict[str, str] = {}
+        # Voice advice from the delivery analysis (timbre, age, energy, accent).
+        self.speaker_voice_profiles: Dict[str, Any] = dict(speaker_voice_profiles or {})
+        self.voice_advice_max_candidates = max(1, int(voice_advice_max_candidates or 8))
         self.emotion_enricher: Optional[Gemini38EmotionEnricher] = None
 
         self._speaker_profiles: Dict[str, SpeakerReferenceProfile] = {}
@@ -892,6 +1004,8 @@ class Gemini38TTSWrapper(TTSInterface):
                     laughter_score=laughter_info.get("score"),
                     laughter_fallback=bool(laughter_info.get("fallback")),
                     laughter_attempts=int(laughter_info.get("attempts") or 0),
+                    vocal_events_required=", ".join(laughter_info.get("vocal_required") or []) or None,
+                    vocal_events_missing=", ".join(laughter_info.get("vocal_missing") or []) or None,
                 )
             )
             return self._make_alignment(
@@ -985,12 +1099,19 @@ class Gemini38TTSWrapper(TTSInterface):
         requires_laughter = bool(
             self.config.enable_laughter_verification and _text_has_laughter_tag(working_text)
         )
+        required_vocal_kinds = (
+            _text_vocal_kinds(working_text)
+            if self.config.enable_vocal_event_verification
+            else []
+        )
         laughter_info: Dict[str, Any] = {
             "required": requires_laughter,
             "detected": None,
             "score": None,
             "attempts": 0,
             "fallback": False,
+            "vocal_required": list(required_vocal_kinds),
+            "vocal_missing": [],
         }
 
         attempt_text = working_text
@@ -1010,7 +1131,26 @@ class Gemini38TTSWrapper(TTSInterface):
             if not is_valid:
                 return text_used, model_used, False, validation_reason, laughter_info
             if not requires_laughter:
-                return text_used, model_used, True, validation_reason, laughter_info
+                missing = self._missing_vocal_kinds(output_path, required_vocal_kinds)
+                if not missing:
+                    return text_used, model_used, True, validation_reason, laughter_info
+                laughter_info["vocal_missing"] = list(missing)
+                attempt_index += 1
+                if attempt_index == 1:
+                    logger.info(
+                        "Vocal event(s) %s not detected for speaker '%s' — retrying the same line",
+                        ", ".join(missing),
+                        segment.speaker,
+                    )
+                    attempt_text = working_text
+                    continue
+                logger.warning(
+                    "Vocal event validation failed for speaker '%s' (%s) after %d attempt(s) — keeping audio",
+                    segment.speaker,
+                    ", ".join(missing),
+                    attempt_index,
+                )
+                return working_text, model_used, True, validation_reason, laughter_info
 
             ok, score = self._verify_laughter(output_path)
             laughter_info["detected"] = ok
@@ -1070,7 +1210,11 @@ class Gemini38TTSWrapper(TTSInterface):
                     input_tokens = self._count_tokens(prompt.text) + self._count_tokens(prompt.style)
                     self._register_usage(usage_tracker, model, input_tokens=input_tokens)
 
-                if len(prompt.text) > MAX_CHAR_LIMIT_PER_REQUEST:
+                if len(prompt.text) > (
+                    OPENROUTER_MAX_CHAR_LIMIT
+                    if self.api_client.transport == "openrouter"
+                    else MAX_CHAR_LIMIT_PER_REQUEST
+                ):
                     audio_bytes = self._synthesize_by_sentence_split(prompt, voice_name, model)
                 else:
                     audio_bytes = self.api_client.synthesize_chunk(
@@ -1184,6 +1328,43 @@ class Gemini38TTSWrapper(TTSInterface):
             logger.warning("Laughter verification failed: %s", exc)
             return True, None
 
+    def _get_vocal_event_verifier(self) -> Optional[Any]:
+        """Lazy AST AudioSet verifier for non-verbal tags (scream, sob, ...)."""
+        verifier = getattr(self, "_vocal_event_verifier", None)
+        if verifier is None:
+            try:
+                from src.dubbing.audio.vocal_event_detector import AstVocalEventDetector
+
+                verifier = AstVocalEventDetector()
+            except Exception as exc:
+                logger.warning("Vocal event verifier unavailable: %s", exc)
+                verifier = False
+            self._vocal_event_verifier = verifier
+        return verifier or None
+
+    def _missing_vocal_kinds(self, audio_path: str, kinds: List[str]) -> List[str]:
+        """Return requested non-verbal kinds that are not audible in the clip."""
+        if not kinds or not self.config.enable_vocal_event_verification:
+            return []
+        verifier = self._get_vocal_event_verifier()
+        if verifier is None:
+            return []
+        missing: List[str] = []
+        for kind in kinds:
+            try:
+                ok, _measurement = verifier.has_event(
+                    audio_path,
+                    kind,
+                    threshold=self.config.vocal_event_validation_threshold,
+                    min_seconds=self.config.vocal_event_min_seconds,
+                )
+            except Exception as exc:
+                logger.warning("Vocal event verification failed (%s): %s", kind, exc)
+                ok = True
+            if not ok:
+                missing.append(kind)
+        return missing
+
     def _build_prompt(self, segment: TTSSegmentData, text: str, context_style: Optional[str] = None):
         speaker_prompt = self.voice_prompt_mapping.get(segment.speaker, "")
         return build_gemini38_prompt(
@@ -1192,12 +1373,19 @@ class Gemini38TTSWrapper(TTSInterface):
             speaker_prompt=speaker_prompt,
             segment_style=segment.style_prompt,
             emotion=segment.emotion,
+            emotion_note=segment.emotion_note,
+            voice_note=segment.voice_note,
             context_style=context_style,
             max_style_chars=self.config.style_max_chars,
         )
 
     def _synthesize_by_sentence_split(self, prompt, voice_name: str, model: Optional[str] = None) -> bytes:
-        chunks = greedy_sent_split(prompt.text, MAX_CHAR_LIMIT_PER_REQUEST)
+        limit = (
+            OPENROUTER_MAX_CHAR_LIMIT
+            if self.api_client.transport == "openrouter"
+            else MAX_CHAR_LIMIT_PER_REQUEST
+        )
+        chunks = greedy_sent_split(prompt.text, limit)
         part_paths: List[str] = []
         temp_dir = tempfile.mkdtemp(prefix="gemini38_split_")
         try:
@@ -1593,6 +1781,49 @@ class Gemini38TTSWrapper(TTSInterface):
                 except Exception as exc:
                     logger.debug("Could not build embedding for extended voice '%s': %s", voice_name, exc)
 
+    def _voice_advice_candidates(self, speaker_id: Optional[str]) -> Optional[List[str]]:
+        """Voices that fit the advised character best (None when there is no advice).
+
+        The list only contains voices that already have an embedding, so the
+        embedding matcher can still compare them. The gender aware default is
+        always kept as a safety net.
+        """
+        profile = profile_for_speaker(
+            getattr(self, "speaker_voice_profiles", None), speaker_id
+        )
+        if profile is None:
+            return None
+
+        speaker_gender = self._get_effective_speaker_gender(speaker_id)
+        pool = [
+            voice
+            for voice in ALL_GEMINI_VOICES
+            if speaker_gender not in {"male", "female"}
+            or get_gemini_voice_gender(voice) == speaker_gender
+        ]
+        if not pool:
+            return None
+
+        ranked = rank_voices_by_profile(
+            profile,
+            pool,
+            get_gemini_voice_traits,
+            limit=self.voice_advice_max_candidates,
+            keep_voices=[self._get_gender_aware_default_voice(speaker_id)],
+        )
+        samples = getattr(self.voice_matcher, "sample_embeddings", None) or {}
+        candidates = [voice for voice in ranked if voice in samples]
+        if not candidates:
+            return None
+        logger.info(
+            "Gemini 3.8: voice advice for '%s' narrows %d candidate(s) to %d (timbre: %s)",
+            speaker_id,
+            len(pool),
+            len(candidates),
+            profile.timbre or profile.age or "n/a",
+        )
+        return candidates
+
     def find_and_pin_voice_for_speaker(
         self,
         speaker_id: str,
@@ -1624,7 +1855,13 @@ class Gemini38TTSWrapper(TTSInterface):
 
         self._ensure_extended_voice_embeddings(speaker_gender)
         exclusions = self._build_voice_search_exclusions(speaker_id)
-        best_voice = best_voice_for_profile(profile, self.voice_matcher, exclude_voices=exclusions)
+        candidates = self._voice_advice_candidates(speaker_id)
+        best_voice = best_voice_for_profile(
+            profile,
+            self.voice_matcher,
+            exclude_voices=exclusions,
+            candidate_voices=candidates,
+        )
 
         if best_voice:
             best_voice = self._canonicalize_voice_name(best_voice) or best_voice
@@ -1738,9 +1975,10 @@ class Gemini38TTSWrapper(TTSInterface):
         if not self.cost_tracker:
             return
         models_map = usage_tracker.get("models") or {}
+        provider = "openrouter" if getattr(self.api_client, "transport", "openrouter") == "openrouter" else "gemini"
         for model_name, usage in models_map.items():
             self.cost_tracker.add_tts_actual(
-                "gemini",
+                provider,
                 model=model_name,
                 input_tokens=usage.get("input_tokens", 0.0),
                 output_tokens=usage.get("output_tokens", 0.0),

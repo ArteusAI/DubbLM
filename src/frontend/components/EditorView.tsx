@@ -1,5 +1,5 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
   Play, Pause, Wand2, Volume2, VolumeX, 
   ChevronRight, ChevronDown, RefreshCw, ArrowRight, Loader2, Speaker, Sparkles, X, Clock, Pencil, Check, Eraser
@@ -57,6 +57,27 @@ export const EditorView: React.FC<EditorViewProps> = ({
   const [showStartMenu, setShowStartMenu] = useState(false);
   const [isResettingTtsCache, setIsResettingTtsCache] = useState(false);
   const startMenuRef = useRef<HTMLDivElement>(null);
+
+  // Drama 3 exposes the curated cast only; other providers/models keep the
+  // full catalog. This mirrors the filter on the upload screen.
+  const editorVoices = useMemo(() => {
+    const model = activeProject?.config?.ttsModel || '';
+    if (model !== 'fish-audio/drama-3') return voices;
+    const targetLang = (activeProject?.config?.targetLang || 'ru').split('-')[0].toLowerCase();
+    const curated = voices.filter((voice) => {
+      if (!voice.curated) return false;
+      if (voice.models && voice.models.length > 0 && !voice.models.includes(model)) return false;
+      return (voice.language || '')
+        .split(',')
+        .map((code) => code.trim().toLowerCase())
+        .includes(targetLang);
+    });
+    if (curated.length > 0) return curated;
+    const nonCurated = voices.filter((voice) => !voice.curated);
+    return nonCurated.length > 0 ? nonCurated : voices;
+  }, [voices, activeProject?.config?.ttsModel, activeProject?.config?.targetLang]);
+  const editorVoiceCloning = activeProject?.config?.enableVoiceCloning
+    ?? (activeProject?.config?.ttsModel === 'fish-audio/drama-3');
 
   useEffect(() => {
     if (!showStartMenu) return;
@@ -821,12 +842,19 @@ export const EditorView: React.FC<EditorViewProps> = ({
                             onChange={(e) => handleGlobalVoiceChange(segment.speaker, e.target.value)}
                             className="w-full bg-zinc-950 border border-zinc-800 text-zinc-300 text-xs rounded-md px-2 py-1.5 focus:outline-none focus:border-zinc-700"
                         >
-                            {voices.map(voice => (
+                            {editorVoices.map(voice => (
                             <option key={voice.id} value={voice.id}>
                                 {voice.name} ({voice.provider})
                             </option>
                             ))}
                         </select>
+                        {editorVoiceCloning
+                          && activeProject?.config?.ttsModel === 'fish-audio/drama-3'
+                          && !(activeProject?.config?.speakerVoiceMappings || {})[segment.speaker] && (
+                            <p className="text-[9px] text-zinc-600 mt-1">
+                              Cloned from the source; picking a voice pins it for this speaker.
+                            </p>
+                        )}
                         </div>
 
                         {/* TTS Prompt / Style */}

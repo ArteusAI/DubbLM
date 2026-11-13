@@ -3,24 +3,27 @@
 watermark_path: logo.png
 
 # Required parameters (input must be provided via CLI --input)
-source_language: "en"  # Source video language code (e.g., 'en', 'ru', 'de')
+source_language: "auto"  # Source video language code (e.g., 'en', 'ru', 'de')
 target_language: "ru"  # Target dubbing language code (e.g., 'ru', 'en', 'fr')
-default_preset: "hq"  # Default UI preset: fast, hq, ultra
+default_preset: "ultra"  # Default UI preset: fast, hq, ultra
 
 # UI/API preset defaults (source of truth for preset values)
 presets:
   fast:
     persona_id: "none"
-    llm_provider: "gemini"
-    llm_model_name: "gemini-flash-latest"
+    llm_provider: "openrouter"
+    llm_model_name: "~google/gemini-flash-latest"
     llm_temperature: 0.5
     refinement_llm_provider: "openrouter"
     refinement_model_name: "openai/gpt-6-sol"
     refinement_temperature: 1.0
     enable_llm_editor: false
-    tts_system: "openai"
-    tts_model: "gpt-4o-mini-tts"
-    tts_fallback_model: "gpt-4o-mini-tts"
+    tts_system: "gemini38"
+    tts_transport: "openrouter"
+    tts_model: "google/gemini-3.8-flash-lite-tts"
+    tts_fallback_model: "google/gemini-3.8-flash-lite-tts"
+    transcription_system: "openrouter"
+    openrouter_stt_model: "microsoft/mai-transcribe-2"
     keep_background: false
     pause_removal: "disabled"
     video_quality_preset: "720p"
@@ -35,22 +38,26 @@ presets:
     max_workers: 4
   hq:
     persona_id: "none"
-    llm_provider: "gemini"
-    llm_model_name: "gemini-flash-latest"
+    llm_provider: "openrouter"
+    llm_model_name: "~google/gemini-flash-latest"
     llm_temperature: 0.5
     refinement_llm_provider: "openrouter"
     refinement_model_name: "openai/gpt-6-sol"
     refinement_temperature: 1.0
     enable_llm_editor: false
     tts_system: "gemini38"
-    tts_model: "gemini-3.8-flash-tts"
-    tts_fallback_model: "gemini-3.8-flash-lite-tts"
+    tts_transport: "openrouter"
+    tts_model: "google/gemini-3.8-flash-lite-tts"
+    tts_fallback_model: "google/gemini-3.8-flash-lite-tts"
+    transcription_system: "openrouter"
+    openrouter_stt_model: "microsoft/mai-transcribe-2"
     tts_style: "podcast"
     keep_background: false
     pause_removal: "disabled"
     video_quality_preset: "1080p"
     voice_auto_selection: true
     enable_emotion_enrichment: false
+    enable_content_validation: true
     enable_llm_text_adjustment: false
     dubbed_volume: 1.0
     background_volume: 0.56
@@ -59,28 +66,39 @@ presets:
     max_workers: 4
   ultra:
     persona_id: "normal"
-    llm_provider: "gemini"
-    llm_model_name: "gemini-flash-latest"
+    llm_provider: "openrouter"
+    llm_model_name: "~google/gemini-flash-latest"
     llm_temperature: 0.5
     refinement_llm_provider: "openrouter"
-    refinement_model_name: "openai/gpt-6-sol"
-    refinement_temperature: 1.0
+    refinement_model_name: "google/gemini-4-carbon"
+    refinement_temperature: 0.8
     enable_llm_editor: false
     editor_llm_provider: "openrouter"
     editor_model_name: "openai/gpt-5.6-sol"
     editor_temperature: 1.0
     editor_reasoning_effort: "xhigh"
     tts_system: "gemini38"  # legacy "gemini" is deprecated
+    tts_transport: "openrouter"
+    tts_model: "google/gemini-3.8-flash-tts"
+    tts_fallback_model: "google/gemini-3.8-flash-lite-tts"
     tts_style: "podcast"
-    keep_background: true
+    transcription_system: "openrouter"
+    openrouter_stt_model: "microsoft/mai-transcribe-2"
+    keep_background: false
     pause_removal: "disabled"
     video_quality_preset: "original"
     video_minterpolate_threshold: 1.0
     voice_auto_selection: true
     enable_emotion_enrichment: true
+    enable_laughter_detection: false
+    enable_vocal_event_detection: false
+    enable_video_emotion_analysis: false
+    enable_voice_advisor: false
+    enable_gemini_speaker_labeling: false
     enable_llm_text_adjustment: true
     dubbed_volume: 1.0
     background_volume: 0.56
+    background_voice_volume: 0.0
     normalize_audio: false
     use_two_pass_encoding: true
     max_workers: 4
@@ -100,6 +118,7 @@ no_cache: false  # Disable caching (slower but fresh processing)
 remove_pauses: false  # Automatically shorten long silence periods
 normalize_audio: false  # Normalize audio volume for consistent output
 dubbed_volume: 1.0  # Gain multiplier for the translated track (e.g., 1.2 for +1.6 dB)
+background_voice_volume: 0.0  # "Background voice": the original voice mixed under the dub, quieter than the dub (0 = off)
 use_two_pass_encoding: true  # Use two-pass encoding for better video quality (slower but higher quality)
 enable_emotion_analysis: false
 
@@ -107,11 +126,26 @@ enable_emotion_analysis: false
 # Default TTS model / fallback are owned by Python constants
 # (DEFAULT_GEMINI38_TTS_MODEL / DEFAULT_GEMINI38_TTS_FALLBACK_MODEL in
 # src/tts/gemini38_tts_wrapper.py); override here only if you truly need to.
-tts_system: "gemini38"  # TTS engine: coqui, openai, gemini (deprecated), gemini38, f5_tts
+tts_system: "gemini38"  # TTS engine: gemini38, openrouter, openai, minimax, gemini (deprecated), f5_tts
+tts_transport: "openrouter"  # gemini38 transport: openrouter or google (legacy)
 tts_prompt_prefix: "Speak in Russian with natural conversational energy, clear articulation:"  # Global voice instruction prefix for all speakers
 
+# Gemini 3.8 TTS through OpenRouter:
+#   tts_model: "google/gemini-3.8-flash-tts"        # ultra
+#   tts_model: "google/gemini-3.8-flash-lite-tts"   # fast/hq
+#
+# OpenRouter speech models (tts_system: "openrouter"):
+#   tts_model: "qwen/qwen-audio-3.0-tts-flash"   # default
+#   tts_model: "qwen/qwen-audio-3.0-tts-plus"
+#   tts_model: "x-ai/grok-voice-tts-1.0"
+#   tts_model: "fish-audio/drama-3"              # Fish Audio Drama 3 (directable)
+# Drama 3 takes a plain-language direction in square brackets
+# ("[calm, measured storyteller voice] ..."), and its voices are Fish voice
+# ids taken from the public Fish voice library (see voice_name below).
+# tts_model: "fish-audio/drama-3"
+
 enable_emotion_enrichment: true
-emotion_enrichment_model: gemini-2.5-pro
+emotion_enrichment_model: ~google/gemini-flash-latest
 emotion_enrichment_temperature: 0.7
 
 # Parallel processing settings for TTS
@@ -125,18 +159,27 @@ segments_optimization:
   min_segment_duration: 0.5  # Minimum segment duration in seconds (shorter segments filtered out)
 
 # Transcription settings
-transcription_system: "assemblyai"  # Speech-to-text: whisper, openai, whisperx, assemblyai
+transcription_system: "openrouter"  # Speech-to-text: openrouter, assemblyai, whisper, openai, whisperx
+openrouter_stt_model: "microsoft/mai-transcribe-2"
+openrouter_stt_fallback_models:
+  - "elevenlabs/scribe-v2"
+  - "deepgram/nova-3"
+openrouter_stt_chunk_seconds: 600
+openrouter_stt_overlap_seconds: 15
+# Run ASR + diarization on the isolated vocals stem (UVR). Better speaker
+# attribution on music-heavy material. Unset = follow keep_background.
+#transcribe_on_vocals: true
 #speakers_expected: 2  # Expected number of speakers for diarization (optional, auto-detect if not specified)
 
 # Translation engine configuration
 translator_type: "llm"  # Translation method: llm (AI-powered context-aware)
-llm_provider: "gemini"  # AI provider: gemini, openrouter
-llm_model_name: "gemini-2.5-pro"  # Specific model for translation
+llm_provider: "openrouter"  # AI provider: openrouter, gemini
+llm_model_name: "~google/gemini-flash-latest"  # Specific model for translation
 llm_temperature: 1.0  # Translation creativity (0.0=conservative, 2.0=creative)
 
 # Translation refinement settings
 refinement_llm_provider: "openrouter"  # AI provider for style refinement
-refinement_model_name: "anthropic/claude-sonnet-4.5"  # Model for translation polishing
+refinement_model_name: "google/gemini-4-carbon"  # Model for translation polishing
 refinement_temperature: 1.0  # Refinement creativity level
 refinement_persona: "normal"  # Speaking style: normal, science_popularizer, casual_manager, child, housewife, it_buddy, ai_buddy
 
@@ -147,6 +190,9 @@ save_translated_subtitles: true  # Generate .srt file with translated text
 # Voice configuration
 # voice_name: "charon"  # Single voice for all speakers (OpenAI/Gemini voices)
 voice_auto_selection: true  # Auto-match voices to speakers based on audio characteristics
+# Stateless voice cloning (Fish Audio Drama 3 via OpenRouter). When unset,
+# the API enables it automatically for Drama 3 and leaves other models alone.
+# enable_voice_cloning: true
 # Voice consistency validation settings (Gemini TTS)
 # enable_voice_consistency_validation: true  # Validate synthesized audio against speaker/voice embeddings
 # voice_similarity_threshold: 0.70  # Cosine similarity threshold for acceptable voice consistency
@@ -227,20 +273,47 @@ glossary:
 
 pricing:
   transcription:
+    openrouter:
+      models:
+        microsoft/mai-transcribe-2:
+          per_min: 0.0016667
+        elevenlabs/scribe-v2:
+          per_min: 0.0036667
+        deepgram/nova-3:
+          per_min: 0.0043
     assemblyai:
       per_min: 0.0025
     openai:
       per_min: 0.006
   translation:
+    openrouter:
+      models:
+        "~google/gemini-flash-latest":
+          input_per_1m_tokens: 1.50
+          output_per_1m_tokens: 7.50
+          reasoning_per_1m_tokens: 7.50
+        google/gemini-4-carbon:
+          input_per_1m_tokens: 2.00
+          output_per_1m_tokens: 10.00
+          reasoning_per_1m_tokens: 10.00
+        openai/gpt-6-sol:
+          input_per_1m_tokens: 2.00
+          output_per_1m_tokens: 10.00
+          reasoning_per_1m_tokens: 10.00
     gemini:
       input_per_1m_tokens: 3.00
       output_per_1m_tokens: 6.00
+  tts:
     openrouter:
       models:
-        anthropic/claude-sonnet-4.5:
-          input_per_1m_tokens: 3.00
-          output_per_1m_tokens: 15.00
-  tts:
+        google/gemini-3.8-flash-tts:
+          input_per_1m_tokens: 0.50
+          output_per_1m_tokens: 9.00
+          audio_output_tokens_per_second: 25.0
+        google/gemini-3.8-flash-lite-tts:
+          input_per_1m_tokens: 0.50
+          output_per_1m_tokens: 6.00
+          audio_output_tokens_per_second: 25.0
     gemini:
       models:
         gemini-2.5-flash-preview-tts:

@@ -77,6 +77,7 @@ def init_db() -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_project_columns(engine)
+    _ensure_segment_columns(engine)
 
 
 # Columns added to the `projects` table after initial release. Each entry is
@@ -90,6 +91,14 @@ _PROJECT_EXTRA_COLUMNS: List[tuple] = [
     ("result_height", "INTEGER"),
     ("result_duration", "REAL"),
     ("total_size", "INTEGER"),
+]
+
+# Columns added to the `segments` table after initial release (delivery
+# analysis produced by the video+audio emotion analyzer).
+_SEGMENT_EXTRA_COLUMNS: List[tuple] = [
+    ("emotion", "VARCHAR(32)"),
+    ("emotion_intensity", "REAL"),
+    ("emotion_direction", "VARCHAR(256)"),
 ]
 
 
@@ -110,6 +119,24 @@ def _ensure_project_columns(engine) -> None:
             if col_name not in existing:
                 conn.execute(
                     text(f'ALTER TABLE projects ADD COLUMN "{col_name}" {col_type}')
+                )
+
+
+def _ensure_segment_columns(engine) -> None:
+    """Add new columns to the `segments` table if missing.
+
+    Same lightweight-migration approach as `_ensure_project_columns`.
+    """
+    inspector = inspect(engine)
+    if "segments" not in inspector.get_table_names():
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("segments")}
+    with engine.begin() as conn:
+        for col_name, col_type in _SEGMENT_EXTRA_COLUMNS:
+            if col_name not in existing:
+                conn.execute(
+                    text(f'ALTER TABLE segments ADD COLUMN "{col_name}" {col_type}')
                 )
 
 

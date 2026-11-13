@@ -178,7 +178,12 @@ class VoiceMatcher:
 
         return best_match_voice
     
-    def find_best_matching_voice_multi_segment(self, reference_embeddings: List[np.ndarray], exclude_voices: Optional[List[str]] = None) -> Optional[str]:
+    def find_best_matching_voice_multi_segment(
+        self,
+        reference_embeddings: List[np.ndarray],
+        exclude_voices: Optional[List[str]] = None,
+        candidate_voices: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """
         Find the best matching voice using multiple reference embeddings.
         Uses voting to determine which voice prevails across segments.
@@ -186,6 +191,9 @@ class VoiceMatcher:
         Args:
             reference_embeddings: List of embeddings from different segments
             exclude_voices: A list of voice names to exclude from consideration.
+            candidate_voices: Optional allow-list. When given, only these voices
+                are considered (used to restrict the search by speaker gender,
+                age or accent).
             
         Returns:
             The voice name that best matches across all segments
@@ -197,6 +205,13 @@ class VoiceMatcher:
             voice: emb for voice, emb in self.sample_embeddings.items()
             if not exclude_voices or voice not in exclude_voices
         }
+
+        if candidate_voices is not None:
+            allowed = set(candidate_voices)
+            current_sample_embeddings = {
+                voice: emb for voice, emb in current_sample_embeddings.items()
+                if voice in allowed
+            }
 
         if not current_sample_embeddings:
             logger.warning("Warning: All available voices are excluded or no sample embeddings available.")

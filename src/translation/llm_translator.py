@@ -97,7 +97,7 @@ class LLMTranslator(TranslationInterface):
     
     def __init__(
         self,
-        llm_provider: Literal["gemini", "openrouter"] = "gemini",
+        llm_provider: Literal["gemini", "openrouter"] = "openrouter",
         model_name: Optional[str] = None,
         temperature: float = 0.5,
         max_tokens: int = 16384,
@@ -114,7 +114,9 @@ class LLMTranslator(TranslationInterface):
         prompt_prefix: Optional[str] = None,
         cost_tracker: Optional[Any] = None,
         enable_emotion_enrichment: bool = False,
+        enable_video_emotion_analysis: bool = False,
         segment_stretch: str = "audio_and_video",
+        creative_recovery_variants: bool = False,
         enable_llm_editor: bool = False,
         editor_llm_provider: Optional[Literal["gemini", "openrouter"]] = None,
         editor_model_name: Optional[str] = None,
@@ -158,7 +160,7 @@ class LLMTranslator(TranslationInterface):
         elif llm_provider == "gemini":
             self.model_name = "gemini-2.5-pro"
         elif llm_provider == "openrouter":
-            self.model_name = "anthropic/claude-sonnet-4.5"
+            self.model_name = "~google/gemini-flash-latest"
         
         # Configure refinement model settings
         self.refinement_llm_provider = refinement_llm_provider or llm_provider
@@ -197,8 +199,15 @@ class LLMTranslator(TranslationInterface):
         self.last_speaker_metadata: Dict[str, Dict[str, Any]] = {}
         self.last_speaker_metadata_cache_signature = ""
         self.enable_emotion_enrichment = enable_emotion_enrichment
+        # The video+audio emotion analysis (Gemini VLM) owns the delivery: it
+        # sees the actual performance, so the text-only labeling below is
+        # skipped to avoid two competing sources of emotion.
+        self.enable_video_emotion_analysis = bool(enable_video_emotion_analysis)
         # Segment stretch mode: determines which alternative versions to generate
         self.segment_stretch = segment_stretch
+        # Creative trailers may need short fallbacks so a punchy but longer
+        # "text" does not force video slowdown.
+        self.creative_recovery_variants = bool(creative_recovery_variants)
         self.tts_system = str(tts_system or "").strip().lower() or None
         raw_tts_mapping = tts_system_mapping or {}
         self.tts_system_mapping = {
@@ -239,6 +248,8 @@ class LLMTranslator(TranslationInterface):
         return normalized if normalized in allowed else "none"
 
     def _required_variant_keys(self) -> List[str]:
+        if self.creative_recovery_variants:
+            return ["very_short", "short", "long"]
         if self.segment_stretch in ("video", "audio_and_video"):
             return ["long"]
         return ["very_short", "short", "long"]
@@ -291,6 +302,11 @@ class LLMTranslator(TranslationInterface):
         model = (self.tts_model or "").strip().lower()
         return model.startswith("x-ai/") or "grok-voice-tts" in model
 
+    def _openrouter_is_drama3_tts(self) -> bool:
+        """Fish Audio Drama 3: directions in square brackets are stage notes."""
+        model = (self.tts_model or "").strip().lower()
+        return model == "fish-audio/drama-3" or model.endswith("/drama-3")
+
     def _editor_tts_signature(self) -> str:
         mapping_signature = ",".join(
             f"{speaker}:{system}"
@@ -306,10 +322,10 @@ class LLMTranslator(TranslationInterface):
         }
         sections: List[str] = []
 
-        if "gemini" in batch_tts_systems:
+        if batch_tts_systems.intersection({"gemini", "gemini38"}):
             sections.append("""
 # Gemini TTS delivery guidance
-- Only for slots where `tts_system` is `gemini`, you MAY improve spoken intonation by adding subtle expressive markup and pause markers directly in the output text.
+- Only for slots where `tts_system` is `gemini` or `gemini38`, you MAY improve spoken intonation by adding subtle expressive markup and pause markers directly in the output text.
 - Allowed Gemini-friendly markup includes tags such as [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [trembling], [whispers], plus non-speech [sigh], [uhm].
 - Pause markers: [short pause], [long pause]. Use them actively to break monotony and help the listener absorb information.
 - You SHOULD insert pause markers wherever they improve pacing and comprehension. Uninterrupted continuous speech is hard to follow in dubbing.
@@ -340,6 +356,20 @@ class LLMTranslator(TranslationInterface):
 - Use tags sparingly; many lines should stay untagged.
 - Preserve exact factual meaning and natural target-language wording.
 - For non-OpenRouter slots, do not add Qwen tags.
+""".strip())
+            elif self._openrouter_is_drama3_tts():
+                sections.append("""
+# OpenRouter Fish Audio Drama 3 delivery guidance
+- Only for slots where `tts_system` is `openrouter` with Fish Audio Drama 3, you MAY direct the performance with square-bracket notes.
+- A square-bracket note is a plain-language stage direction, NOT a keyword tag. Write it like a note to a voice actor, e.g. [calm, measured storyteller voice], [low, gravelly, tired but in control], [fast, nervous, stumbling over words], [voice breaking, close to panic].
+- Put the direction before the words it applies to. Prefer ONE short direction per line; use two only when the delivery clearly changes inside the line.
+- Sounds and pauses also go in brackets, placed exactly where they happen: [shaky breath], [small laugh], [sigh], [short pause].
+- To change the delivery of specific words only, use the paired tags <whisper>, <emphasis>, <soft>, <fast>, <slow>, <stress>, <forceful> around those words.
+- Do NOT use Qwen demo tags ([excited], [panicked], [giggles], …) as keyword tags and do NOT use Gemini-only tags ([uhm], [robotic], [short pause] as a pause marker, [whispers]).
+- Keep directions short (a few words). Long stage directions dilute the line.
+- Use directions sparingly; many lines should stay undirected.
+- Preserve exact factual meaning and natural target-language wording.
+- For non-OpenRouter slots, do not add Drama 3 directions.
 """.strip())
             elif self._openrouter_is_grok_tts():
                 sections.append("""
@@ -436,6 +466,19 @@ OpenRouter TTS speakers in this chunk: {speaker_scope}.
 - Allowed tags ONLY: [excited], [panicked], [laughing], [amazed], [angry], [mischievously], [giggles], [sarcastic, speaking slowly].
 - Prefer a single leading tag; use sparingly. Do not invent new tags.
 - Do not use Gemini pause/filler tags for openrouter speakers.
+- Preserve exact meaning, facts, names, numbers, and natural target-language wording.
+- Do not add markup for non-OpenRouter speakers.
+""".strip())
+            elif self._openrouter_is_drama3_tts():
+                sections.append(f"""
+# OpenRouter Fish Audio Drama 3 delivery guidance
+OpenRouter TTS speakers in this chunk: {speaker_scope}.
+- You MAY direct the performance for openrouter speakers with square-bracket notes.
+- A note is a plain-language stage direction, e.g. [calm, measured storyteller voice], [fast, nervous], [voice breaking, close to panic].
+- Place ONE short direction before the words it applies to; sounds and pauses also go in brackets ([shaky breath], [small laugh], [sigh]).
+- For a delivery change on specific words only, wrap them in <whisper>, <emphasis>, <soft>, <fast>, <slow>, <stress> or <forceful>.
+- Do NOT use Qwen demo tags or Gemini-only tags ([uhm], [robotic], [whispers]) for openrouter speakers.
+- Use directions sparingly; most lines should stay undirected.
 - Preserve exact meaning, facts, names, numbers, and natural target-language wording.
 - Do not add markup for non-OpenRouter speakers.
 """.strip())
@@ -700,7 +743,98 @@ Rules:
             enriched_segments.append(segment_copy)
 
         return enriched_segments
-        
+
+    def _label_segment_emotions(
+        self,
+        segments: List[Dict],
+        target_language: str = "en",
+        debug: bool = False,
+        batch_size: int = 15,
+    ) -> List[Dict]:
+        """Label each translated line with a canonical emotion (Gemini, text-only).
+
+        The label lands in ``segment["emotion"]`` and is consumed by the Gemini
+        3.8 TTS wrapper as a sustained ``speech_metadata.style`` phrase. Lines
+        are labeled in batches to keep API cost and latency low; failures leave
+        the segments untouched so synthesis still works without styles.
+        """
+        if not self.enable_emotion_enrichment or not segments:
+            return segments
+        if self.enable_llm_editor:
+            logger.debug("Skipping emotion labeling because the LLM editor pass is enabled.")
+            return segments
+        if getattr(self, "enable_video_emotion_analysis", False):
+            logger.debug(
+                "Skipping text-only emotion labeling: the video+audio analysis owns the delivery."
+            )
+            return segments
+        if not self.refinement_llm:
+            logger.warning("Emotion labeling enabled but refinement LLM is unavailable. Skipping.")
+            return segments
+
+        from src.tts.gemini38_tags import EMOTION_LABELS
+
+        pending = [
+            (index, segment)
+            for index, segment in enumerate(segments)
+            if (segment.get("translation") or segment.get("text") or "").strip()
+        ]
+        if not pending:
+            return segments
+
+        labels_text = ", ".join(EMOTION_LABELS)
+        labeled = 0
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+            payload = {
+                str(index): {
+                    "speaker": segment.get("speaker"),
+                    "text": segment.get("translation") or segment.get("text"),
+                }
+                for index, segment in batch
+            }
+            prompt = f"""You are a dubbing director. Label the dominant emotion of each dialogue line in {target_language}.
+Allowed labels: {labels_text}.
+Rules:
+- Choose exactly one label per line; use "neutral" when no strong emotion is present.
+- Base the label on the line's wording and punctuation, plus the speaker's intent.
+- Do NOT rewrite or translate the text.
+- Return a JSON object mapping line id to label, e.g. {{"0": "sad", "1": "neutral"}}.
+- Do NOT add explanations.
+
+Lines JSON:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+            try:
+                response = robust_llm_call(self.refinement_llm.complete, prompt)
+                response_text = response.text if hasattr(response, "text") else str(response)
+                self._record_llm_cost(
+                    self.refinement_llm_provider,
+                    self.refinement_model_name,
+                    prompt,
+                    response_text,
+                    response,
+                    category="emotion_labeling",
+                )
+                if not response_text:
+                    continue
+                parsed = json_repair.loads(response_text) if json_repair else json.loads(response_text)
+                if not isinstance(parsed, dict):
+                    logger.warning("Emotion labeling response is not a JSON object; skipping batch.")
+                    continue
+                for index, segment in batch:
+                    value = parsed.get(str(index), parsed.get(index))
+                    label = str(value or "").strip().lower()
+                    if label in EMOTION_LABELS:
+                        segment["emotion"] = label
+                        labeled += 1
+            except Exception as exc:
+                logger.error(f"Emotion labeling batch failed: {exc}", exc_info=debug)
+
+        if labeled:
+            logger.info("Labeled %d segment emotion(s) for TTS style guidance", labeled)
+        return segments
+
     def initialize(self) -> None:
         """Initialize the LLM translation system."""
         import os
@@ -1202,7 +1336,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         persona = self.refinement_persona if self.refinement_persona in REFINEMENT_PROMPTS else "normal"
         base_prompt = REFINEMENT_PROMPTS[persona]
 
-        if self.segment_stretch in ("video", "audio_and_video"):
+        if self.segment_stretch in ("video", "audio_and_video") and not self.creative_recovery_variants:
             alternative_versions_section = ALTERNATIVE_VERSIONS_LONG_ONLY
             json_output_format = JSON_OUTPUT_FORMAT_LONG_ONLY
         else:
@@ -1900,6 +2034,16 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             max_chars = 600
             logger.debug(f"Second optimization pass - merging translated segments (max_chars={max_chars})...")
             final_segments = self._optimize_segments(translated_segments, max_gap_seconds=0.3, max_chars=max_chars)
+
+        # 9. Optional per-segment emotion labels for TTS style guidance. Runs on
+        # the final (merged) segments so every synthesized line carries a label.
+        if self.enable_emotion_enrichment and not self.enable_llm_editor:
+            logger.info("Labeling segment emotions for TTS style guidance...")
+            final_segments = self._label_segment_emotions(
+                final_segments,
+                target_language=target_language,
+                debug=kwargs.get("debug", self.debug),
+            )
         
         # Report performance metrics
         elapsed_time = time.perf_counter() - start_time
@@ -1908,6 +2052,24 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
 
         return final_segments
     
+    def _segment_word_speakers_consistent(self, left: Dict, right: Dict) -> bool:
+        """Refuse to merge across a word-level speaker change.
+
+        Word-level diarization can leave a speaker switch inside a segment; a
+        naive same-speaker merge would then move words onto the wrong voice.
+        """
+        left_words = left.get('words')
+        right_words = right.get('words')
+        if not isinstance(left_words, list) or not left_words:
+            return True
+        if not isinstance(right_words, list) or not right_words:
+            return True
+        left_speaker = left_words[-1].get('speaker') if isinstance(left_words[-1], dict) else None
+        right_speaker = right_words[0].get('speaker') if isinstance(right_words[0], dict) else None
+        if not left_speaker or not right_speaker:
+            return True
+        return left_speaker == right_speaker
+
     def _optimize_segments(self, segments: List[Dict], max_gap_seconds: float = 0.3, max_chars: int = 500) -> List[Dict]:
         """
         Optimize segments by merging adjacent ones from the same speaker.
@@ -1932,7 +2094,8 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 current_segment = segment.copy()
             elif (segment["speaker"] == current_segment["speaker"] and 
                   segment["start"] - current_segment["end"] <= max_gap_seconds and
-                  len(current_segment["text"]) + len(segment["text"]) + 1 <= max_chars):  # +1 for the space
+                  len(current_segment["text"]) + len(segment["text"]) + 1 <= max_chars and
+                  self._segment_word_speakers_consistent(current_segment, segment)):  # +1 for the space
                 # Same speaker, close enough in time, and won't exceed max character limit
                 merged_segment = {
                     "start": current_segment["start"],
@@ -1957,7 +2120,17 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                 for key, value in current_segment.items():
                     if key not in merged_segment:
                         merged_segment[key] = value
-                
+
+                # Preserve word-level timestamps (and their speaker labels) so
+                # the merge guards keep working for later passes.
+                merged_words = []
+                if isinstance(current_segment.get("words"), list):
+                    merged_words.extend(current_segment["words"])
+                if isinstance(segment.get("words"), list):
+                    merged_words.extend(segment["words"])
+                if merged_words:
+                    merged_segment["words"] = merged_words
+
                 current_segment = merged_segment
             else:
                 # Different speaker, too far apart, or max chars reached - add current segment and start a new one
@@ -2810,7 +2983,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             base_prompt = REFINEMENT_PROMPTS[persona]
             
             # Select alternative versions instructions based on segment_stretch mode
-            if self.segment_stretch in ("video", "audio_and_video"):
+            if self.segment_stretch in ("video", "audio_and_video") and not self.creative_recovery_variants:
                 alternative_versions_section = ALTERNATIVE_VERSIONS_LONG_ONLY
                 json_output_format = JSON_OUTPUT_FORMAT_LONG_ONLY
             else:
@@ -3062,7 +3235,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                     num_segments_in_chunk = len(chunk["translated_pairs"]) # Fallback if segments are missing
 
                 if current_pair_index + num_segments_in_chunk > len(refined_pairs):
-                    logger.error(f"Error: Not enough refined pairs to redistribute into chunk structure. Skipping chunk.")
+                    logger.error("Error: Not enough refined pairs to redistribute into chunk structure. Skipping chunk.")
                     # Optionally handle this error more gracefully, e.g., reuse original chunk data
                     batch_refined_chunks.append(chunk) # Append original chunk as fallback
                     continue
@@ -3125,7 +3298,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
             try:
                 comprehensive_report_file = os.path.join(session_dir, "comprehensive_refinement_comparison.txt")
                 with open(comprehensive_report_file, "w", encoding="utf-8") as f:
-                    f.write(f"=== COMPREHENSIVE REFINEMENT COMPARISON REPORT ===\n")
+                    f.write("=== COMPREHENSIVE REFINEMENT COMPARISON REPORT ===\n")
                     f.write(f"Total execution time: {total_execution_time:.2f} seconds\n")
                     f.write(f"Processed {len(translated_chunks)} chunks in {len(batches)} batches\n\n")
                     
@@ -3182,9 +3355,22 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
                         translated_pairs[i].get("cohesion_with_prev"),
                         is_first=(len(all_segments) == 0),
                     )
-                    # Use the potentially modified speaker from translated_pairs
-                    # This preserves any allowed speaker replacement that happened during validation
-                    segment["speaker"] = translated_pairs[i]["speaker"]
+                    # Keep the diarized speaker assignment: the translation LLM
+                    # must never move a line onto another character's voice.
+                    # Only fill in a speaker if the original segment lacked one.
+                    llm_speaker = translated_pairs[i].get("speaker")
+                    diarized_speaker = segment.get("speaker")
+                    if llm_speaker and diarized_speaker and llm_speaker != diarized_speaker:
+                        logger.warning(
+                            "Ignoring LLM speaker change for segment %d/%d: "
+                            "keeping diarized %s over %s",
+                            i + 1,
+                            len(original_segments),
+                            diarized_speaker,
+                            llm_speaker,
+                        )
+                    elif not diarized_speaker and llm_speaker:
+                        segment["speaker"] = llm_speaker
                     all_segments.append(segment)
         
         # Filter out segments with empty translations (after filling with original text)
@@ -3230,7 +3416,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         Returns:
             None
         """
-        logger.debug(f"Generating human-readable timecodes report...")
+        logger.debug("Generating human-readable timecodes report...")
         
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
@@ -3296,7 +3482,7 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         Returns:
             Rewritten text in target language. Falls back to original_text on failure.
         """
-        logger.debug(f"=== adjust_segment_text_length called ===")
+        logger.debug("=== adjust_segment_text_length called ===")
         logger.debug(f"Original text length: {len(original_text)} chars")
         logger.debug(f"Original text: '{original_text[:100]}{'...' if len(original_text) > 100 else ''}'")
         logger.debug(f"Desired ratio: {desired_ratio:.2f}, Target char count: {target_char_count}")

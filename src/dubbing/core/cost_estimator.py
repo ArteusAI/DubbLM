@@ -126,7 +126,7 @@ class CostEstimator:
             logger.warning("Skipping transcription cost estimation: %s", exc)
 
     def _estimate_translation(self, estimated_tokens: float) -> None:
-        provider = (self._config.get("llm_provider") or "gemini").lower()
+        provider = (self._config.get("llm_provider") or "openrouter").lower()
         model_name = self._resolve_llm_model_name(provider)
         encoding_model = model_name or self._default_model_for_provider(provider)
         chunk_count = self._estimate_chunk_count(estimated_tokens)
@@ -208,7 +208,7 @@ class CostEstimator:
 
     def _estimate_tts(self, duration_seconds: float, estimated_tokens: float) -> None:
         tts_system = (self._config.get("tts_system") or "").lower()
-        if tts_system not in ("gemini", "gemini38", "openai"):
+        if tts_system not in ("gemini", "gemini38", "openai", "openrouter"):
             logger.info(
                 "TTS system '%s' has no pricing configured; skipping TTS estimate.",
                 tts_system,
@@ -216,7 +216,12 @@ class CostEstimator:
             return
 
         model_name = self._resolve_tts_model_name(tts_system)
-        pricing_provider = "gemini" if tts_system == "gemini38" else tts_system
+        transport = str(self._config.get("tts_transport") or "openrouter").lower()
+        pricing_provider = (
+            "openrouter"
+            if tts_system in ("gemini", "gemini38") and transport == "openrouter"
+            else ("gemini" if tts_system == "gemini38" else tts_system)
+        )
         try:
             self._tracker.estimate_tts_cost(
                 pricing_provider,
@@ -256,7 +261,7 @@ class CostEstimator:
         model = self._config.get("refinement_model_name")
         if model:
             return model
-        if provider == (self._config.get("llm_provider") or "gemini").lower():
+        if provider == (self._config.get("llm_provider") or "openrouter").lower():
             return default_model
         return self._default_model_for_provider(provider)
 
@@ -477,5 +482,5 @@ IMPORTANT: The glossary provides base forms of translations. When using a term f
         if provider == "gemini":
             return "gemini-2.5-pro"
         if provider == "openrouter":
-            return "anthropic/claude-sonnet-4.5"
+            return "~google/gemini-flash-latest"
         return None

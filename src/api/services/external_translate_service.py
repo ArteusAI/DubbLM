@@ -58,7 +58,7 @@ async def start_external_translate(
     file: UploadFile,
     target_lang: str,
     *,
-    preset: PresetType = "hq",
+    preset: PresetType = "ultra",
     source_lang: str = "auto",
     minimal_diarization_merge: bool = False,
     keep_background: bool = False,

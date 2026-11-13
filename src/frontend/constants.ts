@@ -17,8 +17,8 @@ export const GEMINI_TTS_MODEL_OPTIONS = [
 // Gemini 3.8 Flash TTS (Interactions API, per-segment synthesis).
 // Keep aligned with DEFAULT_GEMINI38_TTS_MODEL in
 // src/tts/gemini38_tts_wrapper.py (the backend source of truth).
-export const GEMINI38_DEFAULT_TTS_MODEL = 'gemini-3.8-flash-tts';
-export const GEMINI38_DEFAULT_TTS_FALLBACK_MODEL = 'gemini-3.8-flash-lite-tts';
+export const GEMINI38_DEFAULT_TTS_MODEL = 'google/gemini-3.8-flash-tts';
+export const GEMINI38_DEFAULT_TTS_FALLBACK_MODEL = 'google/gemini-3.8-flash-lite-tts';
 export const GEMINI38_TTS_MODEL_OPTIONS = [
   GEMINI38_DEFAULT_TTS_MODEL,
   GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
@@ -42,6 +42,12 @@ export const normalizeTtsSystem = (
     ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
   };
 };
+
+// Gemini 3.8 and the legacy Gemini provider share the same prebuilt voice
+// catalog. The API exposes that catalog under the legacy "gemini" id, while
+// the UI only offers "gemini38".
+export const resolveVoiceCatalogProvider = (ttsSystem: string): string =>
+  ttsSystem === 'gemini38' ? LEGACY_GEMINI_TTS_SYSTEM : ttsSystem;
 
 export const LANGUAGES: Language[] = [
   { code: 'auto', name: 'Auto Detect' },
@@ -81,10 +87,10 @@ export const DEFAULT_PERSONAS: Persona[] = [
 ];
 
 export const TTS_PROVIDERS = [
-  { id: 'openai', name: 'OpenAI' },
-  { id: 'gemini38', name: 'Gemini 3.8 (Highest Quality)' },
-  { id: 'minimax', name: 'MiniMax' },
-  { id: 'openrouter', name: 'OpenRouter' },
+  { id: 'gemini38', name: 'Gemini 3.8 (OpenRouter)' },
+  { id: 'openrouter', name: 'OpenRouter (Qwen / Fish / Grok)' },
+  { id: 'openai', name: 'OpenAI (legacy)' },
+  { id: 'minimax', name: 'MiniMax (legacy)' },
 ];
 
 export const OPENROUTER_DEFAULT_TTS_MODEL = 'qwen/qwen-audio-3.0-tts-flash';
@@ -92,11 +98,40 @@ export const OPENROUTER_TTS_MODEL_OPTIONS = [
   'qwen/qwen-audio-3.0-tts-flash',
   'qwen/qwen-audio-3.0-tts-plus',
   'x-ai/grok-voice-tts-1.0',
+  'fish-audio/drama-3',
 ] as const;
 
+// Voices accepted by each known OpenRouter speech model.
+// The API reports the same information per voice (`models`); this map is the
+// offline fallback for voices that do not carry that metadata.
+export const OPENROUTER_MODEL_VOICES: Record<string, string[]> = {
+  'qwen/qwen-audio-3.0-tts-flash': ['loongjohn', 'longanhuan_v3.6'],
+  'qwen/qwen-audio-3.0-tts-plus': ['longanlingxin', 'longanlufeng'],
+  'x-ai/grok-voice-tts-1.0': ['eve', 'ara', 'rex', 'sal', 'leo'],
+  // Fish Audio Drama 3 selects voices by Fish voice id. These are the curated
+  // Russian adult voices; the backend returns them with `curated: true`.
+  'fish-audio/drama-3': [
+    '67ecc0169ec54f4eb99ff59680cd0458', // Тёплый рассказчик (male)
+    '7312c38557eb4fb384e3874e8e9cea67', // Профессиональный баритон (male)
+    'fa3e3b7d3c2a44d88d9f018bc45db1ce', // Низкий русский (male)
+    'd315712918f542e5bf866367e4a4975f', // Мягкий наблюдатель (male)
+    '7f34b2a34b6e461aa2dc9632d7c737f3', // Тёплый баритон (male)
+    '9f414bb4bdc14378854ad9320f9e6f0e', // Молодой разговорный (male)
+    '6ada82e315e648b6a30a2e2210844cbf', // Дерзкий молодой (male)
+    'cfd7057a69204777af3a570d3e3ef164', // Тихий баритон (male)
+    '773ed9d827bb4c0d8b7a1b9267a4255e', // Спокойный резонансный (male)
+    '172565be42474bf093d16c9b60885357', // Сбалансированный баритон (male)
+    '9cc4883d4bbe4276bb67584db3cd117b', // Спокойная рассказчица (female)
+    '12f7ab6416aa490880e63c864a434618', // Мягкий интимный голос (female)
+    '4bf88e0a955748358c0e06a7b656b2af', // Ясный молодой альт (female)
+    '345193fc9ae942888141767d2bc9c4c9', // Чистый молодой голос (female)
+    '9a6b5d73a86042dc8191a8c62adfbe47', // Тёплый мелодичный альт (female)
+  ],
+};
+
 export const LLM_PROVIDERS = [
-  { id: 'gemini', name: 'Gemini' },
   { id: 'openrouter', name: 'OpenRouter' },
+  { id: 'gemini', name: 'Gemini (legacy)' },
 ];
 
 export const TTS_STYLES: {
@@ -149,9 +184,17 @@ export const TTS_STYLES: {
 ];
 
 export const TRANSCRIPTION_PROVIDERS = [
-  { id: 'assemblyai', name: 'AssemblyAI' },
-  { id: 'openai', name: 'OpenAI + PyAnnote' },
-  { id: 'whisperx', name: 'WhisperX (Local)' },
+  { id: 'openrouter', name: 'OpenRouter (MAI-Transcribe 2)' },
+  { id: 'assemblyai', name: 'AssemblyAI (legacy)' },
+  { id: 'openai', name: 'OpenAI + PyAnnote (legacy)' },
+  { id: 'whisperx', name: 'WhisperX (Local, legacy)' },
+];
+
+export const OPENROUTER_STT_DEFAULT_MODEL = 'microsoft/mai-transcribe-2';
+export const OPENROUTER_STT_MODEL_OPTIONS = [
+  'microsoft/mai-transcribe-2',
+  'elevenlabs/scribe-v2',
+  'deepgram/nova-3',
 ];
 
 export const WHISPER_MODELS = [
@@ -182,8 +225,8 @@ export const PRESETS: PresetConfig[] = [
     icon: '⚡',
     personaId: 'none',
     keepBackground: false,
-    llmProvider: 'gemini',
-    llmModelName: 'gemini-flash-latest',
+    llmProvider: 'openrouter',
+    llmModelName: '~google/gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: false,
     enableLlmTextAdjustment: false,
@@ -194,8 +237,11 @@ export const PRESETS: PresetConfig[] = [
     refinementLlmProvider: 'openrouter',
     refinementModelName: 'openai/gpt-6-sol',
     refinementTemperature: 1.0,
-    ttsSystem: 'openai',
-    ttsStyle: 'auto',
+    ttsSystem: 'gemini38',
+    ttsTransport: 'openrouter',
+    ttsModel: 'google/gemini-3.8-flash-lite-tts',
+    ttsFallbackModel: 'google/gemini-3.8-flash-lite-tts',
+    ttsStyle: 'podcast',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
     enableLaughterDetection: false,
@@ -219,8 +265,8 @@ export const PRESETS: PresetConfig[] = [
     icon: '✨',
     personaId: 'none',
     keepBackground: false,
-    llmProvider: 'gemini',
-    llmModelName: 'gemini-flash-latest',
+    llmProvider: 'openrouter',
+    llmModelName: '~google/gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: false,
     enableLlmTextAdjustment: false,
@@ -232,15 +278,18 @@ export const PRESETS: PresetConfig[] = [
     refinementModelName: 'openai/gpt-6-sol',
     refinementTemperature: 1.0,
     ttsSystem: 'gemini38',
-    ttsModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
-    ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
-    ttsStyle: 'auto',
+    ttsTransport: 'openrouter',
+    ttsModel: 'google/gemini-3.8-flash-lite-tts',
+    ttsFallbackModel: 'google/gemini-3.8-flash-lite-tts',
+    ttsStyle: 'podcast',
     voiceAutoSelection: true,
     enableEmotionAnalysis: false,
     enableLaughterDetection: false,
     laughterMode: 'dub',
     enableEmotionEnrichment: false,
     enableContentValidation: true,
+    enableContextStyle: true,
+    contextStyleMaxChars: 140,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
     normalizeAudio: false,
@@ -255,9 +304,9 @@ export const PRESETS: PresetConfig[] = [
     description: '~4x video duration',
     icon: '💎',
     personaId: 'normal',
-    keepBackground: true,
-    llmProvider: 'gemini',
-    llmModelName: 'gemini-flash-latest',
+    keepBackground: false,
+    llmProvider: 'openrouter',
+    llmModelName: '~google/gemini-flash-latest',
     llmTemperature: 0.5,
     enableLlmEditor: false,
     enableLlmTextAdjustment: true,
@@ -266,20 +315,24 @@ export const PRESETS: PresetConfig[] = [
     editorTemperature: 1.0,
     editorReasoningEffort: 'xhigh',
     refinementLlmProvider: 'openrouter',
-    refinementModelName: 'openai/gpt-6-sol',
-    refinementTemperature: 1.0,
+    refinementModelName: 'google/gemini-4-carbon',
+    refinementTemperature: 0.8,
     ttsSystem: 'gemini38',
-    ttsModel: GEMINI38_DEFAULT_TTS_MODEL,
-    ttsFallbackModel: GEMINI38_DEFAULT_TTS_FALLBACK_MODEL,
-    ttsStyle: 'auto',
+    ttsTransport: 'openrouter',
+    ttsModel: 'google/gemini-3.8-flash-tts',
+    ttsFallbackModel: 'google/gemini-3.8-flash-lite-tts',
+    ttsStyle: 'podcast',
     voiceAutoSelection: true,
     enableEmotionAnalysis: true,
-    enableLaughterDetection: true,
+    enableLaughterDetection: false,
     laughterMode: 'dub',
     enableEmotionEnrichment: true,
     enableContentValidation: true,
+    enableContextStyle: true,
+    contextStyleMaxChars: 140,
     dubbedVolume: 1.0,
     backgroundVolume: 0.56,
+    backgroundVoiceVolume: 0.0,
     normalizeAudio: false,
     useTwoPassEncoding: true,
     videoQualityPreset: 'original',

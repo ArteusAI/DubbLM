@@ -241,6 +241,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </p>
               </div>
               
+              {/* OpenRouter */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium text-zinc-300">OpenRouter API Key</label>
+                  {apiKeyStatus.openrouter?.configured && (
+                    <span className="text-xs text-emerald-400 flex items-center gap-1">
+                      <CheckCircle className="w-3 h-3" /> Configured
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-zinc-500">
+                  Required for transcription, translation, TTS and emotion enrichment.
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={isGlobal ? (apiKeyInputs.openrouter ?? '') : (config.apiKeys.openrouter || '')}
+                    onChange={(e) => isGlobal
+                      ? setApiKeyInputs(prev => ({ ...prev, openrouter: e.target.value }))
+                      : onUpdateConfig({ apiKeys: { ...config.apiKeys, openrouter: e.target.value } })
+                    }
+                    className="flex-1 bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50"
+                    placeholder={apiKeyStatus.openrouter?.configured ? "••••••••" : "sk-or-..."}
+                  />
+                  {isGlobal && (
+                    <button
+                      onClick={() => handleSaveApiKey('openrouter')}
+                      disabled={!apiKeyInputs.openrouter || apiKeyStatus.openrouter?.saving}
+                      className="px-4 py-2 bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-sm font-medium transition-colors flex items-center gap-2"
+                    >
+                      {apiKeyStatus.openrouter?.saving ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : apiKeyStatus.openrouter?.saved ? (
+                        <CheckCircle className="w-4 h-4 text-emerald-400" />
+                      ) : (
+                        <Save className="w-4 h-4" />
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+
               {/* OpenAI */}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">

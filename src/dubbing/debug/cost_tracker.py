@@ -65,6 +65,7 @@ CATEGORY_STAGE_MAP: Dict[str, str] = {
     "refinement": "translation",
     "editor_pass": "translation",
     "emotion_enrichment": "emotion_analysis",
+    "emotion_video_analysis": "emotion_analysis",
     "tts_synthesis": "speech_synthesis",
     "tts_batch_alignment": "speech_synthesis",
     "tts_content_validation": "speech_synthesis",
@@ -79,6 +80,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     "refinement": "Refinement",
     "editor_pass": "Editor pass",
     "emotion_enrichment": "Emotion enrichment",
+    "emotion_video_analysis": "Video+audio emotion analysis",
     "tts_synthesis": "TTS synthesis",
     "tts_batch_alignment": "TTS batch alignment ASR",
     "tts_content_validation": "TTS validation ASR",
@@ -113,6 +115,17 @@ DEFAULT_PRICING_CATALOG: Dict[str, Any] = {
                 "gpt-4o-transcribe": {"per_min": 0.006},
                 "gpt-4o-transcribe-diarize": {"per_min": 0.006},
                 "gpt-4o-mini-transcribe": {"per_min": 0.003},
+            },
+        },
+        "openrouter": {
+            # MAI-Transcribe 2 is $0.10/hour on OpenRouter (Azure endpoint).
+            "models": {
+                "microsoft/mai-transcribe-2": {"per_min": 0.10 / 60.0},
+                "elevenlabs/scribe-v2": {"per_min": 0.22 / 60.0},
+                "deepgram/nova-3": {"per_min": 0.258 / 60.0},
+            },
+            "addons": {
+                "speaker_diarization_per_min": 0.0,
             },
         },
     },
@@ -235,6 +248,30 @@ DEFAULT_PRICING_CATALOG: Dict[str, Any] = {
                 "qwen/qwen-audio-3.0-tts-flash": {"per_1m_chars": 15.00},
                 "qwen/qwen-audio-3.0-tts-plus": {"per_1m_chars": 20.00},
                 "x-ai/grok-voice-tts-1.0": {"per_1m_chars": 15.00},
+                # Fish Audio Drama 3: $0.000002 per prompt token -> $2 / 1M chars.
+                "fish-audio/drama-3": {"per_1m_chars": 2.00},
+                # Gemini 3.8 TTS through OpenRouter's /audio/speech endpoint.
+                "google/gemini-3.8-flash-tts": {
+                    "input_per_1m_tokens": 0.50,
+                    "output_per_1m_tokens": 9.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
+                "google/gemini-3.8-flash-lite-tts": {
+                    "input_per_1m_tokens": 0.50,
+                    "output_per_1m_tokens": 6.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
+                # Unprefixed aliases used by older project configs.
+                "gemini-3.8-flash-tts": {
+                    "input_per_1m_tokens": 0.50,
+                    "output_per_1m_tokens": 9.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
+                "gemini-3.8-flash-lite-tts": {
+                    "input_per_1m_tokens": 0.50,
+                    "output_per_1m_tokens": 6.00,
+                    "audio_output_tokens_per_second": 25.0,
+                },
             }
         },
     },
@@ -934,10 +971,19 @@ class CostTracker:
         self.usage["tts"]["output_tokens"] += float(expected_output_tokens or 0.0)
         self.usage["tts"]["audio_seconds"] += float(expected_audio_seconds or 0.0)
         detail_map = self.usage["tts"].setdefault("details", {})
-        detail_entry = detail_map.setdefault(f"{provider}:{model or 'default'}", {"input_tokens": 0.0, "output_tokens": 0.0, "audio_seconds": 0.0})
-        detail_entry["input_tokens"] += float(input_tokens or 0.0)
-        detail_entry["output_tokens"] += float(expected_output_tokens or 0.0)
-        detail_entry["audio_seconds"] += float(expected_audio_seconds or 0.0)
+        detail_entry = detail_map.setdefault(
+            f"{provider}:{model or 'default'}",
+            {
+                "input_tokens": 0.0,
+                "output_tokens": 0.0,
+                "input_characters": 0.0,
+                "audio_seconds": 0.0,
+                "cost_usd": 0.0,
+            },
+        )
+        detail_entry["input_tokens"] = detail_entry.get("input_tokens", 0.0) + float(input_tokens or 0.0)
+        detail_entry["output_tokens"] = detail_entry.get("output_tokens", 0.0) + float(expected_output_tokens or 0.0)
+        detail_entry["audio_seconds"] = detail_entry.get("audio_seconds", 0.0) + float(expected_audio_seconds or 0.0)
         logger.debug(f"Estimated TTS cost [{provider}#{model or 'default'}]: ${cost:.4f}")
         return cost
 
@@ -987,10 +1033,10 @@ class CostTracker:
                 "audio_seconds": 0.0,
                 "cost_usd": 0.0,
             })
-            entry["input_tokens"] += float(input_tokens or 0.0)
-            entry["output_tokens"] += effective_output_tokens
-            entry["input_characters"] += float(input_characters or 0.0)
-            entry["audio_seconds"] += float(audio_seconds or 0.0)
+            entry["input_tokens"] = entry.get("input_tokens", 0.0) + float(input_tokens or 0.0)
+            entry["output_tokens"] = entry.get("output_tokens", 0.0) + effective_output_tokens
+            entry["input_characters"] = entry.get("input_characters", 0.0) + float(input_characters or 0.0)
+            entry["audio_seconds"] = entry.get("audio_seconds", 0.0) + float(audio_seconds or 0.0)
             entry["cost_usd"] += cost
 
         self._record_api_cost(

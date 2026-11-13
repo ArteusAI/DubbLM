@@ -6,12 +6,13 @@ import { EditorView } from './components/EditorView';
 import { ResultView } from './components/ResultView';
 import { ProjectListView } from './components/ProjectListView';
 import { SettingsModal } from './components/SettingsModal';
+import { SetupWizard } from './components/SetupWizard';
 import { AppStep, AppConfig, Segment, ProcessingLog, Persona, Project, ProjectStatus, PresetId, LlmProvider, SpeakerMetadata, TtsStyleId, ResolvedTtsStyleId } from './types';
 import { DEFAULT_PERSONAS, PRESETS, normalizeTtsSystem } from './constants';
 import { ChevronRight, LayoutDashboard, Settings, AlertTriangle, Loader2, X } from 'lucide-react';
 import api, { ProjectResponse, SegmentResponse, VoiceResponse, PersonaResponse, ProjectConfig as ApiProjectConfig, DownloadQuality, VideoInfoResponse, QueueAutoResponse } from './api';
 
-const DEFAULT_PRESET = PRESETS.find(p => p.id === 'hq')!;
+const DEFAULT_PRESET = PRESETS.find(p => p.id === 'ultra')!;
 
 const INITIAL_CONFIG: AppConfig = {
   sourceLang: 'auto',
@@ -19,7 +20,9 @@ const INITIAL_CONFIG: AppConfig = {
   defaultTargetLang: 'ru',
   personaId: DEFAULT_PRESET.personaId || 'none',
   keepBackground: DEFAULT_PRESET.keepBackground ?? false,
-  preset: 'hq',
+  preset: 'ultra',
+  transcriptionSystem: 'openrouter',
+  openrouterSttModel: 'microsoft/mai-transcribe-2',
   apiKeys: {},
   // Apply default preset settings
   llmProvider: DEFAULT_PRESET.llmProvider,
@@ -35,6 +38,7 @@ const INITIAL_CONFIG: AppConfig = {
   refinementModelName: DEFAULT_PRESET.refinementModelName,
   refinementTemperature: DEFAULT_PRESET.refinementTemperature,
   ttsSystem: DEFAULT_PRESET.ttsSystem,
+  ttsTransport: DEFAULT_PRESET.ttsTransport,
   ttsModel: DEFAULT_PRESET.ttsModel,
   ttsStyle: DEFAULT_PRESET.ttsStyle,
   ttsPromptPrefix: DEFAULT_PRESET.ttsPromptPrefix,
@@ -45,6 +49,7 @@ const INITIAL_CONFIG: AppConfig = {
   contextStyleMaxChars: DEFAULT_PRESET.contextStyleMaxChars,
   dubbedVolume: DEFAULT_PRESET.dubbedVolume,
   backgroundVolume: DEFAULT_PRESET.backgroundVolume,
+  backgroundVoiceVolume: DEFAULT_PRESET.backgroundVoiceVolume ?? 0,
   normalizeAudio: DEFAULT_PRESET.normalizeAudio,
   keepOriginalAudioRanges: [],
   useTwoPassEncoding: DEFAULT_PRESET.useTwoPassEncoding,
@@ -88,6 +93,7 @@ const buildProjectConfigPayload = (
   startTime: cfg.startTime,
   duration: cfg.duration,
   transcriptionSystem: cfg.transcriptionSystem,
+  openrouterSttModel: cfg.openrouterSttModel,
   whisperModel: cfg.whisperModel,
   llmProvider: cfg.llmProvider,
   llmModelName: cfg.llmModelName,
@@ -107,12 +113,27 @@ const buildProjectConfigPayload = (
   refinementTemperature: cfg.refinementTemperature,
   translationPromptPrefix: cfg.translationPromptPrefix,
   ttsSystem: cfg.ttsSystem,
+  ttsTransport: cfg.ttsTransport,
   ttsModel: cfg.ttsModel,
   ttsStyle: cfg.ttsStyle,
   ttsPromptPrefix: cfg.ttsPromptPrefix,
   resolvedTtsStyle: cfg.resolvedTtsStyle,
   voiceAutoSelection: cfg.voiceAutoSelection,
+  enableVoiceCloning: cfg.enableVoiceCloning,
   enableEmotionEnrichment: cfg.enableEmotionEnrichment,
+  enableVideoEmotionAnalysis: cfg.enableVideoEmotionAnalysis,
+  videoEmotionAnalysisModel: cfg.videoEmotionAnalysisModel,
+  videoEmotionAnalysisFps: cfg.videoEmotionAnalysisFps,
+  videoEmotionAnalysisDirectionMaxChars: cfg.videoEmotionAnalysisDirectionMaxChars,
+  videoEmotionAnalysisLanguage: cfg.videoEmotionAnalysisLanguage,
+  enableVoiceAdvisor: cfg.enableVoiceAdvisor,
+  voiceAdviceMaxCandidates: cfg.voiceAdviceMaxCandidates,
+  enableLaughterDetection: cfg.enableLaughterDetection,
+  laughterMode: cfg.laughterMode,
+  enableVocalEventDetection: cfg.enableVocalEventDetection,
+  vocalEventsMode: cfg.vocalEventsMode,
+  vocalEventKinds: cfg.vocalEventKinds,
+  enableVocalEventLoudnessDetection: cfg.enableVocalEventLoudnessDetection,
   enableContentValidation: cfg.enableContentValidation,
   enableContextStyle: cfg.enableContextStyle,
   contextStyleMaxChars: cfg.contextStyleMaxChars,
@@ -123,6 +144,7 @@ const buildProjectConfigPayload = (
   contentValidatorSpeechModel: cfg.contentValidatorSpeechModel,
   dubbedVolume: cfg.dubbedVolume,
   backgroundVolume: cfg.backgroundVolume,
+  backgroundVoiceVolume: cfg.backgroundVoiceVolume,
   normalizeAudio: cfg.normalizeAudio,
   keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
   useTwoPassEncoding: cfg.useTwoPassEncoding,
@@ -153,15 +175,16 @@ const mapSegmentFromApi = (
   translatedText: seg.translatedText || '',
   isMuted: seg.isMuted,
   voiceId: seg.voiceId || fallback?.speakerVoiceMappings?.[seg.speaker] || 'alloy',
-  provider: normalizeTtsSystem(seg.provider || fallback?.ttsSystem || 'openai').ttsSystem || 'openai',
+  provider: normalizeTtsSystem(seg.provider || fallback?.ttsSystem || 'gemini38').ttsSystem || 'gemini38',
   audioUrl: seg.audioUrl,
   ttsPrompt: seg.ttsPrompt,
   speakerColor: seg.speakerColor,
 });
 
 const mapProjectFromApi = (p: ProjectResponse): Project => {
-  const presetId = (p.config.preset as PresetId) || 'hq';
-  const preset = PRESETS.find(pr => pr.id === presetId) || DEFAULT_PRESET;
+  const requestedPresetId = (p.config.preset as PresetId) || 'ultra';
+  const preset = PRESETS.find(pr => pr.id === requestedPresetId) || DEFAULT_PRESET;
+  const presetId = preset.id;
   const cfg = p.config;
   
   return {
@@ -181,7 +204,8 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       // Load saved settings, fallback to preset defaults
       startTime: cfg.startTime,
       duration: cfg.duration,
-      transcriptionSystem: cfg.transcriptionSystem as 'assemblyai' | 'openai' | 'whisperx' | undefined,
+      transcriptionSystem: cfg.transcriptionSystem as 'openrouter' | 'assemblyai' | 'openai' | 'whisperx' | undefined,
+      openrouterSttModel: cfg.openrouterSttModel,
       whisperModel: cfg.whisperModel,
       llmProvider: (cfg.llmProvider as LlmProvider) || preset.llmProvider,
       llmModelName: cfg.llmModelName || preset.llmModelName,
@@ -198,17 +222,43 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       translationPromptPrefix: cfg.translationPromptPrefix,
       speakerTtsPrompts: cfg.speakerTtsPrompts || {},
       speakerVoiceMappings: cfg.speakerVoiceMappings || {},
+      autoSelectedVoices: cfg.autoSelectedVoices || {},
       enableSpeakerGenderInference: cfg.enableSpeakerGenderInference ?? true,
       speakerMetadata: cfg.speakerMetadata || {},
       ...normalizeTtsSystem(
         cfg.ttsSystem || preset.ttsSystem,
         cfg.ttsModel || preset.ttsModel,
       ),
+      ttsTransport: cfg.ttsTransport ?? preset.ttsTransport ?? 'openrouter',
       ttsStyle: (cfg.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'auto',
       ttsPromptPrefix: cfg.ttsPromptPrefix ?? preset.ttsPromptPrefix,
       resolvedTtsStyle: cfg.resolvedTtsStyle as ResolvedTtsStyleId | undefined,
       voiceAutoSelection: cfg.voiceAutoSelection ?? preset.voiceAutoSelection,
+      enableVoiceCloning: cfg.enableVoiceCloning,
       enableEmotionEnrichment: cfg.enableEmotionEnrichment ?? preset.enableEmotionEnrichment,
+      enableVideoEmotionAnalysis:
+        cfg.enableVideoEmotionAnalysis ?? preset.enableVideoEmotionAnalysis,
+      videoEmotionAnalysisModel:
+        cfg.videoEmotionAnalysisModel ?? preset.videoEmotionAnalysisModel,
+      videoEmotionAnalysisFps:
+        cfg.videoEmotionAnalysisFps ?? preset.videoEmotionAnalysisFps,
+      videoEmotionAnalysisDirectionMaxChars:
+        cfg.videoEmotionAnalysisDirectionMaxChars ??
+        preset.videoEmotionAnalysisDirectionMaxChars,
+      videoEmotionAnalysisLanguage:
+        cfg.videoEmotionAnalysisLanguage ?? preset.videoEmotionAnalysisLanguage,
+      enableVoiceAdvisor: cfg.enableVoiceAdvisor ?? preset.enableVoiceAdvisor,
+      voiceAdviceMaxCandidates:
+        cfg.voiceAdviceMaxCandidates ?? preset.voiceAdviceMaxCandidates,
+      speakerVoiceProfiles: cfg.speakerVoiceProfiles,
+      enableLaughterDetection: cfg.enableLaughterDetection ?? preset.enableLaughterDetection,
+      laughterMode: cfg.laughterMode ?? preset.laughterMode,
+      enableVocalEventDetection:
+        cfg.enableVocalEventDetection ?? preset.enableVocalEventDetection,
+      vocalEventsMode: cfg.vocalEventsMode ?? preset.vocalEventsMode,
+      vocalEventKinds: cfg.vocalEventKinds ?? preset.vocalEventKinds,
+      enableVocalEventLoudnessDetection:
+        cfg.enableVocalEventLoudnessDetection ?? preset.enableVocalEventLoudnessDetection,
       enableContentValidation: cfg.enableContentValidation ?? preset.enableContentValidation,
       enableContextStyle: cfg.enableContextStyle ?? preset.enableContextStyle,
       contextStyleMaxChars: cfg.contextStyleMaxChars ?? preset.contextStyleMaxChars,
@@ -219,6 +269,7 @@ const mapProjectFromApi = (p: ProjectResponse): Project => {
       contentValidatorSpeechModel: cfg.contentValidatorSpeechModel ?? 'nano',
       dubbedVolume: cfg.dubbedVolume ?? preset.dubbedVolume,
       backgroundVolume: cfg.backgroundVolume ?? preset.backgroundVolume,
+      backgroundVoiceVolume: cfg.backgroundVoiceVolume ?? preset.backgroundVoiceVolume ?? 0,
       normalizeAudio: cfg.normalizeAudio ?? preset.normalizeAudio,
       keepOriginalAudioRanges: cfg.keepOriginalAudioRanges || [],
       useTwoPassEncoding: cfg.useTwoPassEncoding ?? preset.useTwoPassEncoding,
@@ -290,6 +341,8 @@ const App: React.FC = () => {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [setupVersion, setSetupVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   
   // Navigation State
@@ -391,6 +444,13 @@ const App: React.FC = () => {
     const loadInitialData = async () => {
       try {
         setIsLoading(true);
+        const setupStatus = await api.getSetupStatus();
+        if (setupStatus.required) {
+          setSetupRequired(true);
+          setIsLoading(false);
+          return;
+        }
+        setSetupRequired(false);
         const [projectsData, voicesData, personasData, settingsData] = await Promise.all([
           api.listProjects(),
           api.getVoices(),
@@ -447,7 +507,7 @@ const App: React.FC = () => {
     };
 
     loadInitialData();
-  }, []);
+  }, [setupVersion]);
 
   // --- SSE Status Subscription ---
   // Track processing status separately to avoid re-subscribing on every project update
@@ -995,6 +1055,7 @@ const App: React.FC = () => {
           presetFromApi?.ttsSystem ?? preset.ttsSystem,
           presetFromApi?.ttsModel ?? preset.ttsModel,
         ),
+        ttsTransport: (presetFromApi?.ttsTransport as 'openrouter' | 'google' | undefined) ?? preset.ttsTransport ?? 'openrouter',
         ttsStyle: (presetFromApi?.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'auto',
         ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
         voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
@@ -1004,11 +1065,14 @@ const App: React.FC = () => {
         contextStyleMaxChars: presetFromApi?.contextStyleMaxChars ?? preset.contextStyleMaxChars,
         dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
         backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
+        backgroundVoiceVolume: presetFromApi?.backgroundVoiceVolume ?? preset.backgroundVoiceVolume ?? 0,
         normalizeAudio: presetFromApi?.normalizeAudio ?? preset.normalizeAudio,
         useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
         videoQualityPreset: presetFromApi?.videoQualityPreset ?? preset.videoQualityPreset,
         maxWorkers: presetFromApi?.maxWorkers ?? preset.maxWorkers,
         pauseRemoval: presetFromApi?.pauseRemoval ?? preset.pauseRemoval,
+        transcriptionSystem: presetFromApi?.transcriptionSystem ?? 'openrouter',
+        openrouterSttModel: presetFromApi?.openrouterSttModel ?? 'microsoft/mai-transcribe-2',
       };
       
       await api.updateProjectConfig(projectId, configUpdate);
@@ -1276,6 +1340,18 @@ const App: React.FC = () => {
   const handleSettingsUpdate = activeProject 
     ? (newCfg: Partial<AppConfig>) => updateActiveProject({ config: { ...activeProject.config, ...newCfg } })
     : updateGlobalConfig;
+
+  if (setupRequired) {
+    return (
+      <SetupWizard
+        onComplete={() => {
+          setSetupRequired(false);
+          setIsLoading(true);
+          setSetupVersion((value) => value + 1);
+        }}
+      />
+    );
+  }
 
   if (isLoading) {
     return (

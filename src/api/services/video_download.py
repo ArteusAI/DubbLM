@@ -39,6 +39,18 @@ YOUTUBE_PLAYLIST_HOSTS = {"youtube.com", "m.youtube.com", "music.youtube.com"}
 
 YOUTUBE_VIDEO_PATH_PREFIXES = ("shorts/", "embed/", "live/", "v/")
 
+# YouTube occasionally returns HTTP 403 for media URLs even when metadata
+# extraction succeeds (PO-token / bot-protection experiments). These modes
+# retry the same video with a different player client before falling back to
+# the muxed 360p stream, which is generally allowed without a PO token.
+ALTERNATE_YOUTUBE_EXTRACTOR_ARGS = {
+    "youtube": {"player_client": ["mweb", "web_embedded"]},
+}
+COMPATIBILITY_YOUTUBE_EXTRACTOR_ARGS = {
+    "youtube": {"player_client": ["tv"]},
+}
+COMPATIBILITY_FORMAT = "18/best[acodec!=none]/best/worst"
+
 
 class VideoDownloadError(HTTPException):
     """Raised when a video download fails."""
@@ -74,6 +86,23 @@ def _is_playlist_only_url(parsed: ParseResult) -> bool:
 
     path = parsed.path.strip("/")
     return not path.startswith(YOUTUBE_VIDEO_PATH_PREFIXES)
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Return True for YouTube video URLs (including youtu.be)."""
+    host = (urlparse(url).netloc or "").lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return (
+        host in {"youtu.be", "youtube.com", "youtube-nocookie.com"}
+        or host.endswith((".youtube.com", ".youtube-nocookie.com"))
+    )
+
+
+def _is_forbidden_error(message: str) -> bool:
+    """Detect yt-dlp errors caused by a rejected/expired media URL."""
+    lower = message.lower()
+    return "http error 403" in lower or ("403" in lower and "forbidden" in lower)
 
 
 def validate_video_url(url: str) -> str:
@@ -114,9 +143,17 @@ def build_ytdlp_options(
     progress_callback: Optional[ProgressCallback] = None,
     log_callback: Optional[LogCallback] = None,
     preserve_native_format: bool = True,
+    format_selector: Optional[str] = None,
+    extractor_args: Optional[dict] = None,
 ) -> dict:
-    """Build yt-dlp options dictionary."""
-    format_selector = QUALITY_FORMATS.get(quality, QUALITY_FORMATS["best"])
+    """Build yt-dlp options dictionary.
+
+    ``format_selector`` and ``extractor_args`` are optional overrides used by
+    the 403 fallback path; normal downloads keep the quality preset behavior.
+    """
+    format_selector = format_selector or QUALITY_FORMATS.get(
+        quality, QUALITY_FORMATS["best"]
+    )
 
     options: dict = {
         "format": format_selector,
@@ -145,6 +182,9 @@ def build_ytdlp_options(
 
     if max_filesize:
         options["max_filesize"] = max_filesize
+
+    if extractor_args:
+        options["extractor_args"] = extractor_args
 
     if progress_callback is not None:
 
@@ -311,6 +351,13 @@ def _convert_to_mp4(path: Path) -> Path:
     return target
 
 
+def _clear_uploads(project_manager: ProjectManager) -> None:
+    """Remove partial downloads so the next attempt starts clean."""
+    for existing_file in project_manager.uploads_dir.iterdir():
+        if existing_file.is_file():
+            existing_file.unlink()
+
+
 def _perform_download(
     url: str,
     project_id: str,
@@ -321,6 +368,8 @@ def _perform_download(
     max_download_duration: Optional[int],
     progress_callback: Optional[ProgressCallback],
     log_callback: Optional[LogCallback],
+    format_selector: Optional[str] = None,
+    extractor_args: Optional[dict] = None,
 ) -> tuple[Path, Optional[str], int]:
     """Perform a single download attempt with the given quality.
 
@@ -337,6 +386,8 @@ def _perform_download(
         progress_callback=progress_callback,
         log_callback=log_callback,
         preserve_native_format=True,
+        format_selector=format_selector,
+        extractor_args=extractor_args,
     )
 
     import yt_dlp
@@ -411,6 +462,83 @@ def _perform_download(
     return uploaded_file, title, uploaded_file.stat().st_size
 
 
+def _perform_download_with_fallback(
+    url: str,
+    project_id: str,
+    *,
+    quality: str,
+    cookies_path: Optional[Path],
+    max_filesize: int,
+    max_download_duration: Optional[int],
+    progress_callback: Optional[ProgressCallback],
+    log_callback: Optional[LogCallback],
+) -> tuple[Path, Optional[str], int]:
+    """Download, retrying with alternate clients/360p when media URLs 403."""
+    import yt_dlp
+
+    project_manager = ProjectManager(project_id)
+
+    def attempt(**overrides: object) -> tuple[Path, Optional[str], int]:
+        return _perform_download(
+            url,
+            project_id,
+            quality=quality,
+            cookies_path=cookies_path,
+            max_filesize=max_filesize,
+            max_download_duration=max_download_duration,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+            **overrides,
+        )
+
+    try:
+        return attempt()
+    except yt_dlp.utils.DownloadError as exc:
+        if not _is_forbidden_error(str(exc)):
+            raise
+
+    _clear_uploads(project_manager)
+    if log_callback:
+        if _is_youtube_url(url):
+            log_callback(
+                "YouTube rejected the media stream (HTTP 403). "
+                "Retrying with an alternate player client...",
+                "warning",
+            )
+        else:
+            log_callback(
+                "The video server rejected the media stream (HTTP 403). "
+                "Retrying download...",
+                "warning",
+            )
+    if progress_callback:
+        progress_callback(0, "Retrying download...")
+
+    alternate_args = (
+        ALTERNATE_YOUTUBE_EXTRACTOR_ARGS if _is_youtube_url(url) else None
+    )
+    try:
+        return attempt(extractor_args=alternate_args)
+    except yt_dlp.utils.DownloadError as exc:
+        if not _is_forbidden_error(str(exc)) or not _is_youtube_url(url):
+            raise
+
+    _clear_uploads(project_manager)
+    if log_callback:
+        log_callback(
+            "Alternate extraction also returned HTTP 403; falling back to "
+            "the 360p compatibility stream...",
+            "warning",
+        )
+    if progress_callback:
+        progress_callback(0, "Retrying in 360p compatibility mode...")
+
+    return attempt(
+        format_selector=COMPATIBILITY_FORMAT,
+        extractor_args=COMPATIBILITY_YOUTUBE_EXTRACTOR_ARGS,
+    )
+
+
 def download_video_from_url(
     url: str,
     project_id: str,
@@ -441,9 +569,7 @@ def download_video_from_url(
     pm.ensure_directories()
 
     # Clear existing uploads to keep a single source video per project
-    for existing_file in pm.uploads_dir.iterdir():
-        if existing_file.is_file():
-            existing_file.unlink()
+    _clear_uploads(pm)
 
     try:
         import yt_dlp
@@ -462,7 +588,7 @@ def download_video_from_url(
 
     for attempt_quality in qualities_to_try:
         try:
-            uploaded_file, title, file_size = _perform_download(
+            uploaded_file, title, file_size = _perform_download_with_fallback(
                 url,
                 project_id,
                 quality=attempt_quality,
@@ -483,9 +609,7 @@ def download_video_from_url(
             last_error = error_msg
 
             # Clean up partial downloads before retry
-            for f in pm.uploads_dir.iterdir():
-                if f.is_file():
-                    f.unlink()
+            _clear_uploads(pm)
 
             is_format_error = "Requested format is not available" in error_msg
             if is_format_error and attempt_quality != "best" and len(qualities_to_try) > 1:
@@ -495,22 +619,22 @@ def download_video_from_url(
                     progress_callback(0, f"Quality '{attempt_quality}' unavailable, trying best...")
                 continue
 
-            detail = _map_download_error(error_msg, attempt_quality)
+            detail = _map_download_error(error_msg, attempt_quality, url=url)
             raise VideoDownloadError(detail) from exc
         except VideoDownloadError:
             raise
         except Exception as exc:
-            for f in pm.uploads_dir.iterdir():
-                if f.is_file():
-                    f.unlink()
+            _clear_uploads(pm)
             raise VideoDownloadError(f"Failed to download video: {exc}") from exc
 
     # Should not reach here, but guard just in case
-    detail = _map_download_error(last_error or "Unknown error", quality)
+    detail = _map_download_error(last_error or "Unknown error", quality, url=url)
     raise VideoDownloadError(detail)
 
 
-def _map_download_error(error_msg: str, quality: str) -> str:
+def _map_download_error(
+    error_msg: str, quality: str, url: Optional[str] = None
+) -> str:
     """Map a yt-dlp DownloadError message to a user-friendly detail."""
     if "Private video" in error_msg:
         return "This video is private"
@@ -524,6 +648,16 @@ def _map_download_error(error_msg: str, quality: str) -> str:
         return f"Selected quality '{quality}' is not available for this video"
     if "Sign in to confirm" in error_msg:
         return "YouTube requires sign-in. Provide valid cookies to download."
+    if _is_forbidden_error(error_msg):
+        if url and _is_youtube_url(url):
+            return (
+                "YouTube denied the download (HTTP 403). "
+                "Please retry later or refresh cookies."
+            )
+        return (
+            "The video server denied the download (HTTP 403). "
+            "Please retry later."
+        )
     return f"Failed to download video: {error_msg}"
 
 

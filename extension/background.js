@@ -21,12 +21,23 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'sync_cookies') {
-    const serverUrl = request.serverUrl;
-    
-    // Fallback to saved apiToken in storage if not explicitly provided
-    chrome.storage.local.get(['apiToken'], (result) => {
-      const apiToken = request.apiToken || result.apiToken || '';
-      
+    // Always use the configured server. Never trust a server URL supplied by
+    // the page event, otherwise any website could exfiltrate YouTube cookies.
+    chrome.storage.local.get(['serverUrl', 'apiToken'], (result) => {
+      const defaultServerUrl = (typeof DEFAULT_CONFIG !== 'undefined' && DEFAULT_CONFIG.serverUrl) || 'http://localhost:8000';
+      const defaultApiToken = (typeof DEFAULT_CONFIG !== 'undefined' && DEFAULT_CONFIG.apiToken) || '';
+      const configuredServerUrl = result.serverUrl || defaultServerUrl;
+      const apiToken = result.apiToken || defaultApiToken || '';
+
+      let serverUrl;
+      try {
+        const parsedServerUrl = new URL(configuredServerUrl);
+        serverUrl = `${parsedServerUrl.origin}${parsedServerUrl.pathname.replace(/\/+$/, '')}`;
+      } catch (err) {
+        sendResponse({ success: false, error: `Invalid DubbLM server URL: ${configuredServerUrl}` });
+        return;
+      }
+
       // Get cookies for YouTube
       chrome.cookies.getAll({ domain: '.youtube.com' }, (cookies) => {
         if (!cookies || cookies.length === 0) {

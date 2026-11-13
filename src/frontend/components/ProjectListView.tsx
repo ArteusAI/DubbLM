@@ -167,9 +167,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
         if (isExtensionInstalled) {
           console.log('Cookie error detected, requesting automatic cookie sync from extension...');
           setHasAttemptedAutoSync(true);
-          window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_COOKIES', { 
-            detail: { serverUrl: window.location.origin } 
-          }));
+          window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_COOKIES'));
         }
       }
     } else {
@@ -662,7 +660,7 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
                   onClick={(e) => e.stopPropagation()}
                 >
                   {PRESETS.map((preset) => {
-                    const isPresetSelected = (project.config.preset || 'hq') === preset.id;
+                    const isPresetSelected = (project.config.preset || 'ultra') === preset.id;
                     return (
                       <button
                         key={preset.id}
@@ -685,8 +683,8 @@ const ProjectCard: React.FC<ProjectCardProps> = ({
               {/* Show current preset badge when processing or done */}
               {(processing || uploading || project.status === 'dubbed') && (
                 <span className="text-xs text-zinc-500 flex items-center gap-1">
-                  {PRESETS.find(p => p.id === (project.config.preset || 'hq'))?.icon}
-                  {PRESETS.find(p => p.id === (project.config.preset || 'hq'))?.name}
+                  {PRESETS.find(p => p.id === (project.config.preset || 'ultra'))?.icon}
+                  {PRESETS.find(p => p.id === (project.config.preset || 'ultra'))?.name}
                 </span>
               )}
             </div>
@@ -744,6 +742,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
   onDeleteProject,
   onBatchUpload,
   onDownloadFromUrl,
+  onRetryDownload,
   onAutoProcess,
   onStopProcess,
   onResetAndRestart,
@@ -835,9 +834,7 @@ export const ProjectListView: React.FC<ProjectListViewProps> = ({
       window.addEventListener('DUBBLM_SYNC_SUCCESS', handleSuccess);
       window.addEventListener('DUBBLM_SYNC_ERROR', handleError);
       
-      window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_COOKIES', { 
-        detail: { serverUrl: window.location.origin } 
-      }));
+      window.dispatchEvent(new CustomEvent('DUBBLM_SYNC_COOKIES'));
     });
   };
 

@@ -397,8 +397,14 @@ def best_voice_for_profile(
     profile: SpeakerReferenceProfile,
     voice_matcher: Any,
     exclude_voices: Optional[Sequence[str]] = None,
+    candidate_voices: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
-    """Pick the closest prebuilt voice for a speaker profile."""
+    """Pick the closest prebuilt voice for a speaker profile.
+
+    ``candidate_voices`` restricts the search to a shortlist (used by the
+    voice advice of the delivery analysis); ``exclude_voices`` removes
+    voices that are already taken or blocked.
+    """
     if profile is None:
         return None
     if voice_matcher is not None and getattr(voice_matcher, "sample_embeddings", None):
@@ -407,6 +413,7 @@ def best_voice_for_profile(
                 voice = voice_matcher.find_best_matching_voice_multi_segment(
                     profile.clip_embeddings,
                     exclude_voices=list(exclude_voices) if exclude_voices else None,
+                    candidate_voices=list(candidate_voices) if candidate_voices else None,
                 )
                 if voice:
                     return voice
@@ -416,8 +423,15 @@ def best_voice_for_profile(
             best_voice = None
             best_similarity = -1.0
             excluded = {str(v).strip().lower() for v in (exclude_voices or [])}
+            allowed = (
+                {str(v).strip().lower() for v in candidate_voices}
+                if candidate_voices
+                else None
+            )
             for voice_name, embedding in voice_matcher.sample_embeddings.items():
                 if voice_name.lower() in excluded:
+                    continue
+                if allowed is not None and voice_name.lower() not in allowed:
                     continue
                 similarity = cosine_similarity(profile.centroid, np.asarray(embedding, dtype=np.float64))
                 if similarity > best_similarity:

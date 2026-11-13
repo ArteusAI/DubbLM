@@ -1,6 +1,3 @@
-from typing import Optional, Dict, Any, Union
-import os
-
 from src.translation.translation_interface import TranslationInterface
 from src.translation.llm_translator import LLMTranslator
 
@@ -33,7 +30,7 @@ class TranslatorFactory:
         """
         if translator_type == "llm":
             # Get LLM provider (gemini or openrouter)
-            llm_provider = kwargs.get("llm_provider", "gemini")
+            llm_provider = kwargs.get("llm_provider", "openrouter")
             cost_tracker = kwargs.get("cost_tracker")
             
             # Get translation model configuration parameters
@@ -60,6 +57,7 @@ class TranslatorFactory:
             cache_manager = kwargs.get("cache_manager")
 
             enable_emotion_enrichment = kwargs.get("enable_emotion_enrichment", False)
+            enable_video_emotion_analysis = kwargs.get("enable_video_emotion_analysis", False)
             enable_llm_editor = kwargs.get("enable_llm_editor", False)
             editor_llm_provider = kwargs.get("editor_llm_provider")
             editor_model_name = kwargs.get("editor_model_name")
@@ -71,6 +69,7 @@ class TranslatorFactory:
             
             # Segment stretch mode for alternative version generation
             segment_stretch = kwargs.get("segment_stretch", "audio_and_video")
+            creative_recovery_variants = kwargs.get("creative_recovery_variants", False)
             
             translator = LLMTranslator(
                 llm_provider=llm_provider,
@@ -87,7 +86,9 @@ class TranslatorFactory:
                 cache_manager=cache_manager,
                 cost_tracker=cost_tracker,
                 enable_emotion_enrichment=enable_emotion_enrichment,
+                enable_video_emotion_analysis=enable_video_emotion_analysis,
                 segment_stretch=segment_stretch,
+                creative_recovery_variants=creative_recovery_variants,
                 enable_llm_editor=enable_llm_editor,
                 editor_llm_provider=editor_llm_provider,
                 editor_model_name=editor_model_name,

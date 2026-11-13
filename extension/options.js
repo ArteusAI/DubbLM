@@ -11,7 +11,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Save settings
   document.getElementById('saveBtn').addEventListener('click', () => {
-    const serverUrl = document.getElementById('serverUrl').value.trim();
+    let serverUrl = document.getElementById('serverUrl').value.trim().replace(/\/+$/, '');
+    if (serverUrl && !/^https?:\/\//i.test(serverUrl)) {
+      serverUrl = `http://${serverUrl}`;
+    }
     const apiToken = document.getElementById('apiToken').value.trim();
     const statusDiv = document.getElementById('status');
 

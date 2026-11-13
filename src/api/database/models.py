@@ -148,6 +148,13 @@ class Segment(Base):
     original_text = Column(Text, nullable=False)
     translated_text = Column(Text, nullable=True)
     
+    # Delivery analysis (video+audio emotion analysis).
+    # `emotion` is a canonical label (e.g. "tense"), `emotion_direction` is a
+    # short director's note mixed into the TTS instruction.
+    emotion = Column(String(32), nullable=True)
+    emotion_intensity = Column(Float, nullable=True)
+    emotion_direction = Column(String(256), nullable=True)
+
     # TTS settings
     voice_id = Column(String(64), nullable=True)
     provider = Column(SQLEnum(TTSProvider), nullable=True)
@@ -174,6 +181,9 @@ class Segment(Base):
             "endTime": self.end_time,
             "originalText": self.original_text,
             "translatedText": self.translated_text,
+            "emotion": self.emotion,
+            "emotionIntensity": self.emotion_intensity,
+            "emotionDirection": self.emotion_direction,
             "voiceId": self.voice_id,
             "provider": self.provider.value if self.provider else None,
             "ttsPrompt": self.tts_prompt,

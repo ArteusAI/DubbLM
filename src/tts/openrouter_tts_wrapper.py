@@ -1,20 +1,37 @@
-from typing import Optional, Dict, Any, List, Union, Sequence
+from typing import Optional, Dict, Any, Iterable, List, Union, Sequence
+import base64
+import mimetypes
 import os
+import re
 import time
 import tempfile
 import shutil
 import hashlib
 from pathlib import Path
 
+import requests
+
 from .models import TTSSegmentData, SegmentAlignment, DiarizationSegment, SegmentSynthesisReport
 from .voice_sample_manager import VoiceSampleManager, AudioValidator
 from .openrouter_voice_catalog import (
     ALL_OPENROUTER_VOICES,
+    FISH_BLOCKED_VOICES,
+    FISH_VOICE_META,
     OPENROUTER_VOICE_META,
     default_voice_for,
+    filter_fish_voices,
+    fish_voice_meta,
+    fish_voice_profile,
+    is_fish_drama_tts_model,
+    is_fish_voice_id,
     is_qwen_tts_model,
+    is_voiceless_tts_model,
     max_char_limit_for_model,
     voices_for_model,
+)
+from src.utils.speaker_gender import (
+    build_effective_speaker_gender_map,
+    normalize_speaker_metadata_map,
 )
 from .qwen_emotion import (
     QwenEmotionEnricher,
@@ -27,6 +44,8 @@ from .qwen_emotion import (
     style_prompt_to_instruction,
 )
 from src.tts.tts_interface import TTSInterface
+from src.tts.voice_clone_reference import VoiceCloneReference
+from src.tts.voice_advisor import profile_for_speaker, rank_voices_by_profile
 from src.utils.sent_split import greedy_sent_split
 from src.utils.audio_embedder import AudioEmbedder
 from src.utils.voice_matcher import VoiceMatcher
@@ -52,6 +71,7 @@ OPENROUTER_TTS_MODELS = [
     "qwen/qwen-audio-3.0-tts-flash",
     "qwen/qwen-audio-3.0-tts-plus",
     "x-ai/grok-voice-tts-1.0",
+    "fish-audio/drama-3",
 ]
 
 DEFAULT_SAMPLES_DIR = (Path(__file__).parent / "samples" / "openrouter").resolve()
@@ -64,6 +84,139 @@ Let me share some interesting facts about science and nature with you.
 
 MAX_CHAR_LIMIT = 2000  # Qwen default; use max_char_limit_for_model() at runtime
 
+# Speech requests without a voice are issued directly: the OpenAI client always
+# sends a `voice` field, which some models reject with HTTP 400.
+SPEECH_REQUEST_TIMEOUT_SECONDS = 600
+
+
+class VoiceCloneRequestError(RuntimeError):
+    """OpenRouter rejected a stateless voice-cloning request."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code or 0)
+
+# --- Drama 3 (Fish Audio) direction handling -------------------------------
+# A leading direction is a plain-language note in square brackets. Drama 3
+# never reads it aloud, so it is safe to keep and to merge into one note.
+_DRAMA_LEADING_DIRECTION_RE = re.compile(r"^\s*\[([^\[\]]+)\]\s*")
+# Filler tags turn into audible words in Drama 3 ("[uhm]" -> "Um").
+_DRAMA_FILLER_TAG_RE = re.compile(r"\[(?:uhm|um|uh|erm|hmm)\]", re.IGNORECASE)
+# "Speak in a calm, authoritative voice" -> "calm, authoritative voice"
+_DRAMA_STYLE_PREFIX_RE = re.compile(
+    r"^(?:speak|read|say|deliver|perform|render)\s+"
+    r"(?:this|the\s+following(?:\s+line)?)?\s*"
+    r"(?:aloud\s+)?"
+    r"(?:in|with|as)\s+"
+    r"(?:a|an|the)?\s*",
+    re.IGNORECASE,
+)
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+DRAMA_MAX_DIRECTION_CHARS = 220
+DRAMA_MAX_STYLE_PROMPT_CHARS = 120
+DRAMA_MAX_NOTE_CHARS = 90
+DRAMA_NEUTRAL_EMOTIONS = {"", "none", "n/a", "na", "neutral", "normal", "default"}
+
+
+def _drama_emotion_direction(emotion: Optional[str]) -> str:
+    """Turn a pipeline emotion label into a Drama 3 direction fragment."""
+    if not emotion:
+        return ""
+    label = re.sub(r"\s+", " ", str(emotion).strip().lower())
+    if not label or label in DRAMA_NEUTRAL_EMOTIONS:
+        return ""
+    return label
+
+
+def _drama_style_direction(style_prompt: Optional[str]) -> str:
+    """Turn a style prompt into a Drama 3 direction fragment."""
+    if not style_prompt:
+        return ""
+    cleaned = str(style_prompt).strip()
+    if not cleaned:
+        return ""
+    cleaned = _DRAMA_STYLE_PREFIX_RE.sub("", cleaned).strip()
+    cleaned = cleaned.rstrip(":").strip()
+    cleaned = cleaned.rstrip(".").strip()
+    if len(cleaned) > DRAMA_MAX_STYLE_PROMPT_CHARS and ":" in cleaned:
+        # Long prompts (e.g. the "news" style) end with the actual delivery
+        # instruction after a colon - keep that part only.
+        cleaned = cleaned.rsplit(":", 1)[-1].strip()
+    return cleaned
+
+
+def _drama_note_direction(note: Optional[str]) -> str:
+    """Turn the director's note from the emotion analysis into a direction.
+
+    The note comes from the video+audio analysis and describes the delivery
+    (tone, pace, volume, breath). It is merged into the single leading
+    direction, so it must not contain brackets or quotes.
+    """
+    if not note:
+        return ""
+    cleaned = re.sub(r"[\[\]{}<>]", " ", str(note))
+    cleaned = re.sub(r"[\"“”«»']", "", cleaned)
+    cleaned = _MULTI_SPACE_RE.sub(" ", cleaned).strip(" ,.;:-")
+    if not cleaned:
+        return ""
+    if len(cleaned) > DRAMA_MAX_NOTE_CHARS:
+        cleaned = cleaned[:DRAMA_MAX_NOTE_CHARS]
+        cut = cleaned.rfind(" ")
+        if cut > 20:
+            cleaned = cleaned[:cut]
+    return cleaned.strip(" ,.;:-")
+
+
+def _limit_drama_voice_samples(voice_ids: List[str], limit: int = 8) -> List[str]:
+    """Keep the sample/embedding set small: verified voices first, then popular."""
+    verified = [voice_id for voice_id in voice_ids if voice_id in FISH_VOICE_META]
+    rest = [voice_id for voice_id in voice_ids if voice_id not in FISH_VOICE_META]
+    return (verified + rest)[:limit]
+
+
+def _balanced_drama_voice_samples(
+    voice_ids: List[str],
+    language: str,
+    limit: int = 8,
+    blocked: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Sample pool for voice matching: native, adult, gender balanced.
+
+    Both genders need samples, otherwise a speaker of one gender has almost
+    no candidates left once the gender filter is applied.
+    """
+    blocked_ids = {str(item).strip().lower() for item in (blocked or []) if str(item).strip()}
+    meta = fish_voice_meta(language=language)
+    male: List[str] = []
+    female: List[str] = []
+    other: List[str] = []
+    for voice_id in voice_ids:
+        if voice_id.strip().lower() in blocked_ids or voice_id in FISH_BLOCKED_VOICES:
+            continue
+        profile = meta.get(voice_id) or {}
+        if not profile.get("native"):
+            continue
+        if profile.get("age") in ("child", "teen"):
+            continue
+        if profile.get("character"):
+            continue
+        gender = str(profile.get("gender") or "").strip().lower()
+        if gender == "male":
+            male.append(voice_id)
+        elif gender == "female":
+            female.append(voice_id)
+        else:
+            other.append(voice_id)
+
+    per_gender = max(1, limit // 2)
+    selected = male[:per_gender] + female[:per_gender]
+    if len(selected) < limit:
+        selected += other[: limit - len(selected)]
+    if not selected:
+        # No native voices available (e.g. offline) - fall back to any voice.
+        return _limit_drama_voice_samples(voice_ids, limit)
+    return selected
+
 
 class OpenRouterTTSWrapper(TTSInterface):
     """OpenRouter TTS via OpenAI-compatible /audio/speech endpoint."""
@@ -74,6 +227,7 @@ class OpenRouterTTSWrapper(TTSInterface):
         default_voice: Optional[str] = None,
         embedding_model_device: Optional[str] = None,
         enable_voice_matching: bool = True,
+        enable_voice_cloning: bool = False,
         cost_tracker: Optional[Any] = None,
         target_language: Optional[str] = None,
         enable_audio_validation: bool = True,
@@ -92,6 +246,10 @@ class OpenRouterTTSWrapper(TTSInterface):
         content_validator_whisper_model: str = "base",
         content_validator_whisper_compute_type: str = "int8",
         content_validator_whisper_cpu_threads: int = 2,
+        speaker_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+        blocked_voices: Optional[List[str]] = None,
+        speaker_voice_profiles: Optional[Dict[str, Any]] = None,
+        voice_advice_max_candidates: int = 8,
         **kwargs: Any
     ):
         if not OPENAI_AVAILABLE:
@@ -105,6 +263,9 @@ class OpenRouterTTSWrapper(TTSInterface):
         self.client: Optional[OpenAI] = None
         self.voice_mapping: Dict[str, str] = {}
         self.voice_prompt_mapping: Dict[str, str] = {}
+        # Voice advice from the delivery analysis (timbre, age, energy, accent).
+        self.speaker_voice_profiles: Dict[str, Any] = dict(speaker_voice_profiles or {})
+        self.voice_advice_max_candidates = max(1, int(voice_advice_max_candidates or 8))
         self._audio_cache: Dict[str, tuple[str, float]] = {}
         self._cache_dir: Optional[str] = None
         self.cost_tracker = cost_tracker
@@ -124,16 +285,26 @@ class OpenRouterTTSWrapper(TTSInterface):
         self.min_fade_db = min_fade_db
         self.fade_detection_percentile = fade_detection_percentile
 
+        self.enable_voice_cloning = bool(enable_voice_cloning) and self._is_drama3()
+        if self.enable_voice_cloning:
+            # Stateless cloning supplies the voice directly. Voice matching
+            # would only build an unnecessary library of samples and could pin
+            # a different library voice behind the user's back.
+            enable_voice_matching = False
         self.enable_voice_matching = enable_voice_matching
         self.embedding_model_device = embedding_model_device
         self.audio_embedder: Optional[AudioEmbedder] = None
         self.voice_matcher: Optional[VoiceMatcher] = None
         self.voice_sample_manager: Optional[VoiceSampleManager] = None
+        self._voice_clone_references: Dict[str, VoiceCloneReference] = {}
+        self._voice_clone_references_by_voice: Dict[str, VoiceCloneReference] = {}
+        self._voice_clone_disabled_speakers: set[str] = set()
+        self._voice_clone_data_uris: Dict[str, str] = {}
 
         # Emotion enrichment (Qwen demo tags + NL prefixes in input text).
         self.enable_emotion_enrichment = bool(enable_emotion_enrichment)
         self.enable_llm_editor = bool(enable_llm_editor)
-        self.emotion_enrichment_model = emotion_enrichment_model or "gemini-2.5-pro"
+        self.emotion_enrichment_model = emotion_enrichment_model or "~google/gemini-flash-latest"
         self.emotion_enrichment_temperature = (
             float(emotion_enrichment_temperature)
             if emotion_enrichment_temperature is not None
@@ -148,11 +319,338 @@ class OpenRouterTTSWrapper(TTSInterface):
         self.content_validator_whisper_cpu_threads = content_validator_whisper_cpu_threads
         self._content_validator = None
 
+        # Speaker gender metadata (inferred during transcription). Used to keep
+        # auto-selected voices on the speaker's gender.
+        self.speaker_metadata = normalize_speaker_metadata_map(speaker_metadata)
+        self.speaker_genders = build_effective_speaker_gender_map(self.speaker_metadata)
+
+        # Voices the user does not want to hear (project level block list).
+        self.blocked_voices = {
+            str(item).strip().lower()
+            for item in (blocked_voices or [])
+            if str(item).strip()
+        }
+
+    def _is_blocked_voice(self, voice_name: Optional[str]) -> bool:
+        """True when a voice must not be used (project level block list).
+
+        The global list (``FISH_BLOCKED_VOICES``) only prevents automatic
+        selection - those voices stay assignable by hand. A voice the user
+        banned for the project is never used, not even manually.
+        """
+        key = str(voice_name or "").strip().lower()
+        if not key:
+            return False
+        return key in self.blocked_voices
+
+    def _get_effective_speaker_gender(self, speaker_id: Optional[str]) -> str:
+        """Gender of a speaker as inferred by the pipeline ('' when unknown)."""
+        normalized = str(speaker_id or "").strip()
+        if not normalized:
+            return ""
+        return self.speaker_genders.get(normalized, "")
+
+    def _default_voice_for_speaker(self, speaker_id: Optional[str]) -> str:
+        """Default voice that matches the speaker's gender when known.
+
+        Voices that are already taken by another speaker are skipped, so two
+        characters of the same gender do not end up with the same voice when
+        the matcher is not available.
+        """
+        gender = self._get_effective_speaker_gender(speaker_id)
+        if self._is_drama3() and gender in ("male", "female"):
+            candidates = filter_fish_voices(
+                self._voices_for_model(self.model),
+                language=self.target_language,
+                gender=gender,
+                adult_only=True,
+                native_only=True,
+                allow_character=False,
+                extra_blocked=self.blocked_voices,
+            )
+            if candidates:
+                taken = {
+                    str(voice).strip().lower()
+                    for other, voice in self.voice_mapping.items()
+                    if other != speaker_id
+                }
+                for voice in candidates:
+                    if voice.strip().lower() not in taken:
+                        return voice
+                return candidates[0]
+        return self.default_voice
+
+    def _apply_voice_advice(self, candidates: List[str], speaker_id: Optional[str]) -> List[str]:
+        """Re-rank the candidate voices by the advice of the delivery analysis.
+
+        The gender / age / accent filters stay authoritative; the advice only
+        decides which of the remaining voices fits the character best. The
+        gender aware default is always kept as a safety net.
+        """
+        profile = profile_for_speaker(
+            getattr(self, "speaker_voice_profiles", None), speaker_id
+        )
+        if profile is None or not candidates:
+            return candidates
+
+        try:
+            meta = fish_voice_meta(language=self.target_language)
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.debug("Voice advice skipped: metadata unavailable (%s)", exc)
+            return candidates
+
+        keep = [self._default_voice_for_speaker(speaker_id)]
+        ranked = rank_voices_by_profile(
+            profile,
+            candidates,
+            meta.get,
+            limit=self.voice_advice_max_candidates,
+            keep_voices=keep,
+        )
+        if ranked != candidates:
+            logger.info(
+                "OpenRouter: voice advice for '%s' narrows %d candidate(s) to %d "
+                "(timbre: %s)",
+                speaker_id,
+                len(candidates),
+                len(ranked),
+                profile.timbre or profile.age or "n/a",
+            )
+        return ranked
+
+    def _candidate_voices(self, speaker_id: Optional[str]) -> List[str]:
+        """Voices that may be auto-assigned to a speaker.
+
+        The search is restricted to voices that match the speaker's gender and
+        that speak the dubbing language natively without sounding childlike.
+        Blocked voices (globally or per project) never take part. The
+        restrictions are relaxed step by step, and every relaxation is logged,
+        so a voice of the wrong gender is never picked silently.
+        """
+        if not self._is_drama3():
+            return []
+
+        voices = self._voices_for_model(self.model)
+        gender = self._get_effective_speaker_gender(speaker_id)
+        if gender not in ("male", "female"):
+            logger.warning(
+                f"OpenRouter: speaker '{speaker_id}' has no known gender; "
+                "voice matching falls back to accent and age filters only."
+            )
+
+        strict = filter_fish_voices(
+            voices,
+            language=self.target_language,
+            gender=gender or None,
+            adult_only=True,
+            native_only=True,
+            allow_character=False,
+            extra_blocked=self.blocked_voices,
+        )
+        if strict:
+            return self._apply_voice_advice(strict, speaker_id)
+
+        logger.warning(
+            f"OpenRouter: no native, adult, gender-matching voice for speaker "
+            f"'{speaker_id}' (gender={gender or 'unknown'}); relaxing filters."
+        )
+        relaxed = filter_fish_voices(
+            voices,
+            language=self.target_language,
+            gender=gender or None,
+            adult_only=True,
+            native_only=False,
+            allow_character=False,
+            extra_blocked=self.blocked_voices,
+        )
+        if relaxed:
+            return self._apply_voice_advice(relaxed, speaker_id)
+
+        return self._apply_voice_advice(
+            filter_fish_voices(
+                voices,
+                language=self.target_language,
+                gender=gender or None,
+                adult_only=False,
+                native_only=False,
+                allow_character=True,
+                extra_blocked=self.blocked_voices,
+            ),
+            speaker_id,
+        )
+
+    def _check_voice_gender_match(self, speaker_id: Optional[str], voice_name: str) -> None:
+        """Warn when a manually assigned voice does not match the speaker."""
+        if not self._is_drama3() or not voice_name:
+            return
+        gender = self._get_effective_speaker_gender(speaker_id)
+        if gender not in ("male", "female"):
+            return
+        profile = fish_voice_profile(voice_name, self.target_language)
+        voice_gender = str(profile.get("gender") or "").strip().lower()
+        if voice_gender and voice_gender != gender:
+            logger.warning(
+                f"OpenRouter: voice '{voice_name}' ({profile.get('name')}) is "
+                f"{voice_gender} but speaker '{speaker_id}' is {gender}."
+            )
+
     def _voices_for_model(self, model: Optional[str] = None) -> List[str]:
-        return voices_for_model(model or self.model)
+        return voices_for_model(model or self.model, language=self.target_language)
 
     def _uses_qwen_markup(self) -> bool:
         return is_qwen_tts_model(self.model)
+
+    def _is_voiceless(self) -> bool:
+        """Models that reject any `voice` value must be called without one."""
+        return is_voiceless_tts_model(self.model)
+
+    def _is_drama3(self) -> bool:
+        """Fish Audio Drama 3: directions in square brackets, Fish voice ids."""
+        return is_fish_drama_tts_model(self.model)
+
+    def _request_speech_bytes(
+        self,
+        chunk_text: str,
+        voice_name: str,
+        speed: float,
+        clone_reference: Optional[VoiceCloneReference] = None,
+    ) -> bytes:
+        """Return raw audio bytes for one chunk of speech."""
+        if clone_reference is not None:
+            return self._request_speech_bytes_clone(
+                chunk_text, clone_reference, speed
+            )
+        if self._is_voiceless() or not voice_name:
+            return self._request_speech_bytes_direct(chunk_text, speed)
+
+        create_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "voice": voice_name,
+            "input": chunk_text,
+            "response_format": "mp3",
+        }
+        if speed != 1.0:
+            create_kwargs["speed"] = float(speed)
+        response = self.client.audio.speech.create(**create_kwargs)
+        return response.content
+
+    def _request_speech_bytes_clone(
+        self,
+        chunk_text: str,
+        reference: VoiceCloneReference,
+        speed: float,
+    ) -> bytes:
+        """Send a stateless cloned-voice request to OpenRouter.
+
+        Drama 3's Fish endpoint accepts one audio reference.  We omit ``voice``
+        because the recording is the voice.
+        """
+        data_uri = self._reference_data_uri(reference)
+        if not data_uri:
+            raise VoiceCloneRequestError(0, "empty voice-clone reference")
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": chunk_text,
+            "response_format": "mp3",
+            "input_references": [
+                {"type": "input_audio", "input_audio": {"data": data_uri}}
+            ],
+        }
+        if reference.transcript:
+            payload["input_references"].append(
+                {"type": "text", "text": reference.transcript[:10000]}
+            )
+        if speed != 1.0:
+            payload["speed"] = float(speed)
+
+        response = requests.post(
+            f"{OPENROUTER_BASE_URL}/audio/speech",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "HTTP-Referer": "https://github.com/anomalyco/DubbLM",
+                "X-Title": "DubbLM",
+            },
+            json=payload,
+            timeout=SPEECH_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            raise VoiceCloneRequestError(
+                response.status_code,
+                f"OpenRouter voice cloning failed with status "
+                f"{response.status_code}: {response.text[:400]}",
+            )
+        return response.content
+
+    def _reference_data_uri(self, reference: VoiceCloneReference) -> str:
+        cached = self._voice_clone_data_uris.get(reference.reference_path)
+        if cached:
+            return cached
+        path = Path(reference.reference_path)
+        if not path.exists():
+            logger.warning(
+                "Voice cloning: reference file disappeared: %s",
+                reference.reference_path,
+            )
+            return ""
+        mime = mimetypes.guess_type(str(path))[0] or "audio/wav"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        data_uri = f"data:{mime};base64,{encoded}"
+        self._voice_clone_data_uris[reference.reference_path] = data_uri
+        return data_uri
+
+    def _clone_reference_for_segment(
+        self,
+        segment: TTSSegmentData,
+    ) -> Optional[VoiceCloneReference]:
+        """Resolve the clone reference for a segment, respecting overrides.
+
+        An explicit per-segment voice (the UI's manual mapping) wins over
+        cloning.  A failed speaker is disabled for the rest of the run.
+        """
+        if not self.enable_voice_cloning or not self._is_drama3():
+            return None
+        speaker = str(segment.speaker or "").strip()
+        if not speaker or speaker in self._voice_clone_disabled_speakers:
+            return None
+        explicit_voice = str(segment.voice or "").strip()
+        if explicit_voice:
+            # An explicit clone voice id may still be used, but a normal
+            # library voice mapping overrides cloning.
+            return self._voice_clone_references_by_voice.get(explicit_voice.lower())
+        return self._voice_clone_references.get(speaker)
+
+    def _request_speech_bytes_direct(self, chunk_text: str, speed: float) -> bytes:
+        """Call /audio/speech without a `voice` field.
+
+        Used for models that reject a voice and for requests where no voice is
+        known (the provider then picks its own default voice).
+        """
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": chunk_text,
+            "response_format": "mp3",
+        }
+        if speed != 1.0:
+            payload["speed"] = float(speed)
+
+        response = requests.post(
+            f"{OPENROUTER_BASE_URL}/audio/speech",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "HTTP-Referer": "https://github.com/anomalyco/DubbLM",
+                "X-Title": "DubbLM",
+            },
+            json=payload,
+            timeout=SPEECH_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"OpenRouter TTS request failed with status {response.status_code}: "
+                f"{response.text[:400]}"
+            )
+        return response.content
 
     def _max_char_limit(self) -> int:
         return max_char_limit_for_model(self.model)
@@ -204,6 +702,23 @@ class OpenRouterTTSWrapper(TTSInterface):
         self.voice_prompt_mapping = mapping
         logger.debug(f"OpenRouter voice prompt mapping set: {len(mapping)} entries.")
 
+    def set_voice_clone_references(
+        self,
+        references: Dict[str, VoiceCloneReference],
+    ) -> None:
+        """Attach clean speaker references for stateless voice cloning."""
+        self._voice_clone_references = {
+            str(speaker): reference
+            for speaker, reference in (references or {}).items()
+            if speaker and reference is not None
+        }
+        self._voice_clone_data_uris.clear()
+        self._voice_clone_disabled_speakers.clear()
+        logger.info(
+            "OpenRouter voice cloning: %d speaker reference(s) attached",
+            len(self._voice_clone_references),
+        )
+
     def _validate_voice_name(self, voice_name: str) -> str:
         fallback = (
             self.default_voice
@@ -213,13 +728,27 @@ class OpenRouterTTSWrapper(TTSInterface):
         if not voice_name:
             return fallback
 
+        if self._is_voiceless():
+            # Any voice value is rejected by the provider (HTTP 400).
+            return ""
+
         allowed = self._voices_for_model(self.model)
         normalized = {v.lower(): v for v in allowed}
         all_normalized = {v.lower(): v for v in ALL_OPENROUTER_VOICES}
 
         key = voice_name.strip().lower()
         if key in normalized:
+            if self._is_blocked_voice(key):
+                logger.warning(
+                    f"Voice '{voice_name}' is blocked and will not be used. "
+                    f"Using '{fallback}' instead."
+                )
+                return fallback
             return normalized[key]
+        if self._is_drama3() and is_fish_voice_id(key):
+            # Fish voice ids are opaque 32-char hashes. A voice that is not in
+            # the curated list may still be a valid (e.g. user cloned) voice.
+            return key
         if key in all_normalized:
             logger.warning(
                 f"Voice '{voice_name}' is for another OpenRouter TTS model. "
@@ -248,7 +777,8 @@ class OpenRouterTTSWrapper(TTSInterface):
             )
             self._cache_dir = tempfile.mkdtemp(prefix="openrouter_tts_cache_")
             logger.info(
-                f"OpenRouter TTS initialized with model: {self.model}, default voice: {self.default_voice}"
+                f"OpenRouter TTS initialized with model: {self.model}, "
+                f"default voice: {self.default_voice or '<provider default>'}"
             )
 
             if self.enable_emotion_enrichment and not self._uses_qwen_markup():
@@ -305,12 +835,30 @@ class OpenRouterTTSWrapper(TTSInterface):
                     logger.warning(f"Content validator unavailable for OpenRouter TTS: {exc}")
                     self._content_validator = None
 
+            if self.enable_voice_matching and self._is_voiceless():
+                logger.info(
+                    f"OpenRouter model '{self.model}' does not support voice selection; "
+                    "disabling voice matching."
+                )
+                self.enable_voice_matching = False
+
             if self.enable_voice_matching:
                 try:
                     # Only match/pin against voices supported by the active model.
                     # MP3 samples for other OpenRouter Qwen models may already exist on disk
                     # and will be used when that model is selected.
                     current_model_voices = self._voices_for_model(self.model)
+                    if self._is_drama3():
+                        # The Fish library holds 1000+ voices; rendering a sample
+                        # for each of them would be far too slow. The pool is
+                        # also gender balanced so the gender filter always has
+                        # candidates on both sides.
+                        current_model_voices = _balanced_drama_voice_samples(
+                            current_model_voices,
+                            self.target_language,
+                            limit=min(len(current_model_voices), 24),
+                            blocked=self.blocked_voices,
+                        )
 
                     self.audio_embedder = AudioEmbedder(device=self.embedding_model_device)
                     self.voice_matcher = VoiceMatcher(
@@ -368,19 +916,21 @@ class OpenRouterTTSWrapper(TTSInterface):
         if not self.is_available():
             raise RuntimeError("OpenRouter TTS not initialized.")
 
+        speaker_default = self._default_voice_for_speaker(speaker_id)
+
         if not self.enable_voice_matching or not self.voice_matcher:
-            return self.voice_mapping.get(speaker_id, self.default_voice)
+            return self.voice_mapping.get(speaker_id, speaker_default)
 
         if not force_search and speaker_id in self.voice_mapping:
             return self.voice_mapping[speaker_id]
 
         if not reference_audio_path:
-            return self.default_voice
+            return self._pin_default_voice(speaker_id, speaker_default)
 
         ref_path = Path(reference_audio_path)
         if not ref_path.exists():
             logger.warning(f"Reference audio file not found: {reference_audio_path}. Using default.")
-            return self.default_voice
+            return self._pin_default_voice(speaker_id, speaker_default)
 
         reference_embeddings = self.voice_matcher.extract_multiple_embeddings(
             ref_path,
@@ -388,31 +938,53 @@ class OpenRouterTTSWrapper(TTSInterface):
             segment_duration_ms=3000,
         )
         if not reference_embeddings:
-            return self.default_voice
+            return self._pin_default_voice(speaker_id, speaker_default)
 
+        # Restrict the search to voices that fit the speaker (gender, age,
+        # accent) so a male speaker is never given a female voice.
+        candidates = self._candidate_voices(speaker_id)
         best_match_voice = self.voice_matcher.find_best_matching_voice_multi_segment(
             reference_embeddings,
             exclude_voices=exclude_voices,
+            candidate_voices=candidates or None,
         )
         if best_match_voice:
             self.voice_mapping[speaker_id] = best_match_voice
-            logger.info(f"Matched and pinned speaker '{speaker_id}' to voice '{best_match_voice}'")
+            logger.info(
+                f"Matched and pinned speaker '{speaker_id}' to voice "
+                f"'{best_match_voice}'"
+            )
             return best_match_voice
 
-        return self.default_voice
+        logger.warning(
+            f"OpenRouter: no voice matched speaker '{speaker_id}'; "
+            f"using default voice '{speaker_default}'."
+        )
+        # Pin the default as well: the next speaker then gets a different
+        # voice and the picked voices can be shown in the report.
+        return self._pin_default_voice(speaker_id, speaker_default)
+
+    def _pin_default_voice(self, speaker_id: Optional[str], voice: str) -> str:
+        """Pin the fallback voice so every speaker ends up with its own voice."""
+        if speaker_id and voice:
+            self.voice_mapping[str(speaker_id)] = voice
+        return voice
 
     def _get_cache_key(
         self,
         segment_data: TTSSegmentData,
         language: str,
         speech_text: Optional[str] = None,
+        clone_reference: Optional[VoiceCloneReference] = None,
     ) -> str:
-        voice_name = segment_data.voice or self.voice_mapping.get(segment_data.speaker, self.default_voice)
+        voice_name = segment_data.voice or self.voice_mapping.get(
+            segment_data.speaker, self._default_voice_for_speaker(segment_data.speaker)
+        )
         style_prompt = segment_data.style_prompt or self.voice_prompt_mapping.get(segment_data.speaker, "")
         key_data = {
             "text": speech_text if speech_text is not None else segment_data.text,
             "speaker": segment_data.speaker,
-            "voice": voice_name,
+            "voice": f"clone:{clone_reference.cache_token}" if clone_reference else voice_name,
             "style_prompt": style_prompt,
             "emotion": segment_data.emotion or "Neutral",
             "speed": segment_data.speed or 1.0,
@@ -430,6 +1002,11 @@ class OpenRouterTTSWrapper(TTSInterface):
     ) -> str:
         """Build OpenRouter input text; Qwen markup only for qwen/* models."""
         raw = segment_data.text or ""
+
+        # Drama 3 understands plain-language directions in square brackets, so
+        # its markup must survive instead of being stripped.
+        if self._is_drama3():
+            return self._prepare_drama3_speech_text(segment_data)
 
         # Grok and other non-Qwen models: plain text only (strip provider markup leaks).
         if not self._uses_qwen_markup():
@@ -478,6 +1055,59 @@ class OpenRouterTTSWrapper(TTSInterface):
             )
         return prepared
 
+    def _prepare_drama3_speech_text(self, segment_data: TTSSegmentData) -> str:
+        """Prepare Drama 3 input: keep stage directions, prepend one direction.
+
+        Drama 3 reads square-bracket content as a director's note and never
+        speaks it aloud, so bracket markup coming from the LLM editor is kept
+        as is. The segment style prompt and emotion are merged into a single
+        leading direction, e.g. ``[nervous, calm narrator] I'm fine. Really.``
+        """
+        raw = segment_data.text or ""
+        style_prompt = segment_data.style_prompt or self.voice_prompt_mapping.get(
+            segment_data.speaker, ""
+        )
+
+        # Filler tags such as [uhm] become audible words in Drama 3 ("Um"),
+        # which would change the spoken content - drop them.
+        body = _DRAMA_FILLER_TAG_RE.sub(" ", raw)
+        body = _MULTI_SPACE_RE.sub(" ", body).strip()
+
+        match = _DRAMA_LEADING_DIRECTION_RE.match(body)
+        existing = match.group(1).strip() if match else ""
+        if match:
+            body = body[match.end():].lstrip()
+
+        parts = [
+            part
+            for part in (
+                existing,
+                _drama_emotion_direction(segment_data.emotion),
+                _drama_note_direction(segment_data.emotion_note),
+                _drama_note_direction(segment_data.voice_note),
+                _drama_style_direction(style_prompt),
+            )
+            if part
+        ]
+        if not parts:
+            return body
+
+        direction = ", ".join(parts)
+        if len(direction) > DRAMA_MAX_DIRECTION_CHARS:
+            truncated = direction[:DRAMA_MAX_DIRECTION_CHARS]
+            cut = truncated.rfind(",")
+            if cut > 40:
+                truncated = truncated[:cut]
+            direction = truncated.rstrip(" ,")
+        prepared = f"[{direction}] {body}".strip()
+
+        if prepared != raw:
+            logger.debug(
+                f"Drama 3 speech text prepared for [{segment_data.speaker}]: "
+                f"'{raw[:60]}' -> '{prepared[:80]}'"
+            )
+        return prepared
+
     def _fallback_nl_only_text(self, segment_data: TTSSegmentData) -> str:
         """Strip tags; keep only NL instruction prefixes (safer if tags are spoken)."""
         plain = strip_markup_tags(segment_data.text or "")
@@ -510,6 +1140,7 @@ class OpenRouterTTSWrapper(TTSInterface):
         language: str,
         usage_tracker: Optional[Dict[str, Any]] = None,
         previous_segments: Optional[Sequence[str]] = None,
+        clone_reference: Optional[VoiceCloneReference] = None,
     ) -> None:
         if not self.client:
             raise RuntimeError("OpenRouter client not initialized.")
@@ -522,7 +1153,23 @@ class OpenRouterTTSWrapper(TTSInterface):
         speech_text = self._prepare_speech_text(segment_data, previous_segments=previous_segments)
         used_tag_fallback = False
 
-        cache_key = self._get_cache_key(segment_data, language, speech_text=speech_text)
+        # Resolve the voice up front so every telemetry entry carries it.
+        speaker_id = segment_data.speaker
+        if clone_reference is not None:
+            voice_name = f"clone:{speaker_id}"
+        else:
+            voice_name = segment_data.voice or self.voice_mapping.get(
+                speaker_id, self._default_voice_for_speaker(speaker_id)
+            )
+            voice_name = self._validate_voice_name(voice_name)
+            self._check_voice_gender_match(speaker_id, voice_name)
+
+        cache_key = self._get_cache_key(
+            segment_data,
+            language,
+            speech_text=speech_text,
+            clone_reference=clone_reference,
+        )
         if cache_key in self._audio_cache:
             cached_path, _ = self._audio_cache[cache_key]
             if os.path.exists(cached_path):
@@ -539,12 +1186,9 @@ class OpenRouterTTSWrapper(TTSInterface):
                     duration_seconds=time.perf_counter() - synth_start_ts,
                     output_path=temp_output_path,
                     group_id=report_group_id,
+                    voice=voice_name,
                 ))
                 return
-
-        speaker_id = segment_data.speaker
-        voice_name = segment_data.voice or self.voice_mapping.get(speaker_id, self.default_voice)
-        voice_name = self._validate_voice_name(voice_name)
 
         logger.debug(
             f"  TTS Synthesis for [{speaker_id}]: voice={voice_name}, model={self.model}, "
@@ -583,17 +1227,14 @@ class OpenRouterTTSWrapper(TTSInterface):
                     for attempt in range(max_attempts):
                         try:
                             speed = segment_data.speed if segment_data.speed and segment_data.speed > 0 else 1.0
-                            create_kwargs: Dict[str, Any] = {
-                                "model": self.model,
-                                "voice": voice_name,
-                                "input": chunk_text,
-                                "response_format": "mp3",
-                            }
-                            if speed != 1.0:
-                                create_kwargs["speed"] = float(speed)
-
-                            response = self.client.audio.speech.create(**create_kwargs)
-                            response.write_to_file(chunk_file_path)
+                            audio_bytes = self._request_speech_bytes(
+                                chunk_text,
+                                voice_name,
+                                speed,
+                                clone_reference=clone_reference,
+                            )
+                            with open(chunk_file_path, "wb") as chunk_file:
+                                chunk_file.write(audio_bytes)
                             self._register_usage(
                                 usage_tracker,
                                 self.model,
@@ -602,6 +1243,8 @@ class OpenRouterTTSWrapper(TTSInterface):
                             segment_audio_files.append(chunk_file_path)
                             break
                         except Exception as chunk_exc:
+                            if isinstance(chunk_exc, VoiceCloneRequestError):
+                                raise
                             logger.error(
                                 f"    OpenRouter: Attempt {attempt + 1}/{max_attempts} "
                                 f"for chunk {i + 1} failed: {chunk_exc}"
@@ -651,8 +1294,17 @@ class OpenRouterTTSWrapper(TTSInterface):
                     "min_fade_db": self.min_fade_db,
                     "percentile": self.fade_detection_percentile,
                 }
+                # A one-word line is legitimately shorter than the generic
+                # one-second floor.  Otherwise the validator rejects a good
+                # short take and the retries can end up as a long silent file.
+                plain_attempt = strip_markup_tags(attempt_text or "")
+                expected_min_duration = max(
+                    0.25,
+                    min(1.0, len(plain_attempt) / 12.0),
+                )
                 is_valid, reason, silence_ratio = AudioValidator.validate_audio_sample(
                     temp_attempt_path,
+                    expected_min_duration=expected_min_duration,
                     max_silence_ratio=self.max_silence_ratio,
                     fade_detection_config=fade_config,
                 )
@@ -690,6 +1342,7 @@ class OpenRouterTTSWrapper(TTSInterface):
                         duration_seconds=time.perf_counter() - synth_start_ts,
                         output_path=temp_output_path,
                         group_id=report_group_id,
+                        voice=voice_name,
                     ))
                     return
                 logger.warning(
@@ -717,6 +1370,7 @@ class OpenRouterTTSWrapper(TTSInterface):
                     duration_seconds=time.perf_counter() - synth_start_ts,
                     output_path=temp_output_path,
                     group_id=report_group_id,
+                    voice=voice_name,
                 ))
                 return
 
@@ -738,6 +1392,7 @@ class OpenRouterTTSWrapper(TTSInterface):
                 duration_seconds=time.perf_counter() - synth_start_ts,
                 output_path=temp_output_path,
                 group_id=report_group_id,
+                voice=voice_name,
                 error=f"validation failed (silence_ratio={best_silence_ratio:.2f})",
             ))
             return
@@ -754,6 +1409,7 @@ class OpenRouterTTSWrapper(TTSInterface):
             duration_seconds=time.perf_counter() - synth_start_ts,
             output_path=None,
             group_id=report_group_id,
+            voice=voice_name,
             error="all attempts failed",
         ))
         raise RuntimeError(
@@ -774,8 +1430,6 @@ class OpenRouterTTSWrapper(TTSInterface):
 
         language = language or self.target_language
         previous_context: List[str] = list(kwargs.get("previous_context") or [])
-        assigned_voices: List[str] = []
-
         if self.enable_voice_matching and self.voice_matcher:
             speakers_to_pin = []
             seen = set()
@@ -785,15 +1439,23 @@ class OpenRouterTTSWrapper(TTSInterface):
                     and segment.speaker not in self.voice_mapping
                     and segment.speaker not in seen
                     and segment.reference_audio_path
+                    and self._clone_reference_for_segment(segment) is None
                 ):
                     speakers_to_pin.append((segment.speaker, segment.reference_audio_path))
                     seen.add(segment.speaker)
 
             for speaker_id, ref_path in speakers_to_pin:
+                # The exclusion has to survive across batches, so it is taken
+                # from the voices that are already pinned.
+                assigned_voices = [
+                    voice for voice in self.voice_mapping.values() if voice
+                ]
                 pinned = self.find_and_pin_voice_for_speaker(
                     speaker_id, ref_path, exclude_voices=assigned_voices
                 )
-                if pinned and pinned != self.default_voice:
+                if pinned:
+                    # Every speaker gets its own voice, even when the fallback
+                    # (the default) was used.
                     assigned_voices.append(pinned)
 
         temp_dir = tempfile.mkdtemp(prefix="openrouter_segments_")
@@ -809,11 +1471,15 @@ class OpenRouterTTSWrapper(TTSInterface):
                     f"for speaker '{segment.speaker}'"
                 )
                 try:
+                    clone_reference = self._clone_reference_for_segment(segment)
                     speech_text_preview = self._prepare_speech_text(
                         segment, previous_segments=previous_context
                     )
                     cache_key = self._get_cache_key(
-                        segment, language, speech_text=speech_text_preview
+                        segment,
+                        language,
+                        speech_text=speech_text_preview,
+                        clone_reference=clone_reference,
                     )
                     if cache_key in self._audio_cache:
                         cached_path, duration = self._audio_cache[cache_key]
@@ -837,13 +1503,41 @@ class OpenRouterTTSWrapper(TTSInterface):
                                 previous_context.append(segment.text)
                             continue
 
-                    self._synthesize_single_segment(
-                        segment,
-                        segment_file_path,
-                        language,
-                        usage_tracker=usage_tracker,
-                        previous_segments=previous_context,
-                    )
+                    try:
+                        self._synthesize_single_segment(
+                            segment,
+                            segment_file_path,
+                            language,
+                            usage_tracker=usage_tracker,
+                            previous_segments=previous_context,
+                            clone_reference=clone_reference,
+                        )
+                    except VoiceCloneRequestError as clone_exc:
+                        if clone_exc.status_code and clone_exc.status_code >= 500:
+                            raise
+                        logger.warning(
+                            "Voice cloning failed for speaker '%s' (status=%s); "
+                            "falling back to the library voice for the rest of the run: %s",
+                            segment.speaker,
+                            clone_exc.status_code,
+                            clone_exc,
+                        )
+                        self._voice_clone_disabled_speakers.add(str(segment.speaker or ""))
+                        clone_reference = None
+                        cache_key = self._get_cache_key(
+                            segment,
+                            language,
+                            speech_text=speech_text_preview,
+                            clone_reference=None,
+                        )
+                        self._synthesize_single_segment(
+                            segment,
+                            segment_file_path,
+                            language,
+                            usage_tracker=usage_tracker,
+                            previous_segments=previous_context,
+                            clone_reference=None,
+                        )
                     audio_segment = AudioSegment.from_mp3(segment_file_path)
                     duration = len(audio_segment) / 1000.0
                     self._register_usage(usage_tracker, self.model, audio_seconds=duration)
@@ -896,9 +1590,40 @@ class OpenRouterTTSWrapper(TTSInterface):
         return OPENAI_AVAILABLE and PYDUB_AVAILABLE and self.client is not None
 
     def clone_voice(self, audio_path: str, voice_id: str) -> str:
-        raise NotImplementedError(
-            "Voice cloning is not supported by OpenRouter Qwen TTS. Use Minimax TTS for cloning."
-        )
+        """Register a local reference for stateless cloning.
+
+        OpenRouter does not create a persistent cloned-voice model.  The
+        reference is kept in memory for this process and sent with every
+        synthesis request.  The main pipeline uses
+        :meth:`set_voice_clone_references`; this method exists for callers that
+        follow the generic ``clone_voice`` interface.
+        """
+        if not self._is_drama3():
+            raise NotImplementedError(
+                "Voice cloning is only supported for Fish Audio Drama 3."
+            )
+        path = Path(audio_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Voice clone reference not found: {audio_path}")
+        try:
+            from src.tts.voice_clone_reference import VoiceCloneReference
+            stat = path.stat()
+            token = hashlib.sha1(
+                f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode()
+            ).hexdigest()[:16]
+            reference = VoiceCloneReference(
+                speaker=str(voice_id),
+                reference_path=str(path),
+                duration_seconds=0.0,
+                source_path=str(path),
+                cache_token=token,
+            )
+            key = str(voice_id).strip().lower()
+            self._voice_clone_references_by_voice[key] = reference
+            self._voice_clone_references[str(voice_id)] = reference
+            return voice_id
+        except Exception as exc:
+            raise RuntimeError(f"Could not register voice clone reference: {exc}") from exc
 
     def cleanup(self) -> None:
         if self._cache_dir and os.path.exists(self._cache_dir):
@@ -910,6 +1635,10 @@ class OpenRouterTTSWrapper(TTSInterface):
             self.voice_matcher = None
         self.audio_embedder = None
         self.voice_sample_manager = None
+        self._voice_clone_references.clear()
+        self._voice_clone_references_by_voice.clear()
+        self._voice_clone_data_uris.clear()
+        self._voice_clone_disabled_speakers.clear()
 
     def estimate_audio_segment_length(
         self,

@@ -13,6 +13,9 @@ DEFAULT_GENDER_CONFIDENCE_THRESHOLD = 0.80
 DEFAULT_SPEAKER_GENDER_MODEL_ID = "audeering/wav2vec2-large-robust-24-ft-age-gender"
 SPEAKER_METADATA_CONFIG_KEY = "speakerMetadata"
 SPEAKER_GENDER_SIGNATURE_CONFIG_KEY = "speakerGenderTranslationSignature"
+# Voice advice per speaker (timbre, age, energy, accent) produced by the
+# video+audio delivery analysis.
+SPEAKER_VOICE_PROFILES_CONFIG_KEY = "speakerVoiceProfiles"
 
 
 def normalize_gender_value(value: Any, default: str = DEFAULT_SPEAKER_GENDER) -> str:

@@ -26,14 +26,19 @@ class ProjectConfig(BaseModel):
     speakerCount: Optional[int] = None
     keepBackground: bool = False
     pauseRemoval: Literal["cut", "disabled"] = "disabled"
-    preset: Optional[Literal["fast", "hq", "ultra"]] = "hq"
+    preset: Optional[Literal["fast", "hq", "ultra"]] = "ultra"
     apiKeys: Optional[Dict[str, str]] = None
     autoProcess: Optional[bool] = None  # Auto-continue to dubbing after transcription
     # Extra settings
     startTime: Optional[float] = None
     duration: Optional[float] = None
     transcriptionSystem: Optional[str] = None
+    openrouterSttModel: Optional[str] = None
     whisperModel: Optional[str] = None
+    transcribeOnVocals: Optional[bool] = None
+    enableGeminiSpeakerLabeling: Optional[bool] = None
+    geminiSpeakerLabelingModel: Optional[str] = None
+    geminiSpeakerLabelingMaxSpeakers: Optional[int] = None
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
@@ -45,6 +50,8 @@ class ProjectConfig(BaseModel):
     editorReasoningEffort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "none"]] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
+    autoSelectedVoices: Optional[Dict[str, str]] = None
+    blockedVoices: Optional[List[str]] = None
     enableSpeakerGenderInference: Optional[bool] = True
     speakerMetadata: Optional[Dict[str, SpeakerMetadata]] = None
     refinementLlmProvider: Optional[str] = None
@@ -52,15 +59,30 @@ class ProjectConfig(BaseModel):
     refinementTemperature: Optional[float] = None
     translationPromptPrefix: Optional[str] = None
     ttsSystem: Optional[str] = None
+    ttsTransport: Optional[Literal["openrouter", "google"]] = None
     ttsModel: Optional[str] = None
     ttsFallbackModel: Optional[str] = None
     enableContextStyle: Optional[bool] = None
     contextStyleMaxChars: Optional[int] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
+    enableVoiceCloning: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    refinerEmotionTags: Optional[bool] = None
+    creativeRecoveryVariants: Optional[bool] = None
+    enableVideoEmotionAnalysis: Optional[bool] = None
+    videoEmotionAnalysisModel: Optional[str] = None
+    videoEmotionAnalysisFps: Optional[float] = None
+    videoEmotionAnalysisDirectionMaxChars: Optional[int] = None
+    videoEmotionAnalysisLanguage: Optional[str] = None
+    enableVoiceAdvisor: Optional[bool] = None
+    voiceAdviceMaxCandidates: Optional[int] = None
+    speakerVoiceProfiles: Optional[Dict[str, Dict[str, Any]]] = None
     enableLaughterDetection: Optional[bool] = None
     laughterMode: Optional[Literal["dub", "preserve"]] = None
+    enableVocalEventDetection: Optional[bool] = None
+    vocalEventsMode: Optional[Literal["dub", "preserve"]] = None
+    vocalEventKinds: Optional[List[str]] = None
     enableContentValidation: Optional[bool] = None
     contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
     contentValidatorWhisperModel: Optional[str] = None
@@ -69,6 +91,7 @@ class ProjectConfig(BaseModel):
     contentValidatorSpeechModel: Optional[str] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
+    backgroundVoiceVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None
     useTwoPassEncoding: Optional[bool] = None
     videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
@@ -100,7 +123,12 @@ class ProjectConfigUpdate(BaseModel):
     startTime: Optional[float] = None
     duration: Optional[float] = None
     transcriptionSystem: Optional[str] = None
+    openrouterSttModel: Optional[str] = None
     whisperModel: Optional[str] = None
+    transcribeOnVocals: Optional[bool] = None
+    enableGeminiSpeakerLabeling: Optional[bool] = None
+    geminiSpeakerLabelingModel: Optional[str] = None
+    geminiSpeakerLabelingMaxSpeakers: Optional[int] = None
     llmProvider: Optional[str] = None
     llmModelName: Optional[str] = None
     llmTemperature: Optional[float] = None
@@ -112,6 +140,8 @@ class ProjectConfigUpdate(BaseModel):
     editorReasoningEffort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "none"]] = None
     speakerTtsPrompts: Optional[Dict[str, str]] = None
     speakerVoiceMappings: Optional[Dict[str, str]] = None
+    autoSelectedVoices: Optional[Dict[str, str]] = None
+    blockedVoices: Optional[List[str]] = None
     enableSpeakerGenderInference: Optional[bool] = None
     speakerMetadata: Optional[Dict[str, SpeakerMetadata]] = None
     refinementLlmProvider: Optional[str] = None
@@ -119,15 +149,30 @@ class ProjectConfigUpdate(BaseModel):
     refinementTemperature: Optional[float] = None
     translationPromptPrefix: Optional[str] = None
     ttsSystem: Optional[str] = None
+    ttsTransport: Optional[Literal["openrouter", "google"]] = None
     ttsModel: Optional[str] = None
     ttsFallbackModel: Optional[str] = None
     enableContextStyle: Optional[bool] = None
     contextStyleMaxChars: Optional[int] = None
     ttsPromptPrefix: Optional[str] = None
     voiceAutoSelection: Optional[bool] = None
+    enableVoiceCloning: Optional[bool] = None
     enableEmotionEnrichment: Optional[bool] = None
+    refinerEmotionTags: Optional[bool] = None
+    creativeRecoveryVariants: Optional[bool] = None
+    enableVideoEmotionAnalysis: Optional[bool] = None
+    videoEmotionAnalysisModel: Optional[str] = None
+    videoEmotionAnalysisFps: Optional[float] = None
+    videoEmotionAnalysisDirectionMaxChars: Optional[int] = None
+    videoEmotionAnalysisLanguage: Optional[str] = None
+    enableVoiceAdvisor: Optional[bool] = None
+    voiceAdviceMaxCandidates: Optional[int] = None
+    speakerVoiceProfiles: Optional[Dict[str, Dict[str, Any]]] = None
     enableLaughterDetection: Optional[bool] = None
     laughterMode: Optional[Literal["dub", "preserve"]] = None
+    enableVocalEventDetection: Optional[bool] = None
+    vocalEventsMode: Optional[Literal["dub", "preserve"]] = None
+    vocalEventKinds: Optional[List[str]] = None
     enableContentValidation: Optional[bool] = None
     contentValidatorProvider: Optional[Literal["whisper", "assemblyai"]] = None
     contentValidatorWhisperModel: Optional[str] = None
@@ -136,6 +181,7 @@ class ProjectConfigUpdate(BaseModel):
     contentValidatorSpeechModel: Optional[str] = None
     dubbedVolume: Optional[float] = None
     backgroundVolume: Optional[float] = None
+    backgroundVoiceVolume: Optional[float] = None
     keepOriginalAudioRanges: Optional[List[str]] = None
     useTwoPassEncoding: Optional[bool] = None
     videoQualityPreset: Optional[Literal["720p", "1080p", "original"]] = None
@@ -214,6 +260,9 @@ class SegmentResponse(BaseModel):
     endTime: float
     originalText: str
     translatedText: Optional[str] = None
+    emotion: Optional[str] = None
+    emotionIntensity: Optional[float] = None
+    emotionDirection: Optional[str] = None
     voiceId: Optional[str] = None
     provider: Optional[str] = None
     ttsPrompt: Optional[str] = None
@@ -366,6 +415,12 @@ class VoiceResponse(BaseModel):
     language: Optional[str] = None
     preview_url: Optional[str] = None
     description: Optional[str] = None
+    models: Optional[List[str]] = None
+    accent: Optional[str] = None
+    age: Optional[str] = None
+    native: Optional[bool] = None
+    character: Optional[bool] = None
+    curated: Optional[bool] = None
 
 
 class PersonaResponse(BaseModel):

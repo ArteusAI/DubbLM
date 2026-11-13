@@ -14,13 +14,11 @@ import time
 import torch
 import warnings
 import shutil
-import subprocess
 import random
 import hashlib
-from typing import Dict, List, Tuple, Optional, Any, Literal, Union
+from typing import Dict, List, Tuple, Optional, Any, Sequence
 from pathlib import Path
 from dataclasses import dataclass
-from dotenv import load_dotenv
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -52,6 +50,11 @@ from src.utils.speaker_gender import normalize_speaker_metadata_map
 
 # Import existing factories and interfaces
 from src.tts.tts_factory import TTSFactory
+from src.tts.voice_clone_reference import (
+    VoiceCloneReference,
+    VoiceCloneReferenceBuilder,
+    VoiceCloneReferenceConfig,
+)
 from src.translation.translator_factory import TranslatorFactory
 from src.transcription.transcription_factory import TranscriptionFactory
 
@@ -74,11 +77,53 @@ LAUGHTER_TEXT_VARIANT_KEYS = (
     "chosen_text",
 )
 
+# Non-verbal vocal events: canonical kind -> tag inserted into synthesis text.
+# Legacy [tag] entries are converted by the gemini38 tag layer; angle-bracket
+# entries are already in the documented Gemini 3.8 vocabulary.
+VOCAL_EVENT_TAG = {
+    "laugh": "[laughs]",
+    "cry": "[crying]",
+    "scream": "[screaming]",
+    "shout": "[shout]",
+    "whisper": "<whispers>",
+    "gasp": "[gasp]",
+    "pant": "[pant]",
+    "sigh": "[sigh]",
+    "groan": "[groan]",
+    "grunt": "[grunt]",
+    "whimper": "[whimper]",
+    "breath": "<breath>",
+    "snort": "<snort>",
+}
 
-def insert_laugh_tag(text: str, fraction: float, tag: str = LAUGHTER_TAG) -> Tuple[str, bool]:
-    """Insert a laughter tag at a word boundary; idempotent per text."""
+# Markers used for idempotence: if any is already present in the text, the
+# event of that kind is not injected twice.
+VOCAL_TAG_MARKERS = {
+    "laugh": LAUGHTER_TAG_MARKERS,
+    "cry": ("[crying]", "[sob]", "[cry]", "<sob>", "<cry>"),
+    "scream": ("[screaming]", "[scream]", "<scream>"),
+    "shout": ("[shouting]", "[shout]", "<shout>"),
+    "whisper": ("[whispers]", "[whisper]", "<whispers>", "<whispering>"),
+    "gasp": ("[gasp]", "[gasping]", "<gasp>"),
+    "pant": ("[pant]", "[panting]", "<pant>"),
+    "sigh": ("[sigh]", "[sighs]", "[sighing]", "<sigh>"),
+    "groan": ("[groan]", "[groans]", "<groan>"),
+    "grunt": ("[grunt]", "[grunts]", "<grunt>"),
+    "whimper": ("[whimper]", "[whimpers]", "<whimper>"),
+    "breath": ("[breath]", "<breath>"),
+    "snort": ("[snort]", "<snort>"),
+}
+
+
+def insert_vocal_tag(
+    text: str,
+    fraction: float,
+    tag: str,
+    markers: Sequence[str] = (),
+) -> Tuple[str, bool]:
+    """Insert a vocal tag at a word boundary; idempotent per text and kind."""
     lowered = text.lower()
-    if any(marker in lowered for marker in LAUGHTER_TAG_MARKERS):
+    if any(marker in lowered for marker in markers):
         return text, False
     words = text.split()
     if not words:
@@ -89,6 +134,11 @@ def insert_laugh_tag(text: str, fraction: float, tag: str = LAUGHTER_TAG) -> Tup
     elif fraction < 0.85:
         position = max(1, min(len(words) - 1, int(round(fraction * len(words)))))
     return " ".join(words[:position] + [tag] + words[position:]), True
+
+
+def insert_laugh_tag(text: str, fraction: float, tag: str = LAUGHTER_TAG) -> Tuple[str, bool]:
+    """Insert a laughter tag at a word boundary; idempotent per text."""
+    return insert_vocal_tag(text, fraction, tag, LAUGHTER_TAG_MARKERS)
 
 
 def apply_laugh_tag(segment: Dict, fraction: float, tag: str = LAUGHTER_TAG) -> bool:
@@ -105,6 +155,24 @@ def apply_laugh_tag(segment: Dict, fraction: float, tag: str = LAUGHTER_TAG) -> 
     return changed
 
 
+def apply_vocal_tag(segment: Dict, fraction: float, kind: str) -> bool:
+    """Add a kind-specific vocal tag to every non-empty synthesis text variant."""
+    tag = VOCAL_EVENT_TAG.get(kind)
+    markers = VOCAL_TAG_MARKERS.get(kind, ())
+    if not tag:
+        return False
+    changed = False
+    for key in LAUGHTER_TEXT_VARIANT_KEYS:
+        text = segment.get(key)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        updated, did_change = insert_vocal_tag(text, fraction, tag, markers)
+        if did_change:
+            segment[key] = updated
+            changed = True
+    return changed
+
+
 def laughter_signature(segments: List[Dict]) -> str:
     """Stable hash of laughter-annotated texts, used in synthesis cache keys."""
     parts: List[str] = []
@@ -113,6 +181,24 @@ def laughter_signature(segments: List[Dict]) -> str:
             value = segment.get(key)
             if isinstance(value, str) and any(
                 marker in value.lower() for marker in LAUGHTER_TAG_MARKERS
+            ):
+                parts.append(f"{index}:{key}:{value}")
+    if not parts:
+        return ""
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def vocal_event_signature(segments: List[Dict]) -> str:
+    """Stable hash of vocal-event-annotated texts, used in synthesis cache keys."""
+    all_markers = tuple(
+        marker for markers in VOCAL_TAG_MARKERS.values() for marker in markers
+    )
+    parts: List[str] = []
+    for index, segment in enumerate(segments or []):
+        for key in LAUGHTER_TEXT_VARIANT_KEYS:
+            value = segment.get(key)
+            if isinstance(value, str) and any(
+                marker in value.lower() for marker in all_markers
             ):
                 parts.append(f"{index}:{key}:{value}")
     if not parts:
@@ -198,7 +284,12 @@ class SmartDubbing:
         self.config = config
         self.tts_system_mapping = self.config.get('tts_system_mapping') or {}
         self.voice_prompt = self.config.get('voice_prompt') or {}
-        
+        # Voice advice from the delivery analysis (timbre, age, energy, accent).
+        self.speaker_voice_profiles = self.config.get('speaker_voice_profiles') or {}
+
+        # Speaker -> clean reference built for stateless voice cloning.
+        self.voice_clone_references: Dict[str, VoiceCloneReference] = {}
+
         # Speakers to mute (remove entirely from output)
         self.muted_speakers = set()
         mute_cfg = self.config.get('mute_speakers')
@@ -261,8 +352,15 @@ class SmartDubbing:
         # Detected laughter moments (LaughterEvent objects) applied at synthesis.
         self._laughter_events: Optional[List[Any]] = None
 
-        # Preserved-laughter state (laughter_mode == 'preserve')
+        # All detected vocal events (VocalEvent objects, laugh included).
+        self._vocal_events: Optional[List[Any]] = None
+
+        # Preserved-laughter state (laughter_mode == 'preserve').
+        # In the current mode the ranges drive a volume envelope; translation
+        # segments are never split or moved.
         self._laughter_preserve_ranges: List[Tuple[float, float]] = []
+        self.laughter_volume_ranges_original: List[Tuple[float, float]] = []
+        self.laughter_volume_ranges_output: List[Tuple[float, float]] = []
         self._preserved_laughter_output: List[Dict[str, float]] = []
         self._preserved_laughter_stats: Dict[str, Any] = {
             "ranges": 0,
@@ -282,7 +380,7 @@ class SmartDubbing:
         
         logger.info(f"Initialized SmartDubbing with {self.device} device")
         logger.debug(f"Using {config.get('tts_system', 'coqui')} TTS system")
-        logger.debug(f"Using {config.get('transcription_system', 'whisper')} transcription system")
+        logger.debug(f"Using {config.get('transcription_system', 'openrouter')} transcription system")
         logger.info(f"Language config: source={config.get('source_language')}, target={config.get('target_language')}")
         logger.info(f"Speakers expected: {config.get('speakers_expected')}")
         
@@ -340,7 +438,7 @@ class SmartDubbing:
         try:
             self.translator = TranslatorFactory.create_translator(
                 translator_type=self.config.get('translator_type', 'llm'),
-                llm_provider=self.config.get('llm_provider', 'gemini'),
+                llm_provider=self.config.get('llm_provider', 'openrouter'),
                 model_name=self.config.get('llm_model_name'),
                 temperature=self.config.get('llm_temperature', 0.5),
                 refinement_llm_provider=self.config.get('refinement_llm_provider'),
@@ -358,7 +456,11 @@ class SmartDubbing:
                 cache_manager=self.cache_manager,
                 cost_tracker=self.cost_tracker,
                 enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                enable_video_emotion_analysis=self.config.get(
+                    'enable_video_emotion_analysis', False
+                ),
                 segment_stretch=self.config.get('segment_stretch', 'audio_and_video'),
+                creative_recovery_variants=self.config.get('creative_recovery_variants', False),
                 tts_system=self.config.get('tts_system'),
                 tts_system_mapping=self.config.get('tts_system_mapping'),
                 tts_model=self.config.get('tts_model'),
@@ -380,13 +482,20 @@ class SmartDubbing:
                 device=self.device,
                 voice_config=self.config.get('voice_name'),
                 voice_prompt=self.config.get('voice_prompt', {}),
+                speaker_voice_profiles=self.speaker_voice_profiles,
+                voice_advice_max_candidates=self.config.get('voice_advice_max_candidates', 8),
                 prompt_prefix=self.config.get('tts_prompt_prefix'),
                 blocked_voices=self.config.get('blocked_voices') or None,
                 enable_voice_matching=self.config.get('voice_auto_selection', True),
+                enable_voice_cloning=self.config.get('enable_voice_cloning', False),
                 debug_tts=self.config.get('debug_tts', False),
+                tts_transport=self.config.get('tts_transport', 'openrouter'),
                 model=self.config.get('tts_model'),
                 fallback_model=self.config.get('tts_fallback_model'),
-                enable_emotion_enrichment=self.config.get('enable_emotion_enrichment', False),
+                enable_emotion_enrichment=(
+                    self.config.get('enable_emotion_enrichment', False)
+                    and not self.config.get('refiner_emotion_tags', False)
+                ),
                 enable_llm_editor=self.config.get('enable_llm_editor', False),
                 emotion_enrichment_model=self.config.get('emotion_enrichment_model'),
                 emotion_enrichment_temperature=self.config.get('emotion_enrichment_temperature'),
@@ -409,6 +518,10 @@ class SmartDubbing:
                 enable_content_repetition_check=self.config.get('enable_content_repetition_check', True),
                 content_repetition_min_words=self.config.get('content_repetition_min_words', 4),
                 content_repetition_extra_allowance=self.config.get('content_repetition_extra_allowance', 0),
+                enable_vocal_event_verification=self.config.get(
+                    'enable_vocal_event_verification',
+                    self.config.get('enable_vocal_event_detection', False),
+                ),
                 cost_tracker=self.cost_tracker,
                 translator=self.translator if self.config.get('enable_llm_text_adjustment', True) else None,
                 target_language=self.config.get('target_language', 'en'),  # Pass target language for language-specific TTS configuration
@@ -425,13 +538,20 @@ class SmartDubbing:
         self.transcriber = None
         try:
             self.transcriber = TranscriptionFactory.create_transcriber(
-                transcription_system=self.config.get('transcription_system', 'whisper'),
+                transcription_system=self.config.get('transcription_system', 'openrouter'),
                 source_language=self.config.get('source_language'),
                 device=self.device,
                 whisper_model=self.config.get('whisper_model', 'large-v3'),
+                openrouter_stt_model=self.config.get('openrouter_stt_model', 'microsoft/mai-transcribe-2'),
+                openrouter_stt_fallback_models=self.config.get('openrouter_stt_fallback_models'),
+                openrouter_stt_chunk_seconds=self.config.get('openrouter_stt_chunk_seconds', 600),
+                openrouter_stt_overlap_seconds=self.config.get('openrouter_stt_overlap_seconds', 15),
                 cache_manager=self.cache_manager,
                 cost_tracker=self.cost_tracker,
-                speakers_expected=self.config.get('speakers_expected')
+                speakers_expected=self.config.get('speakers_expected'),
+                enable_gemini_speaker_labeling=self.config.get('enable_gemini_speaker_labeling', False),
+                gemini_speaker_labeling_model=self.config.get('gemini_speaker_labeling_model'),
+                gemini_speaker_labeling_max_speakers=self.config.get('gemini_speaker_labeling_max_speakers'),
             )
             logger.debug(f"Initialized {self.transcriber.name} transcriber")
         except Exception as e:
@@ -485,8 +605,8 @@ class SmartDubbing:
                 logger.info("=" * 70)
                 logger.info("VOICE CLONING COMPLETED")
                 logger.info("=" * 70)
-                logger.info(f"Voice mapping saved to: artifacts/cloned_voices/voice_mapping.json")
-                logger.info(f"Test samples saved to: artifacts/cloned_voices/")
+                logger.info("Voice mapping saved to: artifacts/cloned_voices/voice_mapping.json")
+                logger.info("Test samples saved to: artifacts/cloned_voices/")
                 logger.info("")
                 logger.info("To use cloned voices in future runs:")
                 logger.info("  1. Note the cloned voice IDs from the mapping file")
@@ -522,12 +642,16 @@ class SmartDubbing:
                 if save_translated_subtitles:
                     self.subtitle_manager.save_subtitles(segments_for_output, "translation", self._get_subtitle_path("translation", self.config.get('input'), self.config.get('target_language')))
             
-            # Detect laughter moments before synthesis (tags are injected inside synthesize_speech)
-            if self.config.get('enable_laughter_detection', False):
+            # Detect laughter / non-verbal vocal events before synthesis (tags
+            # are injected inside synthesize_speech). AST detection prefers the
+            # separated vocals stem; laughter keeps using the full mix.
+            if self.config.get('enable_laughter_detection', False) or self.config.get('enable_vocal_event_detection', False):
                 try:
-                    self.detect_laughter_events(audio_file)
-                except Exception as laughter_exc:
-                    logger.warning(f"Laughter detection failed: {laughter_exc}")
+                    if self.config.get('enable_vocal_event_detection', False):
+                        self.ensure_vocals_stem(audio_file)
+                    self.detect_vocal_events(audio_file)
+                except Exception as events_exc:
+                    logger.warning(f"Vocal event detection failed: {events_exc}")
 
             # Synthesize speech or generate silence if no segments remain after muting
             if segments_for_output and len(segments_for_output) > 0:
@@ -616,6 +740,14 @@ class SmartDubbing:
                 ffmpeg_batch_size=self.config.get('ffmpeg_batch_size', 50),
                 dubbed_volume=self.config.get('dubbed_volume', 1.0),
                 background_volume=self.config.get('background_volume', 0.562341),
+                background_voice_path=self.resolve_background_voice_stem(audio_file),
+                background_voice_volume=self.config.get('background_voice_volume', 0.0),
+                laughter_ranges=self.laughter_volume_ranges_output,
+                laughter_ranges_original=self.laughter_volume_ranges_original,
+                laughter_volume=float(self.config.get('laughter_volume', 0.70) or 0.70),
+                laughter_volume_ramp_seconds=float(
+                    self.config.get('laughter_volume_ramp_seconds', 0.25) or 0.25
+                ),
                 upscale_factor=self.config.get('upscale_factor', 1.0),
                 upscale_sharpen=self.config.get('upscale_sharpen', True),
                 video_speed_segments=video_speed_segments
@@ -789,25 +921,63 @@ class SmartDubbing:
         
         return report_file_path, samples_dir_path
     
-    def diarize_and_transcribe(self, audio_file: str) -> Tuple[Dict[Tuple[float, float], str], List[Dict]]:
-        """Perform speaker diarization and transcription."""
+    def diarize_and_transcribe(
+        self,
+        audio_file: str,
+        transcription_source: Optional[str] = None,
+    ) -> Tuple[Dict[Tuple[float, float], str], List[Dict]]:
+        """Perform speaker diarization and transcription.
+
+        ``transcription_source`` overrides the audio fed to the ASR/diarization
+        (e.g. the isolated vocals stem); timing still refers to the original
+        ``audio_file`` timeline, which the stem preserves.
+        """
         if not self.transcriber:
             raise ValueError("Transcriber not initialized")
-            
-        # Generate cache key
+
+        # Auto-resolve the isolated vocals stem for ASR/diarization when the
+        # config asks for it (trailers / keep_background). The stem preserves
+        # the original timeline, so segment timings stay valid.
+        if transcription_source is None:
+            try:
+                if self.config.transcribe_on_vocals_enabled():
+                    transcription_source = self.ensure_vocals_stem(audio_file)
+            except Exception as stem_exc:
+                logger.warning("Vocals stem resolution failed, using full mix: %s", stem_exc)
+
+        asr_input = transcription_source or audio_file
+        if transcription_source and transcription_source != audio_file:
+            logger.info("Transcribing on isolated vocals stem: %s", transcription_source)
+
+        # Generate cache key from the actual ASR input so stem and mix results
+        # never collide.
         cache_key = self.cache_manager.generate_cache_key(
-            audio_file,
+            asr_input,
             self.config.get('source_language'),
             self.config.get('target_language'),
             self.config.get('whisper_model', 'large-v3'),
             self.config.get('start_time'),
             self.config.get('duration')
         )
+        if self.config.get('transcription_system', '').lower() == 'openrouter':
+            cache_key = (
+                f"{cache_key}_or1_"
+                f"{self.config.get('openrouter_stt_model') or 'microsoft/mai-transcribe-2'}_"
+                f"{int(float(self.config.get('openrouter_stt_chunk_seconds') or 600))}_"
+                f"{int(float(self.config.get('openrouter_stt_overlap_seconds') or 15))}_"
+                f"spk{self.config.get('speakers_expected') or 0}"
+            )
+        if self.config.get('enable_gemini_speaker_labeling', False):
+            cache_key = (
+                f"{cache_key}_gemlabel1_"
+                f"{self.config.get('gemini_speaker_labeling_model') or 'default'}_"
+                f"{self.config.get('gemini_speaker_labeling_max_speakers') or 4}"
+            )
         
         # Perform diarization and transcription
         self.performance_tracker.start_timing("diarization")
         speakers_rolls, transcription = self.transcriber.diarize_and_transcribe(
-            audio_file=audio_file,
+            audio_file=asr_input,
             cache_key=cache_key,
             use_cache=self.cache_manager.use_cache
         )
@@ -919,6 +1089,486 @@ class SmartDubbing:
         logger.info("Detected %d laughter moment(s)", len(events))
         return events
 
+    # ------------------------------------------------------------------
+    # Non-verbal vocal event detection (AST)
+    # ------------------------------------------------------------------
+
+    def set_vocal_events(self, events: Optional[List[Any]]) -> None:
+        """Store all detected vocal events (laugh included) for synthesis."""
+        self._vocal_events = list(events or [])
+        self.debug_data["vocal_events"] = [
+            {
+                "kind": getattr(event, "kind", "laugh"),
+                "start": event.start,
+                "end": event.end,
+                "score": event.score,
+            }
+            for event in self._vocal_events
+        ]
+
+    def _vocal_event_kinds(self) -> List[str]:
+        """Configured non-verbal event kinds (canonical names only)."""
+        from ..audio.vocal_event_detector import DEFAULT_DETECTION_KINDS, VOCAL_EVENT_KINDS
+
+        configured = self.config.get("vocal_event_kinds")
+        if isinstance(configured, str):
+            configured = [part.strip() for part in configured.split(",") if part.strip()]
+        if not configured:
+            return list(DEFAULT_DETECTION_KINDS)
+        filtered = [kind for kind in configured if kind in VOCAL_EVENT_KINDS]
+        return filtered or list(DEFAULT_DETECTION_KINDS)
+
+    def _resolve_vocals_stem(self) -> Optional[str]:
+        """Return the separated vocals stem path when one exists."""
+        import glob as _glob
+
+        candidates: List[str] = []
+        try:
+            candidates.extend(sorted(_glob.glob("*Vocals*.wav")))
+            candidates.extend(sorted(_glob.glob("artifacts/audio/*Vocals*.wav")))
+        except Exception:
+            return None
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
+    def resolve_background_voice_stem(self, audio_file: str) -> Optional[str]:
+        """Original vocals stem for the "background voice" layer.
+
+        The layer mixes the original voice under the dubbed track, quieter than
+        the dub. It needs the separated vocals stem; when the separation is not
+        available the layer is simply skipped.
+        """
+        try:
+            volume = float(self.config.get('background_voice_volume', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        preserve_laughter = (
+            self.config.get('laughter_mode') == 'preserve'
+            and bool(getattr(self, 'laughter_volume_ranges_output', None))
+        )
+        if volume <= 0 and not preserve_laughter:
+            return None
+
+        if preserve_laughter:
+            laughter_bed = self.build_laughter_bed_track(audio_file)
+            if laughter_bed:
+                return laughter_bed
+
+        # Preferred: the original voice warped onto the dubbed timeline.
+        aligned = self.build_background_voice_track(audio_file)
+        if aligned:
+            return aligned
+
+        stem = self._resolve_vocals_stem()
+        if stem:
+            return stem
+        try:
+            return self.ensure_vocals_stem(audio_file)
+        except Exception as exc:
+            logger.warning(f"Background voice layer unavailable: {exc}")
+            return None
+
+    def ensure_vocals_stem(self, audio_file: str) -> Optional[str]:
+        """Make sure a vocals stem exists and return its (cached) path.
+
+        Detection and transcription are much cleaner on a separated vocals
+        track for music-heavy material (trailers). Reuses the cached background
+        separation step so ``keep_background`` runs later pay nothing extra.
+        """
+        step_name = "vocals_stem"
+        stem_output = "artifacts/audio/vocals.wav"
+
+        cache_key = self.cache_manager.generate_cache_key(audio_file, "", "", "")
+        try:
+            if self.cache_manager.load_file_from_cache(
+                step_name, cache_key, f"{cache_key}.wav", stem_output
+            ):
+                logger.debug("Loaded vocals stem from cache: %s", stem_output)
+                return stem_output
+        except Exception as cache_exc:
+            logger.debug("Vocals stem cache load failed: %s", cache_exc)
+
+        existing = self._resolve_vocals_stem()
+        if existing:
+            self._cache_vocals_stem(step_name, cache_key, existing, stem_output)
+            return existing
+
+        try:
+            self.audio_processor.process_background_audio(audio_file, voice_denoising=True)
+        except Exception as exc:
+            logger.warning("Vocals separation for event detection failed: %s", exc)
+
+        stem = self._resolve_vocals_stem()
+        if stem:
+            self._cache_vocals_stem(step_name, cache_key, stem, stem_output)
+        return stem
+
+    def _cache_vocals_stem(
+        self, step_name: str, cache_key: str, source: str, destination: str
+    ) -> None:
+        """Persist the vocals stem so transcription can reuse it without UVR."""
+        try:
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            if os.path.abspath(source) != os.path.abspath(destination):
+                shutil.copy(source, destination)
+            self.cache_manager.save_file_to_cache(
+                step_name, cache_key, destination, f"{cache_key}.wav"
+            )
+        except Exception as cache_exc:
+            logger.debug("Failed to cache vocals stem: %s", cache_exc)
+
+
+    def detect_vocal_events(self, audio_file: str) -> List[Any]:
+        """Detect laugh (omine) + non-verbal (AST) events in the source audio.
+
+        Results are cached per audio/config; launch this after
+        :meth:`ensure_vocals_stem` so AST runs on the isolated vocals when
+        available.
+        """
+        import json
+        from ..audio.vocal_event_detector import (
+            DETECTOR_VERSION as VOCAL_DETECTOR_VERSION,
+            AstVocalEventDetector,
+            VocalEvent,
+        )
+
+        kinds = self._vocal_event_kinds()
+        events: List[Any] = []
+
+        if self.config.get("enable_laughter_detection", False) or "laugh" in kinds:
+            try:
+                laugh_events = self.detect_laughter_events(audio_file) or []
+                events.extend(
+                    VocalEvent("laugh", float(event.start), float(event.end), float(event.score))
+                    for event in laugh_events
+                )
+            except Exception as exc:
+                logger.warning("Laughter detection failed: %s", exc)
+
+        ast_kinds = [kind for kind in kinds if kind != "laugh"]
+        if self.config.get("enable_vocal_event_detection", False) and ast_kinds:
+            detection_source = self._resolve_vocals_stem() or audio_file
+            if detection_source != audio_file:
+                logger.info("Vocal event detection source: %s", detection_source)
+            threshold = float(self.config.get("vocal_event_threshold", 0.35))
+            min_seconds = float(self.config.get("vocal_event_min_seconds", 0.3))
+            merge_gap = float(self.config.get("vocal_event_merge_gap_seconds", 0.5))
+            base_key = self.cache_manager.generate_cache_key(
+                audio_file,
+                self.config.get("source_language"),
+                self.config.get("target_language"),
+                self.config.get("whisper_model", "large-v3"),
+                self.config.get("start_time"),
+                self.config.get("duration"),
+            )
+            cache_key = (
+                f"{base_key}_{VOCAL_DETECTOR_VERSION}_{'-'.join(ast_kinds)}_"
+                f"{threshold}_{min_seconds}_{merge_gap}"
+            )
+            step_name = "vocal_events"
+
+            ast_events: Optional[List[Any]] = None
+            if self.cache_manager.cache_exists(step_name, cache_key):
+                try:
+                    cached = self.cache_manager.load_from_cache(step_name, cache_key)
+                    if cached is not None:
+                        ast_events = [
+                            VocalEvent(
+                                kind=str(item.get("kind", "")),
+                                start=float(item["start"]),
+                                end=float(item["end"]),
+                                score=float(item.get("score", 0.0)),
+                            )
+                            for item in cached
+                            if item.get("kind")
+                        ]
+                        logger.debug("Loaded %d vocal event(s) from cache", len(ast_events))
+                except Exception as cache_exc:
+                    logger.warning("Failed to load vocal event cache, re-detecting: %s", cache_exc)
+
+            if ast_events is None:
+                self.performance_tracker.start_timing("emotion_analysis")
+                try:
+                    detector = AstVocalEventDetector(
+                        kinds=ast_kinds,
+                        hf_cache_dir=self.config.get("vocal_event_model_cache_dir"),
+                        window_seconds=float(self.config.get("vocal_event_window_seconds", 10.0)),
+                        hop_seconds=float(self.config.get("vocal_event_hop_seconds", 1.0)),
+                        frame_threshold=threshold,
+                        min_event_seconds=min_seconds,
+                        concat_gap_seconds=merge_gap,
+                        probability_mode=str(
+                            self.config.get("vocal_event_probability_mode", "softmax")
+                        ),
+                        detection_mode=str(
+                            self.config.get("vocal_event_detection_mode", "window")
+                        ),
+                    )
+                    ast_events = detector.detect(detection_source)
+                except Exception as detect_exc:
+                    logger.warning("Non-verbal vocal event detection failed: %s", detect_exc)
+                    ast_events = []
+                finally:
+                    self.performance_tracker.end_timing("emotion_analysis")
+                self.cache_manager.save_to_cache(
+                    step_name,
+                    cache_key,
+                    [
+                        {
+                            "kind": event.kind,
+                            "start": event.start,
+                            "end": event.end,
+                            "score": event.score,
+                        }
+                        for event in ast_events
+                    ],
+                )
+            events.extend(ast_events)
+
+        loudness_events = self._detect_loud_vocal_events(audio_file, events)
+        events.extend(loudness_events)
+
+        self.set_vocal_events(events)
+
+        try:
+            debug_dir = Path("artifacts/debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "vocal_events.json", "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "version": VOCAL_DETECTOR_VERSION,
+                        "audio": audio_file,
+                        "events": [
+                            {
+                                "kind": getattr(event, "kind", "laugh"),
+                                "start": event.start,
+                                "end": event.end,
+                                "score": event.score,
+                            }
+                            for event in events
+                        ],
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as debug_exc:
+            logger.debug("Failed to write vocal events debug file: %s", debug_exc)
+
+        by_kind: Dict[str, int] = {}
+        for event in events:
+            kind = getattr(event, "kind", "laugh")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        summary = ", ".join(f"{kind}: {count}" for kind, count in sorted(by_kind.items()))
+        logger.info("Detected %d vocal event(s)%s", len(events), f" ({summary})" if summary else "")
+        return events
+
+    def _non_laugh_events(self) -> List[Any]:
+        """All detected events except laughter (AST output)."""
+        return [
+            event
+            for event in (getattr(self, "_vocal_events", None) or [])
+            if getattr(event, "kind", "laugh") != "laugh"
+        ]
+
+    def _vocal_event_preserve_metrics(self) -> Optional[Dict[str, Any]]:
+        """Report section for the preserved non-verbal events (screams, ...)."""
+        events = [
+            event
+            for event in (getattr(self, "_vocal_events", None) or [])
+            if getattr(event, "kind", "laugh") != "laugh"
+        ]
+        if not events:
+            return None
+        by_kind: Dict[str, int] = {}
+        for event in events:
+            kind = getattr(event, "kind", "laugh")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        return {
+            "mode": self.config.get("vocal_events_mode", "preserve"),
+            "events": len(events),
+            "by_kind": by_kind,
+            "ranges": [
+                {
+                    "kind": getattr(event, "kind", "laugh"),
+                    "start": float(getattr(event, "start", 0.0)),
+                    "end": float(getattr(event, "end", 0.0)),
+                    "score": float(getattr(event, "score", 0.0) or 0.0),
+                }
+                for event in events
+            ],
+        }
+
+    def _detect_loud_vocal_events(        self,
+        audio_file: str,
+        existing_events: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        """Detect shouted lines / screams from the loudness envelope.
+
+        The AST classifier stays silent on shouted dialogue (it keeps scoring
+        "Speech"), so trailer screams are found by their loudness instead.
+        Ranges already covered by the AST detector are skipped.
+        """
+        if not self.config.get("enable_vocal_event_loudness_detection", False):
+            return []
+
+        from ..audio.loudness_scream_detector import LoudnessScreamDetector
+        from ..audio.vocal_event_detector import VocalEvent
+
+        source = self._resolve_vocals_stem() or audio_file
+        if not source or not os.path.exists(source):
+            return []
+
+        exclude: List[Tuple[float, float]] = [
+            (float(getattr(event, "start", 0.0)), float(getattr(event, "end", 0.0)))
+            for event in (existing_events or [])
+        ]
+
+        detector = LoudnessScreamDetector(
+            margin_db=float(self.config.get("vocal_event_loudness_margin_db", 3.0)),
+            floor_db=float(self.config.get("vocal_event_loudness_floor_db", -25.0)),
+            min_seconds=float(self.config.get("vocal_event_loudness_min_seconds", 0.1)),
+            merge_gap_seconds=float(
+                self.config.get("vocal_event_loudness_merge_gap_seconds", 0.3)
+            ),
+            kind=str(self.config.get("vocal_event_loudness_kind", "scream")),
+        )
+        try:
+            detected = detector.detect(source, exclude_ranges=exclude)
+        except Exception as exc:
+            logger.warning(f"Loudness based vocal event detection failed: {exc}")
+            return []
+
+        return [
+            VocalEvent(event.kind, float(event.start), float(event.end), float(event.score))
+            for event in detected
+        ]
+
+    def inject_vocal_tags(
+        self,
+        segments: List[Dict],
+        events: Optional[List[Any]] = None,
+        max_per_segment: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Insert non-verbal vocal tags (scream, sob, gasp, ...) into text.
+
+        Unlike laughter (one tag per segment), distinct kinds can coexist on a
+        segment up to ``max_per_segment``; repeating the same kind on the same
+        segment is skipped.
+        """
+        event_list = list(self._non_laugh_events()) if events is None else list(events)
+        event_list = [event for event in event_list if getattr(event, "kind", "laugh") != "laugh"]
+        cap = max_per_segment
+        if cap is None:
+            cap = int(self.config.get("vocal_event_max_per_segment", 3) or 0)
+        stats = {"events": len(event_list), "tagged_segments": 0, "skipped": 0, "already_tagged": 0}
+        if not event_list or not segments:
+            return stats
+
+        eligible: List[Tuple[int, Dict]] = []
+        for index, segment in enumerate(segments):
+            speaker = segment.get("speaker")
+            if self._get_tts_system_for_speaker(speaker or "") != "gemini38":
+                continue
+            start = segment.get("start")
+            end = segment.get("end")
+            if start is None or end is None or float(end) <= float(start):
+                continue
+            eligible.append((index, segment))
+
+        if not eligible:
+            stats["skipped"] = len(event_list)
+            return stats
+
+        kinds_by_segment: Dict[int, set] = {}
+        for event in sorted(event_list, key=lambda item: item.start):
+            kind = getattr(event, "kind", "")
+            if kind not in VOCAL_EVENT_TAG:
+                stats["skipped"] += 1
+                continue
+
+            best_index: Optional[int] = None
+            best_segment: Optional[Dict] = None
+            best_overlap = 0.0
+            for index, segment in eligible:
+                overlap = min(float(segment["end"]), event.end) - max(
+                    float(segment["start"]), event.start
+                )
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_index = index
+                    best_segment = segment
+
+            if best_segment is not None:
+                span = max(float(best_segment["end"]) - float(best_segment["start"]), 1e-6)
+                fraction = ((event.start + event.end) / 2.0 - float(best_segment["start"])) / span
+                fraction = min(max(fraction, 0.0), 1.0)
+            else:
+                nearest_index: Optional[int] = None
+                nearest_segment: Optional[Dict] = None
+                nearest_gap = float("inf")
+                append_to_end = True
+                for index, segment in eligible:
+                    gap_to_end = abs(event.start - float(segment["end"]))
+                    gap_to_start = abs(float(segment["start"]) - event.end)
+                    gap = min(gap_to_end, gap_to_start)
+                    if gap < nearest_gap:
+                        nearest_gap = gap
+                        nearest_index = index
+                        nearest_segment = segment
+                        append_to_end = gap_to_end <= gap_to_start
+                if nearest_segment is None or nearest_gap > LAUGHTER_NEAREST_GAP_SECONDS:
+                    stats["skipped"] += 1
+                    continue
+                best_index = nearest_index
+                best_segment = nearest_segment
+                fraction = 1.0 if append_to_end else 0.0
+
+            current_kinds = kinds_by_segment.get(best_index, set())
+            if kind in current_kinds:
+                stats["skipped"] += 1
+                continue
+            if cap and len(current_kinds) >= cap:
+                stats["skipped"] += 1
+                continue
+
+            if apply_vocal_tag(best_segment, fraction, kind):
+                kinds_by_segment.setdefault(best_index, set()).add(kind)
+                stats["tagged_segments"] += 1
+            else:
+                stats["already_tagged"] += 1
+
+        return stats
+
+    def _events_for_preservation(self) -> List[Any]:
+        """Events that still need the legacy split-around handling.
+
+        Laughter is intentionally excluded: ``laughter_mode='preserve'`` now
+        keeps every translation segment in place and only raises the original
+        audio/background volume during the detected laughter.  Non-verbal
+        events keep their legacy preserve behavior.
+        """
+        others: List[Any] = []
+        if self.config.get("vocal_events_mode") == "preserve":
+            others = self._non_laugh_events()
+        return list(others)
+
+    def _events_for_dubbing(self) -> Tuple[List[Any], List[Any]]:
+        """Events that should be voiced with TTS tags.
+
+        Returns ``(laugh_events, other_events)``; laughter keeps its dedicated
+        one-tag-per-segment injection, non-verbal events share a generic path.
+        """
+        laugh: List[Any] = []
+        if self.config.get("laughter_mode") != "preserve" and self._laughter_events:
+            laugh = list(self._laughter_events)
+        others: List[Any] = []
+        if self.config.get("vocal_events_mode") != "preserve":
+            others = self._non_laugh_events()
+        return laugh, others
+
     def inject_laughter_tags(
         self,
         segments: List[Dict],
@@ -1009,7 +1659,19 @@ class SmartDubbing:
         }
 
     def build_laughter_preserve_ranges(self, audio_file: Optional[str] = None) -> List[Tuple[float, float]]:
-        """Merge/pad detected laughter events into preserve ranges (window timeline)."""
+        """Merge/pad detected laughter events into volume-envelope ranges."""
+        events = [
+            event
+            for event in (getattr(self, "_vocal_events", None) or [])
+            if getattr(event, "kind", "laugh") == "laugh"
+        ] or list(self._laughter_events or [])
+        return SmartDubbing._event_preserve_ranges(self, events)
+
+    def build_vocal_preserve_ranges(self, audio_file: Optional[str] = None) -> List[Tuple[float, float]]:
+        """Merge/pad all preserve-mode vocal events (laugh + non-verbal)."""
+        return SmartDubbing._event_preserve_ranges(self, self._events_for_preservation())
+
+    def _event_preserve_ranges(self, events: List[Any]) -> List[Tuple[float, float]]:
         cfg = self._laughter_preserve_config()
         max_end = None
         try:
@@ -1019,7 +1681,7 @@ class SmartDubbing:
         except Exception:
             max_end = None
         ranges = build_laughter_preserve_ranges(
-            self._laughter_events or [],
+            events,
             pad_seconds=cfg["pad"],
             merge_gap=cfg["merge_gap"],
             min_duration=cfg["min_duration"],
@@ -1038,6 +1700,29 @@ class SmartDubbing:
         Returns ``(synthesis_segments, stats)``. The original ``segments`` list is
         left intact so subtitle export keeps whole sentences.
         """
+        return SmartDubbing._prepare_preservation(
+            self, segments, self.build_laughter_preserve_ranges(audio_file)
+        )
+
+    def prepare_vocal_preservation(
+        self,
+        segments: List[Dict],
+        audio_file: Optional[str] = None,
+    ) -> Tuple[List[Dict], Dict[str, Any]]:
+        """Split segments around all preserve-mode vocal events.
+
+        Laughter keeps its own ``laughter_mode`` switch; this method combines it
+        with non-verbal events (``vocal_events_mode == 'preserve'``).
+        """
+        return SmartDubbing._prepare_preservation(
+            self, segments, self.build_vocal_preserve_ranges(audio_file)
+        )
+
+    def _prepare_preservation(
+        self,
+        segments: List[Dict],
+        ranges: List[Tuple[float, float]],
+    ) -> Tuple[List[Dict], Dict[str, Any]]:
         stats = {
             "ranges": 0,
             "segments_split": 0,
@@ -1046,7 +1731,6 @@ class SmartDubbing:
             "skipped": 0,
             "seconds": 0.0,
         }
-        ranges = self.build_laughter_preserve_ranges(audio_file)
         stats["ranges"] = len(ranges)
         stats["seconds"] = sum(e - s for s, e in ranges)
         if not ranges or not segments:
@@ -1567,7 +2251,16 @@ class SmartDubbing:
                 f"{self.config.get('refinement_model_name') or 'default'}|"
                 f"{self.config.get('refinement_temperature', 1.0)}|"
                 f"{self.config.get('refinement_persona') or 'normal'}|"
-                "refinement_cache_v1"
+                f"{self.config.get('segment_stretch') or 'audio_and_video'}|"
+                f"{int(bool(self.config.get('creative_recovery_variants', False)))}|"
+                "refinement_cache_v2"
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        emotion_label_signature = hashlib.md5(
+            (
+                f"{int(bool(self.config.get('enable_emotion_enrichment', False)))}|"
+                f"{int(bool(self.config.get('enable_llm_editor', False)))}|"
+                "emotion_label_v1"
             ).encode("utf-8")
         ).hexdigest()[:12]
         cache_key = (
@@ -1576,6 +2269,7 @@ class SmartDubbing:
             f"_{self.config.get('target_language')}_gender_{speaker_metadata_hash}_keep_{int(preserve_segment_boundaries)}"
             f"_editor_{editor_signature}"
             f"_refine_{refinement_signature}"
+            f"_emolabel_{emotion_label_signature}"
         )
         step_name = "translation"
         
@@ -1655,19 +2349,24 @@ class SmartDubbing:
         Prefers the separated vocals stem (when audio-separator is used),
         falling back to the extracted source track.
         """
-        import glob as _glob
-
-        candidates: List[str] = []
-        try:
-            candidates.extend(sorted(_glob.glob("*Vocals*.wav")))
-            candidates.extend(sorted(_glob.glob("artifacts/audio/*Vocals*.wav")))
-        except Exception:
-            pass
-        candidates.append("artifacts/audio/source.wav")
-        for candidate in candidates:
-            if candidate and os.path.exists(candidate):
-                return candidate
+        stem = self._resolve_vocals_stem()
+        if stem:
+            return stem
+        if os.path.exists("artifacts/audio/source.wav"):
+            return "artifacts/audio/source.wav"
         return None
+
+    def _voice_note_for_speaker(self, speaker: Optional[str]) -> Optional[str]:
+        """Short voice advice (timbre) of a speaker, for the TTS instruction."""
+        if not speaker or not self.speaker_voice_profiles:
+            return None
+        try:
+            from src.tts.voice_advisor import voice_note_for_speaker
+
+            return voice_note_for_speaker(self.speaker_voice_profiles, speaker)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Voice advice lookup failed for '%s': %s", speaker, exc)
+            return None
 
     def _build_segment_cache_key(
         self,
@@ -1680,6 +2379,10 @@ class SmartDubbing:
         voice_name: Optional[str] = None,
         tts_model: Optional[str] = None,
         context_style: Optional[str] = None,
+        emotion: Optional[str] = None,
+        emotion_note: Optional[str] = None,
+        voice_note: Optional[str] = None,
+        voice_clone_token: Optional[str] = None,
     ) -> str:
         """Canonical segment cache-key used by prepass and main synthesis pass.
 
@@ -1689,13 +2392,23 @@ class SmartDubbing:
         The resolved voice name (and TTS model) are part of the key: audio cached
         for one voice must never be replayed after the voice mapping changes,
         otherwise e.g. a male speaker keeps a stale female-voiced render forever.
+        The segment emotion and its director's note are part of the key because
+        they change the delivery style passed to the TTS provider.
         """
         text_hash = hashlib.md5((text_value or "").encode()).hexdigest()[:8]
         model_hash = hashlib.md5((tts_model or "").encode()).hexdigest()[:8]
         context_hash = context_cache_token(context_style)
+        emotion_hash = hashlib.md5((emotion or "").strip().lower().encode()).hexdigest()[:6]
+        note_hash = hashlib.md5((emotion_note or "").strip().lower().encode()).hexdigest()[:6]
+        voice_note_hash = hashlib.md5((voice_note or "").strip().lower().encode()).hexdigest()[:6]
+        clone_hash = (
+            hashlib.md5(voice_clone_token.encode()).hexdigest()[:8]
+            if voice_clone_token
+            else "noclone"
+        )
         return (
             f"{base_cache_prefix}_{tts_system}_{segment_index}_"
-            f"{speaker}_{text_hash}_{voice_prompt_hash}_{voice_name or 'auto'}_{model_hash}_{context_hash}"
+            f"{speaker}_{text_hash}_{voice_prompt_hash}_{voice_name or 'auto'}_{model_hash}_{context_hash}_{emotion_hash}_{note_hash}_{voice_note_hash}_{clone_hash}"
         )
 
     def _run_batched_synthesis_prepass(
@@ -1748,13 +2461,20 @@ class SmartDubbing:
 
             voice_prompt_hash = hashlib.md5((style_prompt or "").encode()).hexdigest()[:8]
             tts_model = getattr(getattr(tts_instance, "config", None), "model", None)
+            voice_note = self._voice_note_for_speaker(speaker)
+            voice_clone_token = self._voice_clone_token_for(speaker)
 
             def make_cache_key(text_value: str, _tts=tts_system, _spk=speaker,
                                _idx=segment_index, _vph=voice_prompt_hash,
-                               _voice=voice_name, _model=tts_model) -> str:
+                               _voice=voice_name, _model=tts_model,
+                               _emo=segment_dict.get("emotion"),
+                               _note=segment_dict.get("emotion_direction"),
+                               _vnote=voice_note, _vclone=voice_clone_token) -> str:
                 return self._build_segment_cache_key(
                     base_cache_prefix, _tts, _idx, _spk, text_value, _vph,
-                    voice_name=_voice, tts_model=_model
+                    voice_name=_voice, tts_model=_model, emotion=_emo,
+                    emotion_note=_note, voice_note=_vnote,
+                    voice_clone_token=_vclone,
                 )
 
             if self.cache_manager.use_cache and not segment_dict.get("force_resynthesize", False):
@@ -1787,7 +2507,9 @@ class SmartDubbing:
             tts_segment_data_args = {
                 "speaker": speaker,
                 "text": active_segment.get("translation", ""),
-                "emotion": segment_dict.get("emotion", "Neutral"),
+                "emotion": segment_dict.get("emotion") or "Neutral",
+                "emotion_note": segment_dict.get("emotion_direction") or None,
+                "voice_note": voice_note,
                 "style_prompt": style_prompt,
                 "reference_audio_path": None,
                 "reference_text": None,
@@ -1837,6 +2559,10 @@ class SmartDubbing:
                 "voice_prompt_hash": voice_prompt_hash,
                 "voice_name": voice_name,
                 "tts_model": tts_model,
+                "emotion": segment_dict.get("emotion"),
+                "emotion_note": segment_dict.get("emotion_direction"),
+                "voice_note": voice_note,
+                "voice_clone_token": voice_clone_token,
             })
 
         if not batches_by_tts:
@@ -1958,6 +2684,10 @@ class SmartDubbing:
                 task["voice_prompt_hash"],
                 voice_name=task.get("voice_name"),
                 tts_model=task.get("tts_model"),
+                emotion=task.get("emotion"),
+                emotion_note=task.get("emotion_note"),
+                voice_note=task.get("voice_note"),
+                voice_clone_token=task.get("voice_clone_token"),
             )
             cache_path = segment_cache_path / f"{cache_key}.wav"
             if cache_path.exists():
@@ -1997,6 +2727,290 @@ class SmartDubbing:
                 + (f", skipped {skipped_fallback} fallback-model output(s)" if skipped_fallback else "")
             )
 
+    def build_background_voice_track(self, audio_file: str) -> Optional[str]:
+        """Original voice, warped onto the timeline of the dubbed track.
+
+        The dubbed track is assembled on its own timeline (the pauses between
+        the segments are compressed), so the original voice has to follow the
+        same mapping - otherwise the original voice drifts away from the dub.
+        The result is written to ``artifacts/audio/background_voice.wav`` and
+        mixed under the dubbed track by the video processor.
+        """
+        positions = getattr(self, "real_segment_positions", None) or []
+        if not positions:
+            return None
+
+        stem = self._resolve_vocals_stem() or audio_file
+        if not stem or not os.path.exists(stem):
+            return None
+
+        try:
+            source = AudioSegment.from_file(stem)
+        except Exception as exc:
+            logger.warning(f"Could not load the original voice for the background layer: {exc}")
+            return None
+
+        ordered = sorted(positions, key=lambda item: float(item.get("original_start", 0.0)))
+        total_ms = int(max(float(item.get("end", 0.0)) for item in ordered) * 1000)
+        if total_ms <= 0:
+            return None
+
+        track = AudioSegment.silent(duration=total_ms, frame_rate=source.frame_rate)
+        for item in ordered:
+            orig_start = float(item.get("original_start", 0.0))
+            orig_end = float(item.get("original_end", 0.0))
+            out_start = float(item.get("start", 0.0))
+            out_end = float(item.get("end", 0.0))
+            if orig_end <= orig_start or out_end <= out_start:
+                continue
+            clip = source[int(orig_start * 1000):int(orig_end * 1000)]
+            if len(clip) <= 0:
+                continue
+            target_ms = int((out_end - out_start) * 1000)
+            if target_ms <= 0:
+                continue
+            if abs(len(clip) - target_ms) > 20:
+                # Match the length of the dubbed segment (the pause between two
+                # segments is compressed, the segments themselves keep their
+                # length, so this is a small correction).
+                clip = clip.set_frame_rate(
+                    max(1000, int(clip.frame_rate * len(clip) / target_ms))
+                ).set_frame_rate(source.frame_rate)
+                if len(clip) > target_ms:
+                    clip = clip[:target_ms]
+                else:
+                    clip = clip + AudioSegment.silent(
+                        duration=target_ms - len(clip), frame_rate=source.frame_rate
+                    )
+            position_ms = int(out_start * 1000)
+            if position_ms + len(clip) > len(track):
+                track = track + AudioSegment.silent(
+                    duration=position_ms + len(clip) - len(track),
+                    frame_rate=source.frame_rate,
+                )
+            track = track.overlay(clip, position=position_ms)
+
+        output_path = "artifacts/audio/background_voice.wav"
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            track.export(output_path, format="wav")
+        except Exception as exc:
+            logger.warning(f"Could not write the background voice track: {exc}")
+            return None
+
+        logger.info(
+            "Background voice track built: %s (%.1fs, %d segment(s))",
+            output_path,
+            len(track) / 1000.0,
+            len(ordered),
+        )
+        return output_path
+
+    def build_laughter_bed_track(self, audio_file: str) -> Optional[str]:
+        """Original laughter only, warped onto the dubbed timeline.
+
+        This is the source for ``laughter_mode='preserve'``.  Unlike the full
+        background-voice track it contains nothing outside the detected
+        laughter ranges, so raising it during laughter cannot bring back
+        unrelated original dialogue.
+        """
+        positions = getattr(self, "real_segment_positions", None) or []
+        if not positions or not self.laughter_volume_ranges_original:
+            return None
+
+        stem = self._resolve_vocals_stem() or audio_file
+        if not stem or not os.path.exists(stem):
+            return None
+        try:
+            source = AudioSegment.from_file(stem)
+        except Exception as exc:
+            logger.warning("Could not load original audio for the laughter bed: %s", exc)
+            return None
+
+        total_ms = int(
+            max(float(item.get("end", 0.0)) for item in positions) * 1000
+        )
+        if total_ms <= 0:
+            return None
+        track = AudioSegment.silent(duration=total_ms, frame_rate=source.frame_rate)
+
+        for original_start, original_end in self.laughter_volume_ranges_original:
+            out_start = self.map_original_to_output(positions, original_start)
+            out_end = self.map_original_to_output(positions, original_end)
+            if out_start is None or out_end is None or out_end <= out_start:
+                continue
+            clip = source[int(original_start * 1000):int(original_end * 1000)]
+            if len(clip) <= 0:
+                continue
+            target_ms = int((out_end - out_start) * 1000)
+            if target_ms <= 0:
+                continue
+            if abs(len(clip) - target_ms) > 20:
+                clip = clip.set_frame_rate(
+                    max(1000, int(clip.frame_rate * len(clip) / target_ms))
+                ).set_frame_rate(source.frame_rate)
+                if len(clip) > target_ms:
+                    clip = clip[:target_ms]
+                else:
+                    clip = clip + AudioSegment.silent(
+                        duration=target_ms - len(clip),
+                        frame_rate=source.frame_rate,
+                    )
+            clip = clip.fade_in(30).fade_out(30)
+            position_ms = int(out_start * 1000)
+            if position_ms + len(clip) > len(track):
+                track = track + AudioSegment.silent(
+                    duration=position_ms + len(clip) - len(track),
+                    frame_rate=source.frame_rate,
+                )
+            track = track.overlay(clip, position=position_ms)
+
+        output_path = "artifacts/audio/laughter_source.wav"
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            track.export(output_path, format="wav")
+        except Exception as exc:
+            logger.warning("Could not write the laughter bed: %s", exc)
+            return None
+        logger.info(
+            "Laughter bed built: %s (%.1fs, %d range(s))",
+            output_path,
+            len(track) / 1000.0,
+            len(self.laughter_volume_ranges_original),
+        )
+        return output_path
+
+    def _ensure_speaker_reference_audio(self, audio_file: str, speakers_rolls: Dict) -> None:
+        """Make sure ``artifacts/speakers_audio/<SPEAKER>.wav`` exists.
+
+        Those samples are the original voice of each speaker. They are used to
+        match a similar TTS voice and to keep the speakers apart.
+        """
+        if not speakers_rolls or not audio_file:
+            return
+        needed = {
+            speaker
+            for speaker in set(speakers_rolls.values())
+            if speaker and not os.path.exists(f"artifacts/speakers_audio/{speaker}.wav")
+        }
+        if not needed:
+            return
+        try:
+            self.speaker_processor.extract_speaker_audio(audio_file, speakers_rolls)
+            logger.info(
+                "Extracted reference audio for %d speaker(s): %s",
+                len(needed),
+                ", ".join(sorted(needed)),
+            )
+        except Exception as exc:
+            logger.warning(f"Could not extract the speaker reference audio: {exc}")
+
+    def build_voice_clone_references(
+        self,
+        segments: List[Dict],
+        speakers_rolls: Dict,
+        audio_file: str,
+    ) -> Dict[str, VoiceCloneReference]:
+        """Build clean speaker references for stateless voice cloning.
+
+        The references are cut inside quiet gaps, checked against the other
+        speakers' diarization turns, and concatenated from several parts of the
+        source.  Speakers without enough clean material are simply omitted and
+        fall back to the normal library voice.
+        """
+        if not self.config.get('enable_voice_cloning', False):
+            self.voice_clone_references = {}
+            return {}
+        if str(self.config.get('tts_system') or '').strip().lower() != 'openrouter':
+            logger.info("Voice cloning is only wired for OpenRouter TTS; skipping")
+            self.voice_clone_references = {}
+            return {}
+        if not speakers_rolls or not audio_file:
+            logger.warning("Voice cloning enabled but no speaker rolls/audio are available")
+            self.voice_clone_references = {}
+            return {}
+
+        source_audio = self._resolve_speaker_reference_source_audio() or audio_file
+        if not source_audio or not os.path.exists(source_audio):
+            logger.warning("Voice cloning: source audio is unavailable (%s)", source_audio)
+            self.voice_clone_references = {}
+            return {}
+
+        transcript_segments: List[Dict[str, Any]] = []
+        for segment in segments or []:
+            speaker = str(segment.get("speaker") or "").strip()
+            if not speaker:
+                continue
+            try:
+                start = float(segment.get("start"))
+                end = float(segment.get("end"))
+            except (TypeError, ValueError):
+                continue
+            text = (
+                segment.get("text")
+                or segment.get("original_text")
+                or segment.get("originalText")
+                or ""
+            )
+            if not str(text).strip():
+                continue
+            transcript_segments.append(
+                {
+                    "speaker": speaker,
+                    "start": start,
+                    "end": end,
+                    "text": str(text).strip(),
+                }
+            )
+
+        manual_voices = self.config.get('voice_name')
+        manual_speakers = (
+            {str(speaker) for speaker, voice in manual_voices.items() if str(voice or '').strip()}
+            if isinstance(manual_voices, dict)
+            else set()
+        )
+        target_rolls = {
+            key: speaker
+            for key, speaker in speakers_rolls.items()
+            if str(speaker) not in manual_speakers
+        }
+
+        builder = VoiceCloneReferenceBuilder(VoiceCloneReferenceConfig())
+        references = builder.build_all(
+            source_audio,
+            target_rolls,
+            out_dir="artifacts/cloned_voices",
+            transcript_segments=transcript_segments,
+            all_speakers_rolls=speakers_rolls,
+        )
+        self.voice_clone_references = references
+        if references:
+            logger.info(
+                "Voice cloning: %d speaker reference(s) ready: %s",
+                len(references),
+                ", ".join(
+                    f"{speaker} ({reference.duration_seconds:.1f}s)"
+                    for speaker, reference in sorted(references.items())
+                ),
+            )
+        else:
+            logger.warning(
+                "Voice cloning: no speaker had enough clean speech; "
+                "falling back to library voices"
+            )
+        return references
+
+    def _voice_clone_token_for(self, speaker: Optional[str]) -> Optional[str]:
+        """Cache-key token for a cloned speaker (None when it is not cloned)."""
+        if not speaker or not self.config.get('enable_voice_cloning', False):
+            return None
+        voice_config = self.config.get('voice_name')
+        if isinstance(voice_config, dict) and str(voice_config.get(speaker) or '').strip():
+            # An explicit per-speaker voice mapping overrides cloning.
+            return None
+        reference = self.voice_clone_references.get(str(speaker))
+        return reference.cache_token if reference is not None else None
+
     def synthesize_speech(
         self, 
         segments: List[Dict], 
@@ -2022,6 +3036,26 @@ class SmartDubbing:
         """
         if not segments:
             raise ValueError("Cannot synthesize speech with no segments.")
+
+        # Reference audio of the speakers (their original voice). The voice
+        # matcher needs it to pick a similar voice, and it is the only way to
+        # give every speaker a different voice. In the API flow the
+        # transcription runs in a separate job, so the samples may be missing
+        # here - the extraction is cached and therefore cheap on a re-dub.
+        self._ensure_speaker_reference_audio(audio_file, speakers_rolls)
+
+        # Stateless voice cloning: build a clean per-speaker reference before
+        # the segment loop, then hand it to every TTS wrapper. Wrappers that do
+        # not support cloning ignore this mapping.
+        if self.config.get('enable_voice_cloning', False):
+            self.build_voice_clone_references(segments, speakers_rolls, audio_file)
+            for tts_instance in (self.tts_systems or {}).values():
+                setter = getattr(tts_instance, "set_voice_clone_references", None)
+                if callable(setter):
+                    try:
+                        setter(self.voice_clone_references)
+                    except Exception as clone_exc:
+                        logger.warning("Could not pass voice clone references to TTS: %s", clone_exc)
 
         # Start timing
         self.performance_tracker.start_timing("speech_synthesis")
@@ -2055,28 +3089,49 @@ class SmartDubbing:
             # Use edited segments
             segments = edited_segments
 
-        # Apply detected laughter moments as TTS tags once, after any editable
-        # override, so edited files created before the feature also get them.
-        # In 'preserve' mode the laughter is kept from the original audio and the
-        # translated speech is split around it instead (no TTS tags).
-        preserve_mode = (
-            self.config.get('laughter_mode') == 'preserve' and bool(self._laughter_events)
-        )
+        # Laughter preserve is a volume-envelope feature now: the translation
+        # segments stay exactly where they are, and the original/background
+        # track is boosted during laughter later in the final mix.
+        self.laughter_volume_ranges_original = []
+        self.laughter_volume_ranges_output = []
+        if self.config.get("laughter_mode") == "preserve":
+            self.laughter_volume_ranges_original = self.build_laughter_preserve_ranges(
+                audio_file
+            )
+            if self.laughter_volume_ranges_original:
+                logger.info(
+                    "Laughter preserve: %d range(s) will use a volume envelope; "
+                    "translation segments are unchanged",
+                    len(self.laughter_volume_ranges_original),
+                )
+            else:
+                logger.info(
+                    "Laughter preserve enabled but no laughter ranges were detected"
+                )
+
+        # Apply detected vocal events once, after any editable override, so
+        # edited files created before the feature also get them.
+        # Non-verbal preserve-mode events still use the legacy split-around
+        # behavior; laughter no longer splits anything.
+        preserve_events = self._events_for_preservation()
+        laugh_dub_events, other_dub_events = self._events_for_dubbing()
+        preserve_mode = bool(preserve_events)
         laughter_stats = None
+        vocal_tag_stats = None
         synthesis_segments = segments
         preserve_stats: Optional[Dict[str, Any]] = None
-        if preserve_mode:
-            synthesis_segments, preserve_stats = self.prepare_laughter_preservation(
+        if preserve_events:
+            synthesis_segments, preserve_stats = self.prepare_vocal_preservation(
                 segments, audio_file
             )
             logger.info(
-                "Laughter preservation: %d range(s), %d segment(s) split, %d skipped",
+                "Vocal event preservation: %d range(s), %d segment(s) split, %d skipped",
                 preserve_stats.get("ranges", 0),
                 preserve_stats.get("segments_split", 0),
                 preserve_stats.get("skipped", 0),
             )
-        elif self._laughter_events:
-            laughter_stats = self.inject_laughter_tags(segments)
+        if laugh_dub_events:
+            laughter_stats = self.inject_laughter_tags(synthesis_segments, events=laugh_dub_events)
             logger.info(
                 "Laughter annotation: %d moment(s), %d segment(s) tagged, %d skipped, %d already tagged",
                 laughter_stats.get("events", 0),
@@ -2084,10 +3139,19 @@ class SmartDubbing:
                 laughter_stats.get("skipped", 0),
                 laughter_stats.get("already_tagged", 0),
             )
-        laugh_signature = laughter_signature(segments)
+        if other_dub_events:
+            vocal_tag_stats = self.inject_vocal_tags(synthesis_segments, events=other_dub_events)
+            logger.info(
+                "Vocal event annotation: %d moment(s), %d segment(s) tagged, %d skipped, %d already tagged",
+                vocal_tag_stats.get("events", 0),
+                vocal_tag_stats.get("tagged_segments", 0),
+                vocal_tag_stats.get("skipped", 0),
+                vocal_tag_stats.get("already_tagged", 0),
+            )
+        vocal_signature = vocal_event_signature(synthesis_segments)
         cache_key = (
-            f"{base_cache_key}_laugh_{laugh_signature}"
-            if laugh_signature
+            f"{base_cache_key}_vocal_{vocal_signature}"
+            if vocal_signature
             else base_cache_key
         )
         if preserve_mode and preserve_stats is not None:
@@ -2126,9 +3190,9 @@ class SmartDubbing:
             logger.info("")
             logger.info("To edit translations:")
             logger.info(f"  1. Open and edit: {editable_path}")
-            logger.info(f"  2. Modify 'translation' field(s) as needed")
-            logger.info(f"  3. Set 'force_resynthesize': true for segments to force regeneration")
-            logger.info(f"  4. Rerun without --exit_before_synthesis flag")
+            logger.info("  2. Modify 'translation' field(s) as needed")
+            logger.info("  3. Set 'force_resynthesize': true for segments to force regeneration")
+            logger.info("  4. Rerun without --exit_before_synthesis flag")
             logger.info("")
             logger.info("The pipeline will automatically use your edited file.")
             logger.info("=" * 70)
@@ -2150,7 +3214,7 @@ class SmartDubbing:
                 self.performance_tracker.end_timing("speech_synthesis")
                 return output_path
         
-        logger.info(f"Synthesizing translated speech using multiple TTS systems...")
+        logger.info("Synthesizing translated speech using multiple TTS systems...")
 
         # From here on, synthesize the (possibly laughter-split) segments; the
         # original list is preserved for subtitles and the editable file.
@@ -2165,7 +3229,7 @@ class SmartDubbing:
         # unreachable with the new key format and stale audio must never be
         # replayed after a voice change (e.g. wrong-gender renders).
         try:
-            format_marker = segment_cache_path / ".cache_key_v3"
+            format_marker = segment_cache_path / ".cache_key_v4"
             if not format_marker.exists():
                 removed = 0
                 for old_entry in segment_cache_path.glob("*.wav"):
@@ -2327,8 +3391,12 @@ class SmartDubbing:
                 return best_text, best_ratio, best_deviation, best_track_type
 
             alternatives: List[Tuple[str, str]] = []
-            # Skip short variants in video/audio_and_video modes since video can be slowed down
-            skip_short_variants = segment_stretch_mode in ("video", "audio_and_video")
+            # Skip short variants in video/audio_and_video modes since video can
+            # be slowed down — unless creative recovery asks for tighter fallbacks.
+            skip_short_variants = (
+                segment_stretch_mode in ("video", "audio_and_video")
+                and not self.config.get("creative_recovery_variants", False)
+            )
             
             if ratio_normal < COMFORT_MIN_ADJUSTMENT_RATIO:
                 # Only try short variants in audio-only mode
@@ -2433,6 +3501,8 @@ class SmartDubbing:
             if tts_system == "gemini38" and self.config.get("enable_context_style", True):
                 context_style = self._build_context_style(segments, segment_index)
             segment_dict["context_style"] = context_style
+            voice_note = self._voice_note_for_speaker(speaker)
+            voice_clone_token = self._voice_clone_token_for(speaker)
 
             def make_cache_key(text_value: str) -> str:
                 return self._build_segment_cache_key(
@@ -2445,6 +3515,10 @@ class SmartDubbing:
                     voice_name=voice_name,
                     tts_model=tts_model,
                     context_style=context_style,
+                    emotion=segment_dict.get("emotion"),
+                    emotion_note=segment_dict.get("emotion_direction"),
+                    voice_note=voice_note,
+                    voice_clone_token=voice_clone_token,
                 )
 
             # Default cache key/path (used when saving new audio)
@@ -2524,7 +3598,9 @@ class SmartDubbing:
             tts_segment_data_args = {
                 "speaker": speaker,
                 "text": active_segment["translation"],
-                "emotion": segment_dict.get("emotion", "Neutral"),
+                "emotion": segment_dict.get("emotion") or "Neutral",
+                "emotion_note": segment_dict.get("emotion_direction") or None,
+                "voice_note": voice_note,
                 "style_prompt": segment_style_prompt,
                 "reference_audio_path": None,
                 "reference_text": None,
@@ -2780,12 +3856,9 @@ class SmartDubbing:
             progress_callback=grouping_progress_callback
         )
 
-        # Restore the original laughter audio into the reserved gaps so the
-        # dubbed track never overlaps it (laughter_mode == 'preserve').
-        if preserve_mode and self._laughter_preserve_ranges:
-            combined_audio = self.splice_preserved_laughter(
-                combined_audio, audio_file, real_segment_positions
-            )
+        # Laughter preserve no longer splices audio or reserves gaps: the
+        # final mix raises the original/background layer during the detected
+        # ranges while the dubbed speech continues on its own timeline.
 
         output_path = "artifacts/audio/output.wav"
         combined_audio.export(output_path, format="wav")
@@ -2794,6 +3867,22 @@ class SmartDubbing:
         self.real_segment_positions = real_segment_positions
         # Store video speed segments for video processing (video/audio_and_video modes)
         self.video_speed_segments = video_speed_segments
+
+        # Map laughter ranges from the original timeline into the assembled
+        # dubbed timeline. The background voice track is warped to the same
+        # timeline, so the envelope raises the right moments.
+        self.laughter_volume_ranges_output = []
+        for range_start, range_end in self.laughter_volume_ranges_original:
+            out_start = self.map_original_to_output(real_segment_positions, range_start)
+            out_end = self.map_original_to_output(real_segment_positions, range_end)
+            if out_start is None or out_end is None or out_end <= out_start:
+                continue
+            self.laughter_volume_ranges_output.append((out_start, out_end))
+        if self.laughter_volume_ranges_output:
+            logger.info(
+                "Laughter preserve: %d range(s) mapped to the dubbed timeline",
+                len(self.laughter_volume_ranges_output),
+            )
         
         # Log information about real vs original timing
         if real_segment_positions:
@@ -2837,7 +3926,7 @@ class SmartDubbing:
             logger.info(f"Total segments synthesized: {total_estimated}")
             logger.info(f"[HIT] Accurate estimations (within comfort zone): {accurate} ({accuracy_rate:.1f}%)")
             logger.info(f"[MISS] Inaccurate estimations (required resynthesis): {inaccurate} ({miss_rate:.1f}%)")
-            logger.info(f"")
+            logger.info("")
             logger.info(f"Overall Accuracy Rate: {accuracy_rate:.1f}%")
             logger.info(f"Overall Miss Rate: {miss_rate:.1f}%")
             logger.info(f"Comfort zone range: {COMFORT_MIN_ADJUSTMENT_RATIO:.2f} - {COMFORT_MAX_ADJUSTMENT_RATIO:.2f}")
@@ -2898,10 +3987,12 @@ class SmartDubbing:
                             "spliced": len(getattr(self, "_preserved_laughter_output", [])),
                             "spliced_ranges": list(getattr(self, "_preserved_laughter_output", [])),
                             "mode": self.config.get("laughter_mode", "dub"),
-                        }
+                        },
+                        "vocal_events_preservation": self._vocal_event_preserve_metrics(),
                     }
                     if getattr(self, "_preserved_laughter_stats", {}).get("ranges")
                     or getattr(self, "_preserved_laughter_output", [])
+                    or self._vocal_event_preserve_metrics()
                     else None
                 ),
             ).build_and_write()
@@ -3242,7 +4333,7 @@ class SmartDubbing:
                                 except Exception:
                                     pass
                     else:
-                        logger.debug(f"LLM adjustment produced no change or empty result, skipping synthesis")
+                        logger.debug("LLM adjustment produced no change or empty result, skipping synthesis")
         except Exception as e:
             logger.warning(f"LLM adjustment step encountered an error: {e}")
 
@@ -3669,7 +4760,6 @@ class SmartDubbing:
             speaker_tracks[speaker] = speaker_track.overlay(adjusted_group_audio, position=position_ms)
             
             processed_groups += 1
-            from src.utils.time_utils import format_seconds_to_srt
             duration_ms = len(adjusted_group_audio)
             logger.debug(f"Processed group {group_idx+1} for speaker {speaker}: "
                         f"{len(group)} segments, ratio={ratio_clamped:.2f}")

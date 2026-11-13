@@ -18,10 +18,15 @@ from src.dubbing.core.log_config import get_logger
 try:
     import torch
     import torchaudio
-    from pydub import AudioSegment
     PYTORCH_AVAILABLE = True
 except ImportError:
     PYTORCH_AVAILABLE = False
+
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
 
 try:
     import librosa
@@ -62,19 +67,19 @@ class AudioFileUtils:
     @staticmethod
     def get_audio_duration_seconds(audio_path: Union[str, Path]) -> Optional[float]:
         """Gets the duration of an audio file in seconds."""
-        try:
-            if PYTORCH_AVAILABLE and hasattr(torchaudio, 'info'):
+        if PYTORCH_AVAILABLE and hasattr(torchaudio, 'info'):
+            try:
                 info = torchaudio.info(str(audio_path))
                 return info.num_frames / info.sample_rate
-            elif PYTORCH_AVAILABLE and 'AudioSegment' in globals():
-                audio_segment = AudioSegment.from_file(str(audio_path))
-                return audio_segment.duration_seconds
-            else:
-                logger.warning("Warning: Cannot determine audio duration. torchaudio.info or pydub not fully available.")
-                return None
-        except Exception as e:
-            logger.error(f"Error getting duration for {audio_path}: {e}")
-            return None
+            except Exception as exc:
+                logger.debug(f"torchaudio.info failed for {audio_path}: {exc}")
+        if PYDUB_AVAILABLE:
+            try:
+                return AudioSegment.from_file(str(audio_path)).duration_seconds
+            except Exception as exc:
+                logger.debug(f"pydub failed to read {audio_path}: {exc}")
+        logger.warning("Warning: Cannot determine audio duration. torchaudio.info or pydub not fully available.")
+        return None
 
     @staticmethod
     def concatenate_audio_files(audio_files: List[str], sample_rate: int = SAMPLE_RATE) -> bytes:

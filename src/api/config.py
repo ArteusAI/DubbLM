@@ -64,7 +64,48 @@ class Settings:
     s3_presign_expires: int = field(
         default_factory=lambda: int(os.getenv("S3_PRESIGN_EXPIRES", str(7 * 24 * 3600)))  # 7 days
     )
-    
+
+    # ИИ Борщ publishing (disabled by default)
+    borsch_publish_enabled: bool = field(
+        default_factory=lambda: os.getenv("BORSCH_PUBLISH_ENABLED", "false").lower() in ("1", "true", "yes")
+    )
+    borsch_api_url: str = field(
+        default_factory=lambda: (os.getenv("BORSCH_API_URL") or "http://37.27.141.35").rstrip("/")
+    )
+    borsch_public_url: str = field(
+        default_factory=lambda: (os.getenv("BORSCH_PUBLIC_URL") or "http://37.27.141.35").rstrip("/")
+    )
+    borsch_s3_bucket: str = field(
+        default_factory=lambda: os.getenv("BORSCH_S3_BUCKET") or "arteus-pub"
+    )
+    borsch_s3_prefix: str = field(
+        default_factory=lambda: (os.getenv("BORSCH_S3_PREFIX") or "videos").strip().strip("/")
+    )
+    borsch_channel: str = field(
+        default_factory=lambda: os.getenv("BORSCH_CHANNEL") or "ИИ Борщ"
+    )
+    borsch_metadata_language: str = field(
+        default_factory=lambda: (os.getenv("BORSCH_METADATA_LANGUAGE") or "auto").strip().lower()
+    )
+    borsch_llm_provider: str = field(
+        default_factory=lambda: (os.getenv("BORSCH_LLM_PROVIDER") or "openrouter").strip().lower()
+    )
+    borsch_llm_model: str = field(
+        default_factory=lambda: os.getenv("BORSCH_LLM_MODEL") or "~google/gemini-flash-latest"
+    )
+    borsch_llm_temperature: float = field(
+        default_factory=lambda: float(os.getenv("BORSCH_LLM_TEMPERATURE", "0.4"))
+    )
+    borsch_llm_timeout: int = field(
+        default_factory=lambda: int(os.getenv("BORSCH_LLM_TIMEOUT", "120"))
+    )
+    borsch_publish_timeout: int = field(
+        default_factory=lambda: int(os.getenv("BORSCH_PUBLISH_TIMEOUT", "1800"))
+    )
+    borsch_max_fallback_upload_bytes: int = field(
+        default_factory=lambda: int(os.getenv("BORSCH_MAX_FALLBACK_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+    )
+
     # Video download settings (yt-dlp)
     max_download_size: int = field(default_factory=lambda: int(os.getenv("MAX_DOWNLOAD_SIZE", str(8 * 1024 * 1024 * 1024))))  # 8GB
     max_download_duration: int | None = field(default_factory=lambda: _parse_optional_int(os.getenv("MAX_DOWNLOAD_DURATION")))

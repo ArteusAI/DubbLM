@@ -37,7 +37,7 @@ STAGE_LABELS: Dict[str, str] = {
     "segment_normalization": "Segment normalization",
     "context_analysis": "Context analysis",
     "translation": "Translation",
-    "emotion_analysis": "Laughter detection",
+    "emotion_analysis": "Delivery analysis",
     "speech_synthesis": "Speech synthesis",
     "background_audio": "Background audio",
     "audio_normalization": "Audio normalization",
@@ -141,6 +141,7 @@ class ReportBuilder:
             "api_costs": api_costs,
             "transcription_usage": transcription_usage,
             "laughter_preservation": self.extra_metrics.get("laughter_preservation"),
+            "vocal_events_preservation": self.extra_metrics.get("vocal_events_preservation"),
             "segments": segments,
             "batches": batches,
             "artifacts": artifacts,
@@ -273,6 +274,7 @@ class ReportBuilder:
                 "duration_seconds": float(rep.duration_seconds) if rep else 0.0,
                 "output_path": (rep.output_path if rep else None) or meta.get("output_path"),
                 "error": rep.error if rep else None,
+                "voice": rep.voice if rep else None,
                 "voice_similarity": rep.voice_similarity if rep else None,
                 "voice_validation": rep.voice_validation if rep else None,
                 "voice_forced": bool(rep.voice_forced) if rep else False,
@@ -281,6 +283,8 @@ class ReportBuilder:
                 "laughter_score": rep.laughter_score if rep else None,
                 "laughter_fallback": bool(rep.laughter_fallback) if rep else False,
                 "laughter_attempts": int(rep.laughter_attempts) if rep else 0,
+                "vocal_events_required": rep.vocal_events_required if rep else None,
+                "vocal_events_missing": rep.vocal_events_missing if rep else None,
             }
             out.append(entry)
         return out
@@ -696,7 +700,11 @@ def _format_api_rate(rates: Dict[str, Any], source: Optional[str]) -> str:
 
 
 def _render_segment_table(rows: List[Dict[str, Any]]) -> List[str]:
-    out = ["| # | Text | Model | Attempts | Time |", "|---:|---|---|---:|---:|"]
+    has_voice = any(row.get("voice") for row in rows)
+    if has_voice:
+        out = ["| # | Text | Model | Voice | Attempts | Time |", "|---:|---|---|---|---:|---:|"]
+    else:
+        out = ["| # | Text | Model | Attempts | Time |", "|---:|---|---|---:|---:|"]
     for row in rows:
         model = row.get("actual_model") or "—"
         if row.get("used_fallback"):
@@ -706,13 +714,24 @@ def _render_segment_table(rows: List[Dict[str, Any]]) -> List[str]:
         success_mark = "" if row.get("success", True) else " ❌"
         time_sec = float(row.get("duration_seconds", 0) or 0)
         text_cell = (row.get("text_preview") or "").replace("|", "\\|").replace("\n", " ")
-        out.append(
-            f"| {int(row.get('segment_index', -1)) + 1} "
-            f"| {text_cell} "
-            f"| {model} "
-            f"| {int(row.get('attempts', 0))} "
-            f"| {time_sec:.2f}s{success_mark} |"
-        )
+        if has_voice:
+            voice_cell = _escape_cell(row.get("voice")) or "—"
+            out.append(
+                f"| {int(row.get('segment_index', -1)) + 1} "
+                f"| {text_cell} "
+                f"| {model} "
+                f"| {voice_cell} "
+                f"| {int(row.get('attempts', 0))} "
+                f"| {time_sec:.2f}s{success_mark} |"
+            )
+        else:
+            out.append(
+                f"| {int(row.get('segment_index', -1)) + 1} "
+                f"| {text_cell} "
+                f"| {model} "
+                f"| {int(row.get('attempts', 0))} "
+                f"| {time_sec:.2f}s{success_mark} |"
+            )
     return out
 
 

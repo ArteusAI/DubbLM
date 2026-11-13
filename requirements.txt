@@ -34,7 +34,7 @@ cairocffi==1.7.1
 cairosvg==2.7.1
 catalogue==2.0.10
 celery==5.5.2
-certifi==2025.4.26
+certifi==2026.10.23
 cffi==1.17.1
 chardet==5.2.0
 charset-normalizer==3.4.2
@@ -383,5 +383,5 @@ x-transformers==2.2.12
 xxhash==3.5.0
 yarl==1.20.0
 youtube-dl==2021.12.17
-yt-dlp[default]>=2026.06.09
+yt-dlp[default]>=2026.10.21
 zopfli==0.2.3.post1

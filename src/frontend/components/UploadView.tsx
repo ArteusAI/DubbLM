@@ -8,8 +8,11 @@ import {
   LLM_PROVIDERS,
   TTS_PROVIDERS,
   normalizeTtsSystem,
+  resolveVoiceCatalogProvider,
   TRANSCRIPTION_PROVIDERS,
   WHISPER_MODELS,
+  OPENROUTER_STT_DEFAULT_MODEL,
+  OPENROUTER_STT_MODEL_OPTIONS,
   TTS_STYLES,
   GEMINI_DEFAULT_TTS_MODEL,
   GEMINI_EXPERIMENTAL_TTS_MODEL,
@@ -18,6 +21,7 @@ import {
   GEMINI38_TTS_MODEL_OPTIONS,
   OPENROUTER_DEFAULT_TTS_MODEL,
   OPENROUTER_TTS_MODEL_OPTIONS,
+  OPENROUTER_MODEL_VOICES,
 } from '../constants';
 import api, { VoiceResponse } from '../api';
 
@@ -183,18 +187,75 @@ export const UploadView: React.FC<UploadViewProps> = ({
     onConfigChange({ speakerTtsPrompts: currentPrompts });
   };
 
+  // Copy the voice advice of the delivery analysis into the speaker prompt.
+  const handleApplyVoiceAdvice = (speakerName: string, advice: string) => {
+    if (!advice) return;
+    const currentPrompts = { ...speakerPromptsRef.current };
+    const existing = (currentPrompts[speakerName] || '').trim();
+    currentPrompts[speakerName] = existing
+      ? `${existing}, ${advice}`
+      : advice;
+    speakerPromptsRef.current = currentPrompts;
+    onConfigChange({ speakerTtsPrompts: currentPrompts });
+  };
+
   const currentPreset = useMemo(() => 
-    PRESETS.find(p => p.id === (config.preset || 'hq')) || PRESETS[1],
+    PRESETS.find(p => p.id === (config.preset || 'ultra')) || PRESETS[2],
     [config.preset]
   );
   const isEditorEnabled = config.enableLlmEditor ?? currentPreset.enableLlmEditor ?? false;
 
-  const selectedTtsProvider = normalizeTtsSystem(config.ttsSystem || currentPreset.ttsSystem).ttsSystem || 'openai';
-  const providerVoices = useMemo(
-    () => voices.filter((voice) => voice.provider === selectedTtsProvider),
-    [voices, selectedTtsProvider]
-  );
+  const selectedTtsProvider = normalizeTtsSystem(config.ttsSystem || currentPreset.ttsSystem).ttsSystem || 'gemini38';
+  const selectedTtsModel = config.ttsModel || currentPreset.ttsModel || '';
+  const openrouterModel = selectedTtsProvider === 'openrouter' ? selectedTtsModel : '';
+  const voiceCatalogProvider = resolveVoiceCatalogProvider(selectedTtsProvider);
+  const providerVoices = useMemo(() => {
+    const providerVoiceList = voices.filter((voice) => voice.provider === voiceCatalogProvider);
+    if (selectedTtsProvider !== 'openrouter' || !openrouterModel) {
+      return providerVoiceList;
+    }
+    // The API reports which models accept each voice. Voices without that
+    // metadata fall back to the static map (offline / older API).
+    const staticVoices = OPENROUTER_MODEL_VOICES[openrouterModel];
+    const scoped = providerVoiceList.filter((voice) => {
+      if (voice.models && voice.models.length > 0) {
+        return voice.models.includes(openrouterModel);
+      }
+      return staticVoices ? staticVoices.includes(voice.id) : true;
+    });
+    // Drama 3 shows the hand-picked cast instead of the raw Fish library.
+    // Other languages keep the live-library fallback.
+    if (openrouterModel === 'fish-audio/drama-3') {
+      const targetLang = (config.targetLang || 'ru').split('-')[0].toLowerCase();
+      const curated = scoped.filter((voice) => {
+        if (!voice.curated) return false;
+        return (voice.language || '')
+          .split(',')
+          .map((code) => code.trim().toLowerCase())
+          .includes(targetLang);
+      });
+      if (curated.length > 0) {
+        return curated;
+      }
+      // No curated cast for this language: never fall back to the Russian
+      // curated voices. Keep the live/verified voices only.
+      const nonCurated = scoped.filter((voice) => !voice.curated);
+      if (nonCurated.length > 0) {
+        return nonCurated;
+      }
+    }
+    // Unknown/custom model: show every provider voice instead of an empty list.
+    return scoped.length > 0 ? scoped : providerVoiceList;
+  }, [voices, selectedTtsProvider, voiceCatalogProvider, openrouterModel, config.targetLang]);
   const defaultProviderVoiceId = providerVoices[0]?.id || '';
+  const openrouterModelHasNoVoices =
+    selectedTtsProvider === 'openrouter' &&
+    openrouterModel in OPENROUTER_MODEL_VOICES &&
+    OPENROUTER_MODEL_VOICES[openrouterModel].length === 0 &&
+    providerVoices.length === 0;
+  const voiceCloningSupported =
+    selectedTtsProvider === 'openrouter' && openrouterModel === 'fish-audio/drama-3';
+  const voiceCloningEnabled = config.enableVoiceCloning ?? voiceCloningSupported;
   const getVoiceKey = (voice: VoiceResponse): string => `${voice.provider}:${voice.id}`;
 
   useEffect(() => {
@@ -386,7 +447,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
           {/* Preset Selector */}
           <div className="flex bg-zinc-900 border border-zinc-700 rounded-lg p-1 gap-1">
             {PRESETS.map((preset) => {
-              const isSelected = (config.preset || 'hq') === preset.id;
+              const isSelected = (config.preset || 'ultra') === preset.id;
               return (
                 <button
                   key={preset.id}
@@ -412,6 +473,9 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         presetFromApi?.ttsSystem ?? preset.ttsSystem,
                         presetFromApi?.ttsModel ?? preset.ttsModel,
                       ),
+                      ttsTransport: (presetFromApi?.ttsTransport as 'openrouter' | 'google' | undefined) ?? preset.ttsTransport ?? 'openrouter',
+                      transcriptionSystem: (presetFromApi?.transcriptionSystem as 'openrouter' | 'assemblyai' | 'openai' | 'whisperx' | undefined) ?? 'openrouter',
+                      openrouterSttModel: presetFromApi?.openrouterSttModel ?? 'microsoft/mai-transcribe-2',
                       ttsStyle: (presetFromApi?.ttsStyle as TtsStyleId | undefined) ?? preset.ttsStyle ?? 'podcast',
                       ttsPromptPrefix: presetFromApi?.ttsPromptPrefix ?? preset.ttsPromptPrefix,
                       voiceAutoSelection: presetFromApi?.voiceAutoSelection ?? preset.voiceAutoSelection,
@@ -421,6 +485,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                       contextStyleMaxChars: presetFromApi?.contextStyleMaxChars ?? preset.contextStyleMaxChars,
                       dubbedVolume: presetFromApi?.dubbedVolume ?? preset.dubbedVolume,
                       backgroundVolume: presetFromApi?.backgroundVolume ?? preset.backgroundVolume,
+                      backgroundVoiceVolume: presetFromApi?.backgroundVoiceVolume ?? preset.backgroundVoiceVolume ?? 0,
                       normalizeAudio: presetFromApi?.normalizeAudio ?? preset.normalizeAudio,
                       useTwoPassEncoding: presetFromApi?.useTwoPassEncoding ?? preset.useTwoPassEncoding,
                       videoQualityPreset: presetFromApi?.videoQualityPreset ?? preset.videoQualityPreset,
@@ -603,11 +668,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Provider
-                            <InfoTip text="Transcription service (AssemblyAI, OpenAI+PyAnnote, or local WhisperX)" />
+                            <InfoTip text="Transcription service (OpenRouter MAI, AssemblyAI, OpenAI+PyAnnote, or local WhisperX)" />
                           </label>
                           <select 
-                            value={config.transcriptionSystem || 'assemblyai'}
-                            onChange={(e) => onConfigChange({ transcriptionSystem: e.target.value as 'assemblyai' | 'openai' | 'whisperx' })}
+                            value={config.transcriptionSystem || 'openrouter'}
+                            onChange={(e) => onConfigChange({ transcriptionSystem: e.target.value as 'openrouter' | 'assemblyai' | 'openai' | 'whisperx' })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
                           >
                             {TRANSCRIPTION_PROVIDERS.map(p => (
@@ -616,20 +681,40 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           </select>
                         </div>
                         <div className="space-y-1">
-                          <label className={`text-[10px] flex items-center ${(config.transcriptionSystem || 'assemblyai') !== 'assemblyai' ? 'text-zinc-500' : 'text-zinc-600'}`}>
-                            Whisper Model
-                            <InfoTip text="Model size for WhisperX/OpenAI transcription" />
-                          </label>
-                          <select 
-                            value={config.whisperModel || 'large-v3'}
-                            onChange={(e) => onConfigChange({ whisperModel: e.target.value })}
-                            disabled={(config.transcriptionSystem || 'assemblyai') === 'assemblyai'}
-                            className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none ${(config.transcriptionSystem || 'assemblyai') === 'assemblyai' ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          >
-                            {WHISPER_MODELS.map(m => (
-                              <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                          </select>
+                          {(config.transcriptionSystem || 'openrouter') === 'openrouter' ? (
+                            <>
+                              <label className="text-[10px] text-zinc-500 flex items-center">
+                                OpenRouter model
+                                <InfoTip text="MAI-Transcribe 2 gives word timestamps and speaker diarization" />
+                              </label>
+                              <select
+                                value={config.openrouterSttModel || OPENROUTER_STT_DEFAULT_MODEL}
+                                onChange={(e) => onConfigChange({ openrouterSttModel: e.target.value })}
+                                className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                              >
+                                {OPENROUTER_STT_MODEL_OPTIONS.map(model => (
+                                  <option key={model} value={model}>{model}</option>
+                                ))}
+                              </select>
+                            </>
+                          ) : (
+                            <>
+                              <label className={`text-[10px] flex items-center ${(config.transcriptionSystem || 'openrouter') !== 'assemblyai' ? 'text-zinc-500' : 'text-zinc-600'}`}>
+                                Whisper Model
+                                <InfoTip text="Model size for WhisperX/OpenAI transcription" />
+                              </label>
+                              <select
+                                value={config.whisperModel || 'large-v3'}
+                                onChange={(e) => onConfigChange({ whisperModel: e.target.value })}
+                                disabled={(config.transcriptionSystem || 'openrouter') === 'assemblyai'}
+                                className={`w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none ${(config.transcriptionSystem || 'openrouter') === 'assemblyai' ? 'opacity-40 cursor-not-allowed' : ''}`}
+                              >
+                                {WHISPER_MODELS.map(m => (
+                                  <option key={m.id} value={m.id}>{m.name}</option>
+                                ))}
+                              </select>
+                            </>
+                          )}
                         </div>
                       </div>
                       <label className="flex items-start gap-2 cursor-pointer max-w-[420px] pt-1">
@@ -668,14 +753,14 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Model
-                            <InfoTip text="Model name for translation (e.g., gemini-2.5-pro)" />
+                            <InfoTip text="Model name for translation (e.g. ~google/gemini-flash-latest)" />
                           </label>
                           <input 
                             type="text"
                             value={config.llmModelName || currentPreset.llmModelName}
                             onChange={(e) => onConfigChange({ llmModelName: e.target.value })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                            placeholder="gemini-2.5-pro"
+                            placeholder="~google/gemini-flash-latest"
                           />
                         </div>
                         <div className="space-y-1">
@@ -726,7 +811,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             value={config.refinementModelName || currentPreset.refinementModelName || ''}
                             onChange={(e) => onConfigChange({ refinementModelName: e.target.value || undefined })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
-                            placeholder="gemini-2.5-pro"
+                            placeholder="~google/gemini-flash-latest"
                           />
                         </div>
                         <div className="space-y-1">
@@ -843,7 +928,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Provider
-                            <InfoTip text="TTS provider (openai, gemini38, minimax, openrouter)" />
+                            <InfoTip text="TTS provider (Gemini 3.8 via OpenRouter, OpenRouter Qwen/Fish/Grok; OpenAI/MiniMax are legacy)" />
                           </label>
                           <select 
                             value={selectedTtsProvider}
@@ -851,6 +936,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                               const provider = e.target.value;
                               onConfigChange({ 
                                 ttsSystem: provider,
+                                ttsTransport: provider === 'gemini' || provider === 'gemini38' ? 'openrouter' : config.ttsTransport,
                                 ttsModel: TTS_DEFAULT_MODELS[provider] || '',
                                 ttsPromptPrefix: provider === 'gemini' || provider === 'gemini38' ? config.ttsPromptPrefix : undefined,
                               });
@@ -926,15 +1012,28 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         </div>
                       </div>
                       <div className="grid grid-cols-2 gap-3">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
+                        {voiceCloningSupported && (
+                          <label className="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={voiceCloningEnabled}
+                              onChange={(e) => onConfigChange({ enableVoiceCloning: e.target.checked })}
+                              className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                            />
+                            <span className="text-[10px] text-zinc-400">Voice cloning</span>
+                            <InfoTip text="Clone each speaker from clean, non-overlapping source segments. On by default for Fish Audio Drama 3. A pinned per-speaker voice overrides cloning." />
+                          </label>
+                        )}
+                        <label className={`flex items-center gap-1.5 cursor-pointer ${voiceCloningEnabled ? 'opacity-40' : ''}`}>
                           <input 
                             type="checkbox" 
                             checked={config.voiceAutoSelection ?? currentPreset.voiceAutoSelection ?? true}
                             onChange={(e) => onConfigChange({ voiceAutoSelection: e.target.checked })}
-                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                            disabled={voiceCloningEnabled}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600 disabled:cursor-not-allowed"
                           />
                           <span className="text-[10px] text-zinc-400">Auto Voice</span>
-                          <InfoTip text="Automatically match voices to speakers based on audio" />
+                          <InfoTip text="Automatically match voices to speakers based on audio. Ignored while voice cloning is enabled." />
                         </label>
                         <label className="flex items-center gap-1.5 cursor-pointer">
                           <input 
@@ -947,14 +1046,24 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           <InfoTip text="Enrich TTS prompts with detected emotions" />
                         </label>
                         <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input 
-                            type="checkbox" 
+                          <input
+                            type="checkbox"
+                            checked={config.enableVideoEmotionAnalysis ?? currentPreset.enableVideoEmotionAnalysis ?? false}
+                            onChange={(e) => onConfigChange({ enableVideoEmotionAnalysis: e.target.checked })}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                          />
+                          <span className="text-[10px] text-zinc-400">Delivery analysis</span>
+                          <InfoTip text="One Gemini VLM request watches the source as a single stream (picture + original audio) and tells how every line is performed. The result (emotion + delivery note) becomes the TTS instruction." />
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
                             checked={config.enableLaughterDetection ?? currentPreset.enableLaughterDetection ?? false}
                             onChange={(e) => onConfigChange({ enableLaughterDetection: e.target.checked })}
                             className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
                           />
                           <span className="text-[10px] text-zinc-400">Laughter</span>
-                          <InfoTip text="Detect laughter moments in the source audio. 'Voice it' dubs laughter with Gemini 3.8 laughter tags (with validation); 'Keep original' preserves the source laughter audio and arranges the translated speech around it so nothing overlaps." />
+                          <InfoTip text="Detect laughter moments in the source audio. 'Voice it' dubs laughter with TTS tags; 'Keep original' preserves the source laughter and smoothly raises the original/background layer to 70% in those moments. Translation segments and their timing stay unchanged." />
                         </label>
                         {(config.enableLaughterDetection ?? currentPreset.enableLaughterDetection ?? false) && (
                           <select
@@ -965,6 +1074,38 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             <option value="dub">Voice it</option>
                             <option value="preserve">Keep original</option>
                           </select>
+                        )}
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={config.enableVocalEventDetection ?? currentPreset.enableVocalEventDetection ?? false}
+                            onChange={(e) => onConfigChange({ enableVocalEventDetection: e.target.checked })}
+                            className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                          />
+                          <span className="text-[10px] text-zinc-400">Screams &amp; sobbing</span>
+                          <InfoTip text="Detect non-verbal vocal events (screams, crying, gasps, whispers...) with the AST AudioSet model on the separated vocals track. 'Keep original' preserves the source performance and arranges the translated speech around it; 'Voice it' renders the events with Gemini 3.8 vocal tags." />
+                        </label>
+                        {(config.enableVocalEventDetection ?? currentPreset.enableVocalEventDetection ?? false) && (
+                          <>
+                            <select
+                              value={config.vocalEventsMode ?? currentPreset.vocalEventsMode ?? 'preserve'}
+                              onChange={(e) => onConfigChange({ vocalEventsMode: e.target.value as 'dub' | 'preserve' })}
+                              className="bg-zinc-950 border border-zinc-700/50 rounded px-1.5 py-1 text-[10px] text-white appearance-none focus:ring-1 focus:ring-brand-500/50 outline-none"
+                            >
+                              <option value="preserve">Keep original</option>
+                              <option value="dub">Voice it</option>
+                            </select>
+                            <label className="flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={config.enableVocalEventLoudnessDetection ?? currentPreset.enableVocalEventLoudnessDetection ?? false}
+                                onChange={(e) => onConfigChange({ enableVocalEventLoudnessDetection: e.target.checked })}
+                                className="w-3 h-3 rounded border-zinc-700 bg-zinc-900 text-brand-600"
+                              />
+                              <span className="text-[10px] text-zinc-400">Loud shouts</span>
+                              <InfoTip text="Also find shouted lines by their loudness. The AudioSet model does not recognise shouted dialogue, so the loudness envelope of the vocals track is used as a second signal." />
+                            </label>
+                          </>
                         )}
                         <label className="flex items-center gap-1.5 cursor-pointer">
                           <input
@@ -987,6 +1128,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                           <InfoTip text="Gemini 3.8 only: pass the previous translated line as a quoted delivery context in style. It is never spoken; keeps intonation continuous across adjacent lines." />
                         </label>
                       </div>
+                      {voiceCloningSupported && voiceCloningEnabled && (
+                        <p className="text-[9px] leading-4 text-zinc-600">
+                          Clean reference segments are collected from different parts of the source and cut inside quiet gaps. Reference audio is sent to OpenRouter; use only voices you have the rights to clone. A pinned per-speaker voice overrides cloning.
+                        </p>
+                      )}
                       <div className="space-y-1">
                         {(() => {
                           const effectiveStyle: TtsStyleId =
@@ -1044,6 +1190,13 @@ export const UploadView: React.FC<UploadViewProps> = ({
                               const hasProviderVoice = providerVoices.some((voice) => voice.id === voiceId);
                               const canPreview = Boolean(selectedVoice?.preview_url);
                               const isPlaying = selectedVoice ? playingSampleKey === getVoiceKey(selectedVoice) : false;
+                              const speakerGender = config.speakerMetadata?.[speaker]?.inferredGender;
+                              const voiceGender = selectedVoice?.gender;
+                              const genderMismatch = Boolean(
+                                speakerGender && speakerGender !== 'unknown' &&
+                                voiceGender && voiceGender !== 'unknown' &&
+                                speakerGender !== voiceGender
+                              );
 
                               return (
                                 <div key={speaker} className="flex items-center gap-2 bg-zinc-950/50 rounded p-1.5">
@@ -1062,6 +1215,14 @@ export const UploadView: React.FC<UploadViewProps> = ({
                                       </option>
                                     ))}
                                   </select>
+                                  {genderMismatch && (
+                                    <span
+                                      className="text-[9px] text-amber-400/90 shrink-0"
+                                      title={`Speaker is ${speakerGender}, voice is ${voiceGender}. The voice will still be used as assigned.`}
+                                    >
+                                      пол не совпадает
+                                    </span>
+                                  )}
                                   <button
                                     onClick={() => handleToggleVoiceSample(selectedVoice)}
                                     disabled={!canPreview}
@@ -1076,6 +1237,34 @@ export const UploadView: React.FC<UploadViewProps> = ({
                                     title="Remove mapping"
                                   >
                                     <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {Object.keys(config.speakerVoiceProfiles || {}).length > 0 && (
+                          <div className="space-y-1.5">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[10px] text-zinc-400">Совет по голосу</span>
+                              <InfoTip text="Gemini описала голос каждого персонажа по видео и звуку. Совет сужает подбор голоса и попадает в инструкцию TTS." />
+                            </div>
+                            {Object.entries(config.speakerVoiceProfiles || {}).map(([speaker, profile]) => {
+                              const advice = [profile?.timbre, profile?.age].filter(Boolean).join(', ');
+                              return (
+                                <div key={speaker} className="flex items-center gap-2 bg-zinc-950/50 rounded p-1.5">
+                                  <span className="text-[10px] font-medium text-zinc-400 min-w-[70px] shrink-0">{speaker}</span>
+                                  <span className="flex-1 text-[10px] text-zinc-300 truncate" title={advice}>
+                                    {advice || '—'}
+                                  </span>
+                                  <button
+                                    onClick={() => handleApplyVoiceAdvice(speaker, advice)}
+                                    disabled={!advice}
+                                    className="text-[9px] text-zinc-500 hover:text-brand-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
+                                    title="Добавить совет в промпт спикера"
+                                  >
+                                    в промпт
                                   </button>
                                 </div>
                               );
@@ -1098,7 +1287,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             className={`flex-1 bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none ${providerVoices.length === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
                             {providerVoices.length === 0 ? (
-                              <option value="">No voices for {selectedTtsProvider}</option>
+                              <option value="">
+                                {openrouterModelHasNoVoices
+                                  ? `${openrouterModel} has no selectable voices`
+                                  : `No voices for ${selectedTtsProvider}`}
+                              </option>
                             ) : (
                               providerVoices.map((voice) => (
                                 <option key={voice.id} value={voice.id}>
@@ -1127,6 +1320,11 @@ export const UploadView: React.FC<UploadViewProps> = ({
                         <p className="text-[9px] text-zinc-600">
                           Example speaker names: SPEAKER_00, SPEAKER_01
                         </p>
+                        {openrouterModelHasNoVoices && (
+                          <p className="text-[9px] text-amber-500/80">
+                            {openrouterModel} does not support voice selection — the provider picks the voice itself.
+                          </p>
+                        )}
                       </div>
 
                       {/* Per-Speaker TTS Prompts */}
@@ -1197,7 +1395,7 @@ export const UploadView: React.FC<UploadViewProps> = ({
                     {/* Audio Section */}
                     <div className="space-y-2">
                       <h4 className="text-[10px] uppercase tracking-wider text-zinc-500 font-medium">Audio</h4>
-                      <div className="grid grid-cols-3 gap-2">
+                      <div className="grid grid-cols-4 gap-2">
                         <div className="space-y-1">
                           <label className="text-[10px] text-zinc-500 flex items-center">
                             Dubbed Vol
@@ -1218,13 +1416,28 @@ export const UploadView: React.FC<UploadViewProps> = ({
                             BG Vol
                             <InfoTip text="Volume for background when kept (0.56 ≈ -5dB)" />
                           </label>
-                          <input 
+                          <input
                             type="number"
                             step="0.1"
                             min="0"
                             max="1"
                             value={config.backgroundVolume ?? currentPreset.backgroundVolume ?? 0.56}
                             onChange={(e) => onConfigChange({ backgroundVolume: parseFloat(e.target.value) })}
+                            className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] text-zinc-500 flex items-center">
+                            BG Voice
+                            <InfoTip text="The original voice stays in the mix under the dub, quieter than the dubbed voice (0 = off)." />
+                          </label>
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0"
+                            max="1"
+                            value={config.backgroundVoiceVolume ?? currentPreset.backgroundVoiceVolume ?? 0}
+                            onChange={(e) => onConfigChange({ backgroundVoiceVolume: parseFloat(e.target.value) })}
                             className="w-full bg-zinc-950 border border-zinc-700/50 rounded px-2 py-1.5 text-[11px] text-white focus:ring-1 focus:ring-brand-500/50 outline-none"
                           />
                         </div>

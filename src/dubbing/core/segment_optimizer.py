@@ -99,6 +99,28 @@ class SegmentOptimizer:
             return len(words)
         return len(str(segment.get('text') or '').split())
 
+    def _word_speaker_boundary_matches(
+        self, left: Dict[str, Any], right: Dict[str, Any]
+    ) -> bool:
+        """Return False when word-level speaker labels disagree at the join.
+
+        With word-level diarization a segment can legitimately carry a trailing
+        speaker change. Merging across such a boundary would hand one
+        character's words to the other's voice, so refuse the merge.
+        """
+        left_words = left.get('words')
+        right_words = right.get('words')
+        if not isinstance(left_words, list) or not left_words:
+            return True
+        if not isinstance(right_words, list) or not right_words:
+            return True
+
+        left_speaker = left_words[-1].get('speaker') if isinstance(left_words[-1], dict) else None
+        right_speaker = right_words[0].get('speaker') if isinstance(right_words[0], dict) else None
+        if not left_speaker or not right_speaker:
+            return True
+        return left_speaker == right_speaker
+
     def _is_short_speaker_fragment(self, segment: Dict[str, Any]) -> bool:
         max_duration = float(self.opt_cfg.get('speaker_fragment_max_duration', 3.0))
         max_words = int(self.opt_cfg.get('speaker_fragment_max_words', 10))
@@ -224,7 +246,13 @@ class SegmentOptimizer:
             # Check if we can merge with current segment
             same_speaker = segment.get('speaker') == current_segment.get('speaker')
             gap = segment['start'] - current_segment['end']
-            can_merge = same_speaker and gap <= max_gap
+            merge_enabled = bool(self.opt_cfg.get('merge_same_speaker_segments', True))
+            can_merge = (
+                merge_enabled
+                and same_speaker
+                and gap <= max_gap
+                and self._word_speaker_boundary_matches(current_segment, segment)
+            )
 
             if can_merge:
                 # Check token limits before merging

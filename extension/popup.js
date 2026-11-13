@@ -34,7 +34,8 @@ document.addEventListener('DOMContentLoaded', () => {
       headers['Authorization'] = `Bearer ${apiToken}`;
     }
 
-    fetch(`${serverUrl}/health`, { headers })
+    const baseUrl = serverUrl.replace(/\/+$/, '');
+    fetch(`${baseUrl}/health`, { headers })
       .then(response => {
         if (response.ok) {
           statusIndicator.textContent = 'Connected';

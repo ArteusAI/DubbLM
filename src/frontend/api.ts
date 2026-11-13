@@ -38,7 +38,7 @@ class ApiClient {
         const error: ApiError = await response.json().catch(() => ({
           detail: `HTTP ${response.status}: ${response.statusText}`,
         }));
-        throw new Error(error.detail);
+        throw Object.assign(new Error(error.detail), { status: response.status });
       }
 
       if (response.status === 204) {
@@ -345,6 +345,19 @@ class ApiClient {
     return this.request<LanguageResponse[]>('/resources/languages');
   }
 
+  // --- Setup ---
+
+  async getSetupStatus(): Promise<SetupStatusResponse> {
+    return this.request<SetupStatusResponse>('/setup/status');
+  }
+
+  async saveOpenRouterKey(key: string): Promise<SetupStatusResponse> {
+    return this.request<SetupStatusResponse>('/setup/openrouter-key', {
+      method: 'POST',
+      body: JSON.stringify({ key }),
+    });
+  }
+
   // --- Settings ---
 
   async getSettings(): Promise<SettingsResponse> {
@@ -503,6 +516,34 @@ class ApiClient {
     return `${this.baseUrl}/projects/${projectId}/download/report`;
   }
 
+  // --- ИИ Борщ publishing ---
+
+  async getBorschPublish(
+    projectId: string,
+    adminToken?: string,
+  ): Promise<BorschPublishState> {
+    const headers = adminToken ? { 'X-Borsch-Admin-Token': adminToken } : undefined;
+    return this.request<BorschPublishState>(
+      `/projects/${projectId}/publish/borsch`,
+      { headers },
+    );
+  }
+
+  async publishToBorsch(
+    projectId: string,
+    adminToken: string,
+    force = false,
+  ): Promise<BorschPublishState> {
+    const qs = force ? '?force=true' : '';
+    return this.request<BorschPublishState>(
+      `/projects/${projectId}/publish/borsch${qs}`,
+      {
+        method: 'POST',
+        headers: { 'X-Borsch-Admin-Token': adminToken },
+      },
+    );
+  }
+
   // --- SSE Status Stream ---
 
   subscribeToStatus(
@@ -604,6 +645,7 @@ export interface ProjectConfig {
   startTime?: number;
   duration?: number;
   transcriptionSystem?: string;
+  openrouterSttModel?: string;
   whisperModel?: string;
   llmProvider?: string;
   llmModelName?: string;
@@ -616,19 +658,36 @@ export interface ProjectConfig {
   editorReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'none';
   speakerTtsPrompts?: Record<string, string>;
   speakerVoiceMappings?: Record<string, string>;
+  autoSelectedVoices?: Record<string, string>;
   enableSpeakerGenderInference?: boolean;
   speakerMetadata?: Record<string, SpeakerMetadata>;
+  enableLaughterDetection?: boolean;
+  laughterMode?: 'dub' | 'preserve';
+  enableVocalEventDetection?: boolean;
+  vocalEventsMode?: 'dub' | 'preserve';
+  vocalEventKinds?: string[];
+  enableVocalEventLoudnessDetection?: boolean;
   refinementLlmProvider?: string;
   refinementModelName?: string;
   refinementTemperature?: number;
   translationPromptPrefix?: string;
   ttsSystem?: string;
+  ttsTransport?: 'openrouter' | 'google';
   ttsModel?: string;
   ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
   resolvedTtsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news';
   voiceAutoSelection?: boolean;
+  enableVoiceCloning?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableVideoEmotionAnalysis?: boolean;
+  videoEmotionAnalysisModel?: string;
+  videoEmotionAnalysisFps?: number;
+  videoEmotionAnalysisDirectionMaxChars?: number;
+  videoEmotionAnalysisLanguage?: string;
+  enableVoiceAdvisor?: boolean;
+  voiceAdviceMaxCandidates?: number;
+  speakerVoiceProfiles?: Record<string, VoiceProfile>;
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;
@@ -639,6 +698,7 @@ export interface ProjectConfig {
   contentValidatorSpeechModel?: string;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  backgroundVoiceVolume?: number;
   normalizeAudio?: boolean;
   keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
@@ -694,6 +754,16 @@ export interface SpeakerMetadata {
   rawLabel?: string | null;
   modelId?: string | null;
   overrideGender?: SpeakerGender | null;
+}
+
+/** Voice advice of a character, produced by the video+audio delivery analysis. */
+export interface VoiceProfile {
+  speaker: string;
+  timbre: string;
+  age: string;
+  energy: number;
+  accent: string;
+  gender: string;
 }
 
 export interface SegmentResponse {
@@ -809,6 +879,13 @@ export interface VoiceResponse {
   gender?: string;
   language?: string;
   preview_url?: string;
+  description?: string;
+  models?: string[];
+  accent?: string;
+  age?: string;
+  native?: boolean;
+  character?: boolean;
+  curated?: boolean;
 }
 
 export interface PersonaResponse {
@@ -855,9 +932,45 @@ export interface ProjectStatsResponse {
   resultHeight?: number;
 }
 
+export interface BorschPublishMetadata {
+  title: string;
+  channel?: string;
+  summary: string;
+  why_hn: string;
+  content_type: string;
+  level: string;
+  shelf_life: string;
+  primary_topic: string;
+  tags: string[];
+  category_ids: string[];
+  reason: string;
+  license?: string;
+  source_url?: string | null;
+}
+
+export interface BorschPublishState {
+  enabled: boolean;
+  published: boolean;
+  vid?: string;
+  status?: 'processing' | 'ready' | 'failed' | 'missing' | string;
+  url?: string;
+  publishedAt?: string;
+  metadata?: BorschPublishMetadata;
+  sourceUrl?: string | null;
+  error?: string;
+}
+
 export interface ProjectReportResponse {
   markdown: string;
   json: unknown | null;
+}
+
+export interface SetupStatusResponse {
+  configured: boolean;
+  required: boolean;
+  provider: 'openrouter';
+  masked?: string;
+  source?: string;
 }
 
 export interface SettingsResponse {
@@ -892,17 +1005,30 @@ export interface PresetDefaultsResponse {
   refinementModelName?: string;
   refinementTemperature?: number;
   ttsSystem?: string;
+  ttsTransport?: 'openrouter' | 'google';
   ttsModel?: string;
   ttsFallbackModel?: string;
   ttsStyle?: 'podcast' | 'lecture' | 'gothic' | 'news' | 'custom' | 'auto';
   ttsPromptPrefix?: string;
   voiceAutoSelection?: boolean;
+  enableVoiceCloning?: boolean;
   enableEmotionEnrichment?: boolean;
+  enableVideoEmotionAnalysis?: boolean;
+  videoEmotionAnalysisModel?: string;
+  videoEmotionAnalysisFps?: number;
+  videoEmotionAnalysisDirectionMaxChars?: number;
+  videoEmotionAnalysisLanguage?: string;
+  enableVoiceAdvisor?: boolean;
+  voiceAdviceMaxCandidates?: number;
+  speakerVoiceProfiles?: Record<string, VoiceProfile>;
+  transcriptionSystem?: string;
+  openrouterSttModel?: string;
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  backgroundVoiceVolume?: number;
   normalizeAudio?: boolean;
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: '720p' | '1080p' | 'original';

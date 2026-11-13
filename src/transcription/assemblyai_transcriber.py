@@ -30,6 +30,9 @@ class AssemblyAITranscriber(BaseTranscriber):
         mp3_size_threshold_mb: int = 20,
         cost_tracker: Optional[Any] = None,
         speakers_expected: Optional[int] = None,
+        enable_gemini_speaker_labeling: bool = False,
+        gemini_speaker_labeling_model: Optional[str] = None,
+        gemini_speaker_labeling_max_speakers: Optional[int] = None,
         **kwargs
     ):
         """
@@ -54,6 +57,11 @@ class AssemblyAITranscriber(BaseTranscriber):
         self.mp3_size_threshold_mb = mp3_size_threshold_mb
         self.cost_tracker = cost_tracker
         self.speakers_expected = speakers_expected
+        self.enable_gemini_speaker_labeling = bool(enable_gemini_speaker_labeling)
+        from src.transcription.gemini_speaker_labeler import DEFAULT_MODEL as _GEMINI_LABEL_MODEL
+
+        self.gemini_speaker_labeling_model = gemini_speaker_labeling_model or _GEMINI_LABEL_MODEL
+        self.gemini_speaker_labeling_max_speakers = int(gemini_speaker_labeling_max_speakers or 4)
         
         # Get API key from environment
         self.api_key = os.environ.get("ASSEMBLYAI_API_KEY")
@@ -272,6 +280,15 @@ class AssemblyAITranscriber(BaseTranscriber):
             # Process transcript and split overly long segments (>420 chars)
             transcription = self._process_assemblyai_transcript(transcript)
 
+            # Optional Gemini-assisted speaker labeling: AssemblyAI diarization
+            # can collapse different characters on hard material. Gemini hears
+            # the audio and re-labels the transcript; word timings stay anchored
+            # to the AssemblyAI output.
+            if self.enable_gemini_speaker_labeling and transcription:
+                transcription = self._apply_gemini_speaker_labeling(
+                    processed_audio_file, transcription
+                )
+
             # Build speakers_rolls mapping from the (potentially) split transcription
             speakers_rolls = {
                 (seg["start"], seg["end"]): seg["speaker"] for seg in transcription
@@ -372,7 +389,106 @@ class AssemblyAITranscriber(BaseTranscriber):
         
         logger.debug(f"Extracted {len(speakers_rolls)} speaker segments")
         return speakers_rolls
-    
+
+    def _apply_gemini_speaker_labeling(
+        self, audio_file: str, transcription: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Re-label speakers with Gemini while keeping ASR word timings."""
+        from src.transcription.gemini_speaker_labeler import (
+            align_labeled_segments_to_words,
+            label_speakers_with_gemini,
+        )
+
+        lines = [
+            {
+                "start": round(float(segment["start"]), 3),
+                "end": round(float(segment["end"]), 3),
+                "text": segment["text"],
+            }
+            for segment in transcription
+        ]
+        if str(audio_file).startswith(("http://", "https://")):
+            logger.warning("Gemini speaker labeling skipped: remote audio URL is not supported")
+            return transcription
+        words = [word for segment in transcription for word in (segment.get("words") or [])]
+        if not words:
+            logger.warning("Gemini speaker labeling skipped: ASR produced no word timestamps")
+            return transcription
+
+        try:
+            labeled = label_speakers_with_gemini(
+                audio_file,
+                lines,
+                model=self.gemini_speaker_labeling_model,
+                max_speakers=self.gemini_speaker_labeling_max_speakers,
+            )
+            realigned = align_labeled_segments_to_words(labeled, words)
+        except Exception as exc:
+            logger.warning("Gemini speaker labeling failed, keeping AssemblyAI labels: %s", exc)
+            return transcription
+
+        if len(realigned) < 2:
+            logger.warning(
+                "Gemini speaker labeling produced %d segment(s); keeping AssemblyAI labels",
+                len(realigned),
+            )
+            return transcription
+
+        logger.info(
+            "Gemini speaker labeling: %d ASR segment(s) -> %d labeled segment(s), %d speaker(s)",
+            len(transcription),
+            len(realigned),
+            len({segment["speaker"] for segment in realigned}),
+        )
+        return realigned
+
+    def _split_words_by_speaker(
+        self, words, default_speaker: str
+    ) -> List[List[Dict[str, Any]]]:
+        """Split an utterance's words into consecutive same-speaker runs.
+
+        AssemblyAI exposes a speaker label per word. A single utterance can
+        still span a speaker change when diarization is unstable (e.g. on
+        music-heavy audio), so we re-segment on word-level speaker boundaries.
+        Returns a list of runs, each a list of word dicts including a
+        ``speaker`` field. Empty/untimed words are skipped.
+        """
+        runs: List[List[Dict[str, Any]]] = []
+        current_run: List[Dict[str, Any]] = []
+        current_speaker: Optional[str] = None
+
+        for word in words or []:
+            start = getattr(word, "start", None)
+            end = getattr(word, "end", None)
+            text = getattr(word, "text", None)
+            if start is None or end is None or not text:
+                continue
+
+            raw_speaker = getattr(word, "speaker", None)
+            speaker = f"SPEAKER_{raw_speaker}" if raw_speaker else default_speaker
+
+            if current_speaker is None or speaker == current_speaker:
+                current_speaker = speaker
+            else:
+                if current_run:
+                    runs.append(current_run)
+                current_run = []
+                current_speaker = speaker
+
+            current_run.append(
+                {
+                    "word": text,
+                    "start": start / 1000.0,
+                    "end": end / 1000.0,
+                    "confidence": getattr(word, "confidence", None),
+                    "speaker": speaker,
+                }
+            )
+
+        if current_run:
+            runs.append(current_run)
+        return runs
+
     def _process_assemblyai_transcript(self, transcript) -> List[Dict[str, Any]]:
         """
         Process AssemblyAI transcript into a list of segments with timing information.
@@ -388,36 +504,43 @@ class AssemblyAITranscriber(BaseTranscriber):
         # Use utterances if available (preferred as they contain speaker info)
         if hasattr(transcript, 'utterances') and transcript.utterances:
             for utterance in transcript.utterances:
-                text = utterance.text.strip()
-                start = utterance.start / 1000.0  # Convert ms to seconds
-                end = utterance.end / 1000.0      # Convert ms to seconds
-                speaker = f"SPEAKER_{utterance.speaker}"
+                default_speaker = f"SPEAKER_{utterance.speaker}"
+                utt_start = utterance.start / 1000.0  # Convert ms to seconds
+                utt_end = utterance.end / 1000.0      # Convert ms to seconds
                 confidence = getattr(utterance, 'confidence', None)
-                
-                if text and start < end:  # Ensure valid segment
+                words = getattr(utterance, 'words', None) or []
+
+                word_runs = self._split_words_by_speaker(words, default_speaker)
+                if word_runs:
+                    for run in word_runs:
+                        text = " ".join(w["word"] for w in run).strip()
+                        start = run[0]["start"]
+                        end = run[-1]["end"]
+                        if not text or start >= end:
+                            continue
+                        segment = {
+                            "text": text,
+                            "start": start,
+                            "end": end,
+                            "speaker": run[0].get("speaker") or default_speaker,
+                            "words": run,
+                        }
+                        if confidence is not None:
+                            segment["confidence"] = confidence
+                        records.append(segment)
+                    continue
+
+                # No usable word timings - keep the utterance as a single segment.
+                text = utterance.text.strip() if getattr(utterance, "text", None) else ""
+                if text and utt_start < utt_end:  # Ensure valid segment
                     segment = {
                         "text": text,
-                        "start": start,
-                        "end": end,
-                        "speaker": speaker
+                        "start": utt_start,
+                        "end": utt_end,
+                        "speaker": default_speaker
                     }
-                    
                     if confidence is not None:
                         segment["confidence"] = confidence
-                        
-                    # Add word-level details if available
-                    if hasattr(utterance, 'words') and utterance.words:
-                        words = []
-                        for word in utterance.words:
-                            word_data = {
-                                "word": word.text,
-                                "start": word.start / 1000.0,
-                                "end": word.end / 1000.0,
-                                "confidence": word.confidence
-                            }
-                            words.append(word_data)
-                        segment["words"] = words
-                    
                     records.append(segment)
         
         # Fall back to sentences if utterances are not available

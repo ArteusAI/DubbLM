@@ -1,31 +1,32 @@
 """Celery tasks for background processing."""
 
 import os
-import sys
 import logging
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, Literal, cast
 
-from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
 
 from sqlalchemy.orm.attributes import flag_modified
 
 from .celery_app import celery_app
 from ..database.session import get_db_session
-from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus, JobType
+from ..database.models import Project, Segment, Job, JobStatus, ProjectStatus
 from ..services.project_manager import ProjectManager
 from ..services.settings_service import get_api_key, apply_api_keys_to_env, API_KEY_PROVIDERS
 from ..services.preset_service import get_preset_config
 from ..services.segment_optimization_config import apply_segment_optimization_config
 from src.dubbing.tts_styles import get_blocked_voices_for_style, resolve_tts_prompt_prefix
+from src.tts.openrouter_voice_catalog import resolve_voice_cloning_enabled
 from src.dubbing.debug.cost_ledger import import_cost_snapshots, write_cost_snapshot_from_tracker
 from src.dubbing.audio.speaker_gender_inferencer import SpeakerGenderInferencer
 from src.utils.speaker_gender import (
     SPEAKER_GENDER_SIGNATURE_CONFIG_KEY,
     SPEAKER_METADATA_CONFIG_KEY,
+    SPEAKER_VOICE_PROFILES_CONFIG_KEY,
     build_effective_gender_prompt_section,
     build_translation_gender_signature,
     normalize_bool,
@@ -167,6 +168,262 @@ def _load_project_config(project_id: str, *, fresh: bool = False) -> Dict[str, A
         if not project:
             raise ValueError(f"Project {project_id} not found")
         return dict(project.config or {})
+    finally:
+        db.close()
+
+
+def _video_emotion_analysis_enabled(
+    config_data: Dict[str, Any],
+    preset_config: Dict[str, Any],
+) -> bool:
+    """Is the video+audio emotion analysis enabled for this project?"""
+    value = config_data.get(
+        "enableVideoEmotionAnalysis",
+        preset_config.get("enable_video_emotion_analysis", False),
+    )
+    return bool(value)
+
+
+def _voice_advisor_enabled(
+    config_data: Dict[str, Any],
+    preset_config: Dict[str, Any],
+) -> bool:
+    """Is the voice advice (timbre per speaker) enabled for this project?"""
+    value = config_data.get(
+        "enableVoiceAdvisor",
+        preset_config.get("enable_voice_advisor", False),
+    )
+    return bool(value)
+
+
+def _run_video_emotion_analysis(
+    project_id: str,
+    job_id: Optional[str],
+    segments: list,
+    source_file: Path,
+    config_data: Dict[str, Any],
+    preset_config: Dict[str, Any],
+    cost_tracker: Optional[Any] = None,
+) -> list:
+    """Analyze the original performance (video + audio) of every segment.
+
+    The segments are updated in place with ``emotion``, ``emotion_intensity``
+    and ``emotion_direction``. Failures are logged and never break the
+    pipeline: dubbing without a delivery analysis still works.
+    """
+    if not _video_emotion_analysis_enabled(config_data, preset_config):
+        return []
+    if not segments:
+        return []
+    if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+        logger.info(
+            "Video emotion analysis is enabled but no Google key is configured; "
+            "skipping legacy Gemini VLM analysis."
+        )
+        return []
+
+    try:
+        from src.dubbing.video.gemini_emotion_analyzer import (
+            DEFAULT_MODEL,
+            EmotionAnalysisConfig,
+            analyze_delivery,
+        )
+    except Exception as import_exc:  # pragma: no cover - defensive
+        logger.warning("Emotion analysis unavailable: %s", import_exc)
+        return {}
+
+    model = (
+        config_data.get("videoEmotionAnalysisModel")
+        or preset_config.get("video_emotion_analysis_model")
+        or DEFAULT_MODEL
+    )
+    try:
+        fps = float(
+            config_data.get(
+                "videoEmotionAnalysisFps",
+                preset_config.get("video_emotion_analysis_fps", 0.5),
+            )
+        )
+    except (TypeError, ValueError):
+        fps = 0.5
+    try:
+        direction_max_chars = int(
+            config_data.get(
+                "videoEmotionAnalysisDirectionMaxChars",
+                preset_config.get("video_emotion_analysis_direction_max_chars", 90),
+            )
+        )
+    except (TypeError, ValueError):
+        direction_max_chars = 90
+    language = (
+        config_data.get("videoEmotionAnalysisLanguage")
+        or preset_config.get("video_emotion_analysis_language")
+        or "en"
+    )
+
+    analysis_config = EmotionAnalysisConfig(
+        model=model,
+        fps=fps,
+        direction_max_chars=direction_max_chars,
+        language=language,
+        start_time=config_data.get("startTime"),
+        duration=config_data.get("duration"),
+        cost_tracker=cost_tracker,
+        cache_dir=str(Path("cache")),
+    )
+
+    logger.info(
+        "[WORKER] Analyzing delivery with %s (video + audio) for %d segment(s)",
+        model,
+        len(segments),
+    )
+    started = time.time()
+    try:
+        analysis = analyze_delivery(str(source_file), segments, analysis_config)
+    except Exception as exc:
+        logger.warning("Video emotion analysis failed: %s", exc)
+        if job_id:
+            add_job_log(job_id, f"Emotion analysis failed: {exc}", "warning")
+        return {}
+
+    if not analysis.lines:
+        if job_id:
+            add_job_log(job_id, "Emotion analysis returned no annotations", "warning")
+        return {}
+
+    labeled = sum(
+        1
+        for segment in segments
+        if str(segment.get("emotion") or "").lower() not in {"", "neutral"}
+    )
+    logger.info(
+        "[WORKER] Emotion analysis done in %.1fs: %d/%d segment(s) with a non-neutral delivery",
+        time.time() - started,
+        labeled,
+        len(segments),
+    )
+    if job_id:
+        add_job_log(
+            job_id,
+            f"Emotion analysis: {labeled}/{len(segments)} segment(s) tagged with a delivery",
+        )
+
+    profiles = {}
+    if _voice_advisor_enabled(config_data, preset_config):
+        profiles = _build_speaker_voice_profiles(analysis, config_data)
+    if profiles:
+        _save_speaker_voice_profiles(project_id, profiles)
+        described = ", ".join(
+            f"{speaker}: {profile.get('timbre') or profile.get('age') or 'n/a'}"
+            for speaker, profile in profiles.items()
+        )
+        logger.info("[WORKER] Voice advice: %s", described)
+        if job_id:
+            add_job_log(job_id, f"Voice advice: {described}")
+    return profiles
+
+
+def _build_speaker_voice_profiles(analysis, config_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn the analysed speaker voices into voice profiles.
+
+    The gender that the pipeline already knows wins over the model's guess.
+    """
+    try:
+        from src.tts.voice_advisor import build_voice_profiles
+        from src.utils.speaker_gender import build_effective_speaker_gender_map
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Voice advisor unavailable: %s", exc)
+        return {}
+
+    try:
+        gender_map = build_effective_speaker_gender_map(
+            config_data.get(SPEAKER_METADATA_CONFIG_KEY)
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Speaker gender map unavailable: %s", exc)
+        gender_map = {}
+
+    profiles = build_voice_profiles(analysis.speakers, gender_map)
+    return {speaker: profile.to_dict() for speaker, profile in profiles.items()}
+
+
+def _save_speaker_voice_profiles(project_id: str, profiles: Dict[str, Any]) -> None:
+    """Persist the voice advice in the project config."""
+    if not profiles:
+        return
+    db = get_db_session()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project is None:
+            return
+        config = dict(project.config or {})
+        config[SPEAKER_VOICE_PROFILES_CONFIG_KEY] = profiles
+        project.config = config
+        flag_modified(project, "config")
+        project.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _update_segment_emotions_in_db(project_id: str, segments: list) -> None:
+    """Persist the delivery analysis onto the existing segment rows."""
+    db = get_db_session()
+    try:
+        existing_segments = db.query(Segment).filter(
+            Segment.project_id == project_id
+        ).order_by(Segment.sequence).all()
+
+        for existing_segment, analyzed in zip(existing_segments, segments):
+            existing_segment.emotion = analyzed.get("emotion")
+            existing_segment.emotion_intensity = analyzed.get("emotion_intensity")
+            existing_segment.emotion_direction = analyzed.get("emotion_direction")
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _persist_selected_voices(
+    project_id: str,
+    dubber: Any,
+    config_data: Dict[str, Any],
+) -> Dict[str, str]:
+    """Store the voices that were picked automatically in the project config.
+
+    They are kept in a separate key so the user can see (and block) them
+    without pinning the assignment: a re-dub may pick a different voice.
+    """
+    selected: Dict[str, str] = {}
+    for tts in (getattr(dubber, "tts_systems", None) or {}).values():
+        mapping = getattr(tts, "voice_mapping", None) or {}
+        for speaker, voice in mapping.items():
+            if speaker and voice and not str(voice).startswith("clone:"):
+                selected[str(speaker)] = str(voice)
+        # Fall back to the voices that were actually used per segment.
+        try:
+            for report in list(getattr(tts, "segment_reports", None) or []):
+                if report.speaker and report.voice and not str(report.voice).startswith("clone:"):
+                    selected.setdefault(str(report.speaker), str(report.voice))
+        except Exception:
+            pass
+    if not selected:
+        return {}
+
+    db = get_db_session()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return {}
+
+        config = dict(project.config or {})
+        config["autoSelectedVoices"] = selected
+        project.config = config
+        flag_modified(project, "config")
+        project.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.info("[DEBUG DUB] persisted auto selected voices: %s", selected)
+        return selected
     finally:
         db.close()
 
@@ -525,12 +782,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             setup_logging(output_dir=str(pm.debug_dir), include_console=False)
             
             # Get preset configuration
-            preset = config_data.get("preset", "hq")
+            preset = config_data.get("preset", "ultra")
             preset_config = get_preset_config(preset)
             
             # Build configuration with preset values (config_data overrides preset)
             # Log the values we're extracting from config_data
-            source_lang = config_data.get("sourceLang", "en")
+            source_lang = config_data.get("sourceLang", "auto")
             target_lang = config_data.get("targetLang", "ru")
             speaker_count = config_data.get("speakerCount")
             logger.info(f"[WORKER] Building DubbingConfig: source_language={source_lang}, target_language={target_lang}, speakers_expected={speaker_count}")
@@ -567,6 +824,8 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "no_cache": False,
                 # TTS settings (config_data overrides preset)
                 "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
+                "tts_transport": config_data.get("ttsTransport")
+                or preset_config.get("tts_transport", "openrouter"),
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
                 "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
                 "tts_prompt_prefix": resolve_tts_prompt_prefix(
@@ -583,6 +842,12 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_video_emotion_analysis": config_data.get(
+                    "enableVideoEmotionAnalysis",
+                    preset_config.get("enable_video_emotion_analysis", False),
+                ),
+                "refiner_emotion_tags": config_data.get("refinerEmotionTags", preset_config.get("refiner_emotion_tags", False)),
+                "creative_recovery_variants": config_data.get("creativeRecoveryVariants", preset_config.get("creative_recovery_variants", False)),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
                 "enable_context_style": config_data.get("enableContextStyle", True),
                 "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
@@ -592,8 +857,38 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "content_validator_whisper_cpu_threads": config_data.get("contentValidatorWhisperCpuThreads", 2),
                 "content_validator_speech_model": config_data.get("contentValidatorSpeechModel", "nano"),
                 # Transcription settings
-                "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
+                "transcription_system": config_data.get(
+                    "transcriptionSystem",
+                    preset_config.get("transcription_system", "openrouter"),
+                ),
+                "openrouter_stt_model": config_data.get("openrouterSttModel")
+                or preset_config.get("openrouter_stt_model", "microsoft/mai-transcribe-2"),
+                "openrouter_stt_fallback_models": preset_config.get(
+                    "openrouter_stt_fallback_models",
+                    ["elevenlabs/scribe-v2", "deepgram/nova-3"],
+                ),
+                "openrouter_stt_chunk_seconds": preset_config.get(
+                    "openrouter_stt_chunk_seconds", 600
+                ),
+                "openrouter_stt_overlap_seconds": preset_config.get(
+                    "openrouter_stt_overlap_seconds", 15
+                ),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
+                "enable_gemini_speaker_labeling": config_data.get(
+                    "enableGeminiSpeakerLabeling",
+                    preset_config.get("enable_gemini_speaker_labeling", False),
+                ),
+                "gemini_speaker_labeling_model": config_data.get(
+                    "geminiSpeakerLabelingModel",
+                    preset_config.get("gemini_speaker_labeling_model"),
+                ),
+                "gemini_speaker_labeling_max_speakers": config_data.get(
+                    "geminiSpeakerLabelingMaxSpeakers",
+                    preset_config.get("gemini_speaker_labeling_max_speakers"),
+                ),
+                "transcribe_on_vocals": config_data.get(
+                    "transcribeOnVocals", preset_config.get("transcribe_on_vocals")
+                ),
                 # Translation settings (config_data overrides preset)
                 "translator_type": "llm",
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
@@ -612,6 +907,11 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
                 "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
+                "speaker_voice_profiles": config_data.get(SPEAKER_VOICE_PROFILES_CONFIG_KEY) or {},
+                "voice_advice_max_candidates": config_data.get(
+                    "voiceAdviceMaxCandidates",
+                    preset_config.get("voice_advice_max_candidates", 8),
+                ),
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
@@ -744,6 +1044,21 @@ def transcribe_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 except Exception as resolve_err:
                     logger.warning(f"Failed to persist resolvedTtsStyle: {resolve_err}")
 
+            update_job_progress(job_id, 34, "emotion_analysis", "Analyzing delivery (video + audio)")
+
+            # Delivery analysis: one Gemini VLM request sees the trailer as a
+            # single stream (picture + original audio) and tells how every line
+            # is performed. The result becomes the TTS instruction.
+            _run_video_emotion_analysis(
+                project_id,
+                job_id,
+                translated_segments,
+                source_file,
+                config_data,
+                preset_config,
+                cost_tracker=getattr(dubber, "cost_tracker", None),
+            )
+
             update_job_progress(job_id, 35, "saving", "Saving segments to database")
             
             # Save segments to database
@@ -823,7 +1138,7 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
 
             setup_logging(output_dir=str(pm.debug_dir), include_console=False)
 
-            preset = config_data.get("preset", "hq")
+            preset = config_data.get("preset", "ultra")
             preset_config = get_preset_config(preset)
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
@@ -841,13 +1156,15 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             dubbing_config.config.update({
                 "project_id": project_id,
                 "input": str(source_file),
-                "source_language": config_data.get("sourceLang", "en"),
+                "source_language": config_data.get("sourceLang", "auto"),
                 "target_language": config_data.get("targetLang", "ru"),
                 "keep_background": config_data.get("keepBackground", preset_config.get("keep_background", False)),
                 "pause_removal": config_data.get("pauseRemoval", "disabled"),
                 "exit_before_synthesis": True,
                 "no_cache": False,
                 "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
+                "tts_transport": config_data.get("ttsTransport")
+                or preset_config.get("tts_transport", "openrouter"),
                 "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
                 "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
                 "tts_prompt_prefix": resolve_tts_prompt_prefix(
@@ -864,6 +1181,12 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_video_emotion_analysis": config_data.get(
+                    "enableVideoEmotionAnalysis",
+                    preset_config.get("enable_video_emotion_analysis", False),
+                ),
+                "refiner_emotion_tags": config_data.get("refinerEmotionTags", preset_config.get("refiner_emotion_tags", False)),
+                "creative_recovery_variants": config_data.get("creativeRecoveryVariants", preset_config.get("creative_recovery_variants", False)),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
                 "enable_context_style": config_data.get("enableContextStyle", True),
                 "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
@@ -872,8 +1195,38 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "content_validator_whisper_compute_type": config_data.get("contentValidatorWhisperComputeType", "int8"),
                 "content_validator_whisper_cpu_threads": config_data.get("contentValidatorWhisperCpuThreads", 2),
                 "content_validator_speech_model": config_data.get("contentValidatorSpeechModel", "nano"),
-                "transcription_system": config_data.get("transcriptionSystem", "assemblyai"),
+                "transcription_system": config_data.get(
+                    "transcriptionSystem",
+                    preset_config.get("transcription_system", "openrouter"),
+                ),
+                "openrouter_stt_model": config_data.get("openrouterSttModel")
+                or preset_config.get("openrouter_stt_model", "microsoft/mai-transcribe-2"),
+                "openrouter_stt_fallback_models": preset_config.get(
+                    "openrouter_stt_fallback_models",
+                    ["elevenlabs/scribe-v2", "deepgram/nova-3"],
+                ),
+                "openrouter_stt_chunk_seconds": preset_config.get(
+                    "openrouter_stt_chunk_seconds", 600
+                ),
+                "openrouter_stt_overlap_seconds": preset_config.get(
+                    "openrouter_stt_overlap_seconds", 15
+                ),
                 "whisper_model": config_data.get("whisperModel", "large-v3"),
+                "enable_gemini_speaker_labeling": config_data.get(
+                    "enableGeminiSpeakerLabeling",
+                    preset_config.get("enable_gemini_speaker_labeling", False),
+                ),
+                "gemini_speaker_labeling_model": config_data.get(
+                    "geminiSpeakerLabelingModel",
+                    preset_config.get("gemini_speaker_labeling_model"),
+                ),
+                "gemini_speaker_labeling_max_speakers": config_data.get(
+                    "geminiSpeakerLabelingMaxSpeakers",
+                    preset_config.get("gemini_speaker_labeling_max_speakers"),
+                ),
+                "transcribe_on_vocals": config_data.get(
+                    "transcribeOnVocals", preset_config.get("transcribe_on_vocals")
+                ),
                 "translator_type": "llm",
                 "llm_provider": config_data.get("llmProvider") or preset_config["llm_provider"],
                 "llm_model_name": config_data.get("llmModelName") or preset_config["llm_model_name"],
@@ -891,6 +1244,11 @@ def retranslate_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "translation_prompt_prefix": config_data.get("translationPromptPrefix"),
                 "enable_speaker_gender_inference": config_data.get("enableSpeakerGenderInference", True),
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
+                "speaker_voice_profiles": config_data.get(SPEAKER_VOICE_PROFILES_CONFIG_KEY) or {},
+                "voice_advice_max_candidates": config_data.get(
+                    "voiceAdviceMaxCandidates",
+                    preset_config.get("voice_advice_max_candidates", 8),
+                ),
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
                 "normalize_audio": normalize_bool(
@@ -1056,7 +1414,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             setup_logging(output_dir=str(pm.debug_dir), include_console=False)
             
             # Get preset configuration
-            preset = config_data.get("preset", "hq")
+            preset = config_data.get("preset", "ultra")
             preset_config = get_preset_config(preset)
             
             # Build TTS prompt prefix based on target language, preset, and selected style
@@ -1072,6 +1430,15 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 style=config_data.get("ttsStyle") or preset_config.get("tts_style"),
                 resolved_style=config_data.get("resolvedTtsStyle"),
             )
+            # Project level block list: voices the user does not want to hear.
+            project_blocked_voices = config_data.get("blockedVoices") or []
+            if project_blocked_voices:
+                blocked_voices = list(blocked_voices) + [
+                    str(item).strip() for item in project_blocked_voices if str(item).strip()
+                ]
+                logger.info(
+                    "[DEBUG DUB] project blocked voices: %s", project_blocked_voices
+                )
             
             # Build configuration with preset values (config_data overrides preset)
             pause_removal_value = config_data.get("pauseRemoval", "disabled")
@@ -1088,6 +1455,20 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             )
             logger.info(f"[DEBUG DUB] config_data keys: {list(config_data.keys())}")
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
+            tts_system = str(config_data.get("ttsSystem") or preset_config["tts_system"]).strip().lower()
+            tts_model = config_data.get("ttsModel") or preset_config.get("tts_model")
+            enable_voice_cloning = (
+                tts_system == "openrouter"
+                and resolve_voice_cloning_enabled(
+                    config_data.get("enableVoiceCloning"), tts_model
+                )
+            )
+            logger.info(
+                "[DEBUG DUB] voice cloning: config=%r model=%r -> enabled=%s",
+                config_data.get("enableVoiceCloning"),
+                tts_model,
+                enable_voice_cloning,
+            )
             video_quality_preset = get_video_quality_preset(config_data, preset_config)
             editor_runtime = _resolve_editor_runtime_config(config_data, preset_config)
             refinement_persona = _resolve_refinement_persona(config_data, preset_config)
@@ -1105,7 +1486,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             dubbing_config.config.update({
                 "project_id": project_id,
                 "input": str(source_file),
-                "source_language": config_data.get("sourceLang", "en"),
+                "source_language": config_data.get("sourceLang", "auto"),
                 "target_language": target_lang,
                 "keep_background": config_data.get(
                     "keepBackground",
@@ -1115,18 +1496,46 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "output": str(pm.get_result_video_path(target_lang)),
                 "save_translated_subtitles": True,
                 # TTS settings (config_data overrides preset)
-                "tts_system": config_data.get("ttsSystem") or preset_config["tts_system"],
-                "tts_model": config_data.get("ttsModel") or preset_config.get("tts_model"),
+                "tts_system": tts_system,
+                "tts_transport": config_data.get("ttsTransport")
+                or preset_config.get("tts_transport", "openrouter"),
+                "tts_model": tts_model,
                 "tts_fallback_model": config_data.get("ttsFallbackModel") or preset_config.get("tts_fallback_model"),
                 "tts_prompt_prefix": tts_prompt_prefix,
                 "blocked_voices": blocked_voices,
                 "voice_name": speaker_voice_mappings,
                 "voice_prompt": config_data.get("speakerTtsPrompts", {}),
                 "voice_auto_selection": config_data.get("voiceAutoSelection", True),
+                "enable_voice_cloning": enable_voice_cloning,
                 "enable_emotion_analysis": config_data.get("enableEmotionAnalysis", False),
                 "enable_emotion_enrichment": config_data.get("enableEmotionEnrichment", False),
+                "enable_video_emotion_analysis": config_data.get(
+                    "enableVideoEmotionAnalysis",
+                    preset_config.get("enable_video_emotion_analysis", False),
+                ),
+                "refiner_emotion_tags": config_data.get("refinerEmotionTags", preset_config.get("refiner_emotion_tags", False)),
+                "creative_recovery_variants": config_data.get("creativeRecoveryVariants", preset_config.get("creative_recovery_variants", False)),
                 "enable_laughter_detection": config_data.get("enableLaughterDetection", preset_config.get("enable_laughter_detection", False)),
                 "laughter_mode": config_data.get("laughterMode", preset_config.get("laughter_mode", "dub")),
+                "enable_vocal_event_detection": config_data.get("enableVocalEventDetection", preset_config.get("enable_vocal_event_detection", False)),
+                "vocal_events_mode": config_data.get("vocalEventsMode", preset_config.get("vocal_events_mode", "preserve")),
+                "vocal_event_kinds": config_data.get("vocalEventKinds", preset_config.get("vocal_event_kinds")),
+                "enable_vocal_event_loudness_detection": config_data.get(
+                    "enableVocalEventLoudnessDetection",
+                    preset_config.get("enable_vocal_event_loudness_detection", False),
+                ),
+                "vocal_event_loudness_threshold_db": config_data.get(
+                    "vocalEventLoudnessThresholdDb",
+                    preset_config.get("vocal_event_loudness_threshold_db", -14.0),
+                ),
+                "vocal_event_loudness_min_seconds": config_data.get(
+                    "vocalEventLoudnessMinSeconds",
+                    preset_config.get("vocal_event_loudness_min_seconds", 0.25),
+                ),
+                "vocal_event_loudness_merge_gap_seconds": config_data.get(
+                    "vocalEventLoudnessMergeGapSeconds",
+                    preset_config.get("vocal_event_loudness_merge_gap_seconds", 0.3),
+                ),
                 "enable_content_validation": config_data.get("enableContentValidation", True),
                 "enable_context_style": config_data.get("enableContextStyle", True),
                 "context_style_max_chars": config_data.get("contextStyleMaxChars", 140),
@@ -1139,6 +1548,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 # Audio settings
                 "dubbed_volume": config_data.get("dubbedVolume", 1.0),
                 "background_volume": config_data.get("backgroundVolume", 0.562341),
+                # "Background voice": the original voice mixed under the dub.
+                "background_voice_volume": config_data.get(
+                    "backgroundVoiceVolume",
+                    preset_config.get("background_voice_volume", 0.0),
+                ),
                 "normalize_audio": normalize_bool(
                     config_data.get(
                         "normalizeAudio",
@@ -1168,6 +1582,11 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 "refinement_temperature": config_data.get("refinementTemperature") if config_data.get("refinementTemperature") is not None else preset_config.get("refinement_temperature", 1.0),
                 "refinement_persona": refinement_persona,
                 "speaker_metadata": config_data.get(SPEAKER_METADATA_CONFIG_KEY),
+                "speaker_voice_profiles": config_data.get(SPEAKER_VOICE_PROFILES_CONFIG_KEY) or {},
+                "voice_advice_max_candidates": config_data.get(
+                    "voiceAdviceMaxCandidates",
+                    preset_config.get("voice_advice_max_candidates", 8),
+                ),
             })
             
             segments_opt = dubbing_config.config.get("segments_optimization", {})
@@ -1200,30 +1619,85 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 dubbing_config.get("duration")
             )
             
-            # Detect laughter moments before synthesis so they can be voiced by
-            # the TTS (tags are injected inside synthesize_speech).
-            if config_data.get("enableLaughterDetection", preset_config.get("enable_laughter_detection", False)):
-                update_job_progress(job_id, 46, "emotion_analysis", "Detecting laughter")
+            # Detect laughter / non-verbal vocal events before synthesis so they
+            # can be voiced or preserved (handling happens inside
+            # synthesize_speech). Detection runs on the separated vocals stem
+            # when available, which keeps music-heavy trailers clean.
+            enable_laughter_detection = config_data.get(
+                "enableLaughterDetection", preset_config.get("enable_laughter_detection", False)
+            )
+            enable_vocal_event_detection = config_data.get(
+                "enableVocalEventDetection", preset_config.get("enable_vocal_event_detection", False)
+            )
+            if enable_laughter_detection or enable_vocal_event_detection:
+                update_job_progress(job_id, 46, "emotion_analysis", "Detecting vocal events")
                 try:
-                    events = dubber.detect_laughter_events(audio_file)
+                    if enable_vocal_event_detection:
+                        dubber.ensure_vocals_stem(audio_file)
+                    events = dubber.detect_vocal_events(audio_file)
+                    by_kind: dict = {}
                     if events:
-                        summary = ", ".join(f"{e.start:.1f}-{e.end:.1f}s" for e in events[:5])
-                        add_job_log(
-                            job_id,
-                            f"Laughter detection: {len(events)} moment(s) [{summary}"
-                            + (" ...]" if len(events) > 5 else "]"),
+                        for event in events:
+                            kind = getattr(event, "kind", "laugh")
+                            by_kind[kind] = by_kind.get(kind, 0) + 1
+                        summary = ", ".join(
+                            f"{kind}: {count}" for kind, count in sorted(by_kind.items())
                         )
+                        add_job_log(job_id, f"Vocal event detection: {len(events)} moment(s) ({summary})")
+                        preview = ", ".join(
+                            f"{getattr(e, 'kind', 'laugh')} {e.start:.1f}-{e.end:.1f}s"
+                            for e in sorted(events, key=lambda item: item.start)[:5]
+                        )
+                        add_job_log(job_id, f"Detected events: [{preview}" + (" ...]" if len(events) > 5 else "]"))
                     else:
-                        add_job_log(job_id, "Laughter detection: no laughter moments found")
-                    if events and dubbing_config.get("laughter_mode") == "preserve":
+                        add_job_log(job_id, "Vocal event detection: no events found")
+                    if by_kind.get("laugh") and dubbing_config.get("laughter_mode") == "preserve":
                         add_job_log(
                             job_id,
-                            "Laughter preservation: keeping original laughter audio, "
+                            "Laughter preserve: original laughter will be boosted via "
+                            "a volume envelope; translation timing stays unchanged",
+                        )
+                    if (
+                        any(kind != "laugh" for kind in by_kind)
+                        and dubbing_config.get("vocal_events_mode") == "preserve"
+                    ):
+                        add_job_log(
+                            job_id,
+                            "Vocal event preservation: keeping original screams/sobs audio, "
                             "rearranging translated speech around it",
                         )
-                except Exception as laughter_exc:
-                    logger.warning("Laughter detection failed for %s: %s", project_id, laughter_exc)
-                    add_job_log(job_id, f"Laughter detection failed: {laughter_exc}", "warning")
+                except Exception as events_exc:
+                    logger.warning("Vocal event detection failed for %s: %s", project_id, events_exc)
+                    add_job_log(job_id, f"Vocal event detection failed: {events_exc}", "warning")
+
+            # Fallback delivery analysis: the segments may carry no emotion yet
+            # (project transcribed before the feature existed, or the
+            # transcription stage failed the analysis). Recompute it here so a
+            # re-dub still gets the original performance.
+            if _video_emotion_analysis_enabled(config_data, preset_config) and not any(
+                str(segment.get("emotion") or "").strip() for segment in segments_data
+            ):
+                update_job_progress(
+                    job_id, 47, "emotion_analysis", "Analyzing delivery (video + audio)"
+                )
+                analyzed = _run_video_emotion_analysis(
+                    project_id,
+                    job_id,
+                    segments_data,
+                    source_file,
+                    config_data,
+                    preset_config,
+                    cost_tracker=getattr(dubber, "cost_tracker", None),
+                )
+                if analyzed:
+                    _update_segment_emotions_in_db(project_id, segments_data)
+                    # The advice must reach the TTS systems of this run: they
+                    # were created before the fallback analysis.
+                    for tts_instance in (getattr(dubber, "tts_systems", None) or {}).values():
+                        try:
+                            tts_instance.set_speaker_voice_profiles(analyzed)
+                        except Exception as advice_exc:  # pragma: no cover - defensive
+                            logger.debug("Could not apply the voice advice: %s", advice_exc)
             
             # Restore speakers_rolls from segments
             speakers_rolls = {}
@@ -1231,10 +1705,16 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 key = (seg["start"], seg["end"])
                 speakers_rolls[key] = seg["speaker"]
             
+            if enable_voice_cloning:
+                update_job_progress(
+                    job_id,
+                    47,
+                    "voice_cloning",
+                    "Collecting clean speaker samples for voice cloning",
+                )
             update_job_progress(job_id, 48, "speech_synthesis", "Synthesizing speech")
             
             # Progress callback for TTS cache prewarming (48% to 52%)
-            total_segments = len(segments_data)
             def prewarm_progress(current: int, total: int, text: str = None):
                 progress = 48 + int((current / total) * 4) if total > 0 else 48
                 message = (
@@ -1268,6 +1748,50 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
                 grouping_progress_callback=grouping_progress,
                 prepass_progress_callback=prewarm_progress,
             )
+
+            if enable_voice_cloning:
+                clone_refs = getattr(dubber, "voice_clone_references", {}) or {}
+                for speaker, reference in sorted(clone_refs.items()):
+                    ranges = ", ".join(
+                        f"{start:.1f}-{end:.1f}s"
+                        for start, end in (reference.clip_ranges or [])[:6]
+                    )
+                    add_job_log(
+                        job_id,
+                        f"Voice cloning {speaker}: {reference.clip_count} clean segment(s), "
+                        f"{reference.duration_seconds:.1f}s"
+                        + (f" ({ranges})" if ranges else ""),
+                    )
+                missing = sorted(
+                    {
+                        str(speaker)
+                        for speaker in speakers_rolls.values()
+                        if str(speaker) not in clone_refs
+                    }
+                )
+                if missing:
+                    add_job_log(
+                        job_id,
+                        "Voice cloning skipped for "
+                        + ", ".join(missing)
+                        + ": not enough clean non-overlapping speech; using library voices",
+                        "warning",
+                    )
+
+            # Persist the voices that were picked automatically so the user
+            # can see them (and block the ones they do not like).
+            try:
+                selected_voices = _persist_selected_voices(project_id, dubber, config_data)
+                if selected_voices:
+                    add_job_log(
+                        job_id,
+                        "Selected voices: "
+                        + ", ".join(
+                            f"{speaker}={voice}" for speaker, voice in selected_voices.items()
+                        ),
+                    )
+            except Exception as voice_exc:
+                logger.warning(f"Could not persist the selected voices: {voice_exc}")
             
             # Process background with progress callback
             background_audio_path = None
@@ -1315,17 +1839,92 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             # Get video speed segments for video/audio_and_video modes
             video_speed_segments = getattr(dubber, 'video_speed_segments', None)
             
+            # "Background voice" layer: the original voice mixed under the dub.
+            # In laughter-preserve mode this layer is also the original-track
+            # source for the dynamic 70% envelope, even when its baseline
+            # volume is zero.
+            background_voice_path = None
+            try:
+                background_voice_volume = float(
+                    dubbing_config.get("background_voice_volume", 0.0) or 0.0
+                )
+            except (TypeError, ValueError):
+                background_voice_volume = 0.0
+            laughter_output_ranges = getattr(
+                dubber, "laughter_volume_ranges_output", []
+            ) or []
+            laughter_original_ranges = getattr(
+                dubber, "laughter_volume_ranges_original", []
+            ) or []
+            needs_background_voice = bool(
+                background_voice_volume > 0 or laughter_output_ranges
+            )
+            if needs_background_voice:
+                try:
+                    # In laughter-preserve mode use a laughter-only bed: the
+                    # original voice outside laughter must not leak back in.
+                    # Otherwise keep the regular full background-voice layer.
+                    if laughter_output_ranges:
+                        background_voice_path = dubber.build_laughter_bed_track(audio_file)
+                    else:
+                        background_voice_path = None
+                    if not background_voice_path and background_voice_volume > 0:
+                        # The original voice has to follow the timeline of the
+                        # dubbed track, otherwise it drifts away from the dub.
+                        background_voice_path = dubber.build_background_voice_track(audio_file)
+                    if not background_voice_path:
+                        background_voice_path = dubber.ensure_vocals_stem(audio_file)
+                except Exception as bg_voice_exc:
+                    logger.warning(
+                        f"Background voice layer unavailable: {bg_voice_exc}"
+                    )
+                    background_voice_path = None
+                if not background_voice_path:
+                    logger.warning(
+                        "Background voice is enabled but the original vocals stem "
+                        "could not be prepared - the layer is skipped"
+                    )
+                else:
+                    logger.info(
+                        "Background voice layer enabled at volume %.2f (%s)",
+                        background_voice_volume,
+                        background_voice_path,
+                    )
+                    add_job_log(
+                        job_id,
+                        "Background voice: original voice kept under the dub at "
+                        f"{background_voice_volume:.2f}",
+                    )
+
+            if laughter_output_ranges:
+                add_job_log(
+                    job_id,
+                    "Laughter preserve: original/background track raised to "
+                    f"{float(dubbing_config.get('laughter_volume', 0.70)):.0%} "
+                    f"in {len(laughter_output_ranges)} range(s); translation segments unchanged",
+                )
+
             output_video_path, _ = dubber.video_processor.combine_audio_with_video(
                 video_path=str(source_file),
                 translated_audio_path=translated_audio_path,
                 background_audio_path=background_audio_path,
+                background_voice_path=background_voice_path,
+                background_voice_volume=background_voice_volume,
+                laughter_ranges=laughter_output_ranges,
+                laughter_ranges_original=laughter_original_ranges,
+                laughter_volume=float(dubbing_config.get("laughter_volume", 0.70) or 0.70),
+                laughter_volume_ramp_seconds=float(
+                    dubbing_config.get("laughter_volume_ramp_seconds", 0.25) or 0.25
+                ),
                 output_file=str(pm.get_result_video_path(config_data.get("targetLang", "ru"))),
                 start_time=config_data.get("startTime"),
                 duration=config_data.get("duration"),
-                source_language=config_data.get("sourceLang", "en"),
+                source_language=config_data.get("sourceLang", "auto"),
                 target_language=config_data.get("targetLang", "ru"),
                 keep_original_audio_ranges=dubbing_config.get("keep_original_audio_ranges"),
                 normalize_audio=dubbing_config.get("normalize_audio", False),
+                dubbed_volume=dubbing_config.get("dubbed_volume", 1.0),
+                background_volume=dubbing_config.get("background_volume", 0.562341),
                 pause_removal=pause_removal,
                 min_pause_duration=segments_opt.get("min_pause_duration", 3),
                 preserve_pause_duration=segments_opt.get("preserve_pause_duration", 1.5),
@@ -1336,7 +1935,7 @@ def dub_project(self, project_id: str, job_id: str) -> Dict[str, Any]:
             )
             
             # Save subtitles to results directory
-            source_lang = config_data.get("sourceLang", "en")
+            source_lang = config_data.get("sourceLang", "auto")
             target_lang = config_data.get("targetLang", "ru")
             
             source_srt_path = str(pm.get_result_subtitles_path(source_lang, "srt"))
@@ -1513,7 +2112,31 @@ def generate_preview(
             
             config_data = project.config or {}
             speaker_voice_mappings = _normalize_speaker_voice_mappings(config_data.get("speakerVoiceMappings"))
-            voice_id = segment.voice_id or speaker_voice_mappings.get(segment.speaker)
+            preview_tts_system = segment.provider or config_data.get("ttsSystem", "gemini38")
+            preview_tts_model = config_data.get("ttsModel")
+            preview_enable_voice_cloning = (
+                str(preview_tts_system).strip().lower() == "openrouter"
+                and resolve_voice_cloning_enabled(
+                    config_data.get("enableVoiceCloning"), preview_tts_model
+                )
+                and not speaker_voice_mappings.get(segment.speaker)
+            )
+            if preview_enable_voice_cloning:
+                voice_id = f"clone_{segment.speaker}"
+            else:
+                voice_id = segment.voice_id or speaker_voice_mappings.get(segment.speaker)
+            all_segment_rows = [
+                {
+                    "speaker": item.speaker,
+                    "start": item.start_time,
+                    "end": item.end_time,
+                    "text": item.original_text,
+                }
+                for item in db.query(Segment)
+                .filter(Segment.project_id == project_id)
+                .order_by(Segment.sequence)
+                .all()
+            ]
         finally:
             db.close()
         
@@ -1542,7 +2165,63 @@ def generate_preview(
             
             # Create TTS instance
             tts_system = segment.provider or config_data.get("ttsSystem", "gemini38")
-            
+            tts_model = config_data.get("ttsModel")
+            enable_voice_cloning = (
+                str(tts_system).strip().lower() == "openrouter"
+                and resolve_voice_cloning_enabled(
+                    config_data.get("enableVoiceCloning"), tts_model
+                )
+            )
+            clone_references: Dict[str, Any] = {}
+            if (
+                enable_voice_cloning
+                and tts_system == "openrouter"
+                and not speaker_voice_mappings.get(segment.speaker)
+            ):
+                try:
+                    from src.tts.voice_clone_reference import (
+                        VoiceCloneReferenceBuilder,
+                        VoiceCloneReferenceConfig,
+                    )
+
+                    source_video = pm.get_source_video_path()
+                    source_audio = pm.audio_dir / "source.wav"
+                    if not source_audio.exists() and source_video and source_video.exists():
+                        pm.audio_dir.mkdir(parents=True, exist_ok=True)
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-y", "-i", str(source_video),
+                                "-vn", "-acodec", "pcm_s16le",
+                                "-ar", "16000", "-ac", "1", str(source_audio),
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                        )
+                    if source_audio.exists() and all_segment_rows:
+                        all_rolls = {
+                            (row["start"], row["end"]): row["speaker"]
+                            for row in all_segment_rows
+                        }
+                        target_rolls = {
+                            (row["start"], row["end"]): row["speaker"]
+                            for row in all_segment_rows
+                            if row["speaker"] == segment.speaker
+                        }
+                        builder = VoiceCloneReferenceBuilder(
+                            VoiceCloneReferenceConfig()
+                        )
+                        clone_references = builder.build_all(
+                            str(source_audio),
+                            target_rolls,
+                            out_dir=str(pm.artifacts_dir / "cloned_voices"),
+                            transcript_segments=all_segment_rows,
+                            all_speakers_rolls=all_rolls,
+                        )
+                except Exception as clone_exc:
+                    logger.warning("Preview voice cloning unavailable: %s", clone_exc)
+                    clone_references = {}
+
             # Build TTS prompt prefix from the selected style
             target_lang = config_data.get("targetLang", "ru")
             tts_prompt_prefix = resolve_tts_prompt_prefix(
@@ -1564,15 +2243,43 @@ def generate_preview(
                 voice_prompt=config_data.get("speakerTtsPrompts", {}),
                 prompt_prefix=tts_prompt_prefix,
                 blocked_voices=preview_blocked_voices,
-                model=config_data.get("ttsModel"),
+                model=tts_model,
+                fallback_model=config_data.get("ttsFallbackModel"),
+                tts_transport=config_data.get("ttsTransport") or "openrouter",
+                enable_voice_cloning=enable_voice_cloning,
+                target_language=target_lang,
+                speaker_metadata=config_data.get(SPEAKER_METADATA_CONFIG_KEY),
             )
+            if clone_references and hasattr(tts, "set_voice_clone_references"):
+                tts.set_voice_clone_references(clone_references)
             
             # Create segment data
+            voice_note = None
+            try:
+                from src.tts.voice_advisor import profile_for_speaker
+
+                profile = profile_for_speaker(
+                    config_data.get(SPEAKER_VOICE_PROFILES_CONFIG_KEY), segment.speaker
+                )
+                voice_note = profile.prompt_fragment() if profile else None
+            except Exception as advice_exc:  # pragma: no cover - defensive
+                logger.debug("Voice advice unavailable for preview: %s", advice_exc)
+
             tts_segment = TTSSegmentData(
                 speaker=segment.speaker,
                 text=segment.translated_text or segment.original_text,
-                voice=segment.voice_id,
+                voice=(
+                    None
+                    if enable_voice_cloning
+                    and not speaker_voice_mappings.get(segment.speaker)
+                    else segment.voice_id
+                ),
                 style_prompt=segment.tts_prompt,
+                # The delivery analysis must reach the preview too, otherwise the
+                # preview would not sound like the final dub.
+                emotion=segment.emotion,
+                emotion_note=segment.emotion_direction,
+                voice_note=voice_note,
                 output_path=str(preview_path),
             )
             
@@ -1603,7 +2310,6 @@ def generate_preview(
 def rephrase_segment(self, project_id: str, segment_id: str, prompt: Optional[str] = None) -> Dict[str, Any]:
     """Rephrase a segment using LLM."""
     try:
-        import json
         import google.generativeai as genai
         
         # Get segment and project from database
@@ -1662,7 +2368,7 @@ Respond with ONLY the rephrased text, nothing else."""
         
         return {"translatedText": rephrased_text}
         
-    except Exception as e:
+    except Exception:
         raise
 
 
@@ -1694,6 +2400,9 @@ def _save_segments_to_db(project_id: str, segments: list) -> None:
                 end_time=seg.get("end", 0),
                 original_text=seg.get("text", ""),
                 translated_text=seg.get("translation", ""),
+                emotion=seg.get("emotion"),
+                emotion_intensity=seg.get("emotion_intensity"),
+                emotion_direction=seg.get("emotion_direction"),
                 sequence=i,
             )
             db.add(segment)
@@ -1733,6 +2442,9 @@ def _segment_to_dubbing_format(segment: Segment) -> dict:
         "end": segment.end_time,
         "text": segment.original_text,
         "translation": segment.translated_text,
+        "emotion": getattr(segment, "emotion", None),
+        "emotion_intensity": getattr(segment, "emotion_intensity", None),
+        "emotion_direction": getattr(segment, "emotion_direction", None),
         "voice_id": segment.voice_id,
         "provider": segment.provider.value if segment.provider else None,
         "tts_prompt": segment.tts_prompt,

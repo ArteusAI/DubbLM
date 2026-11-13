@@ -41,21 +41,38 @@ export interface PresetConfig {
   refinementModelName?: string;
   refinementTemperature: number;
   ttsSystem: string;
+  ttsTransport?: 'openrouter' | 'google';
   ttsModel?: string;
   ttsFallbackModel?: string;
   ttsStyle?: TtsStyleId;
   ttsPromptPrefix?: string;
   resolvedTtsStyle?: ResolvedTtsStyleId;
   voiceAutoSelection?: boolean;
+  enableVoiceCloning?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  refinerEmotionTags?: boolean;
+  creativeRecoveryVariants?: boolean;
+  enableVideoEmotionAnalysis?: boolean;
+  videoEmotionAnalysisModel?: string;
+  videoEmotionAnalysisFps?: number;
+  videoEmotionAnalysisDirectionMaxChars?: number;
+  videoEmotionAnalysisLanguage?: string;
+  enableVoiceAdvisor?: boolean;
+  voiceAdviceMaxCandidates?: number;
+  speakerVoiceProfiles?: Record<string, VoiceProfile>;
   enableLaughterDetection?: boolean;
   laughterMode?: 'dub' | 'preserve';
+  enableVocalEventDetection?: boolean;
+  vocalEventsMode?: 'dub' | 'preserve';
+  vocalEventKinds?: string[];
+  enableVocalEventLoudnessDetection?: boolean;
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;
   dubbedVolume?: number;
   backgroundVolume?: number;
+  backgroundVoiceVolume?: number;
   normalizeAudio?: boolean;
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: VideoQualityPreset;
@@ -76,11 +93,22 @@ export type ProjectStatus =
 export type SpeakerGender = 'male' | 'female' | 'unknown';
 
 export interface SpeakerMetadata {
+
   inferredGender: SpeakerGender;
   inferredConfidence: number;
   rawLabel?: string | null;
   modelId?: string | null;
   overrideGender?: SpeakerGender | null;
+}
+
+/** Voice advice of a character, produced by the video+audio delivery analysis. */
+export interface VoiceProfile {
+  speaker: string;
+  timbre: string;
+  age: string;
+  energy: number;
+  accent: string;
+  gender: string;
 }
 
 export interface Voice {
@@ -138,6 +166,9 @@ export interface AppConfig {
   keepBackground: boolean;
   pauseRemoval: 'cut' | 'disabled';
   preset?: PresetId;
+  autoProcess?: boolean;
+  downloadUrl?: string;
+  downloadQuality?: 'best' | '1080p' | '720p' | '480p';
   apiKeys: {
     openai?: string;
     gemini?: string;
@@ -158,6 +189,7 @@ export interface AppConfig {
   editorReasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'none';
   speakerTtsPrompts?: Record<string, string>;
   speakerVoiceMappings?: Record<string, string>;
+  autoSelectedVoices?: Record<string, string>;
   enableSpeakerGenderInference?: boolean;
   speakerMetadata?: Record<string, SpeakerMetadata>;
   
@@ -169,12 +201,28 @@ export interface AppConfig {
   
   // TTS extras
   ttsSystem?: string;
+  ttsTransport?: 'openrouter' | 'google';
   ttsModel?: string;
   voiceAutoSelection?: boolean;
+  enableVoiceCloning?: boolean;
   enableEmotionAnalysis?: boolean;
   enableEmotionEnrichment?: boolean;
+  refinerEmotionTags?: boolean;
+  creativeRecoveryVariants?: boolean;
+  enableVideoEmotionAnalysis?: boolean;
+  videoEmotionAnalysisModel?: string;
+  videoEmotionAnalysisFps?: number;
+  videoEmotionAnalysisDirectionMaxChars?: number;
+  videoEmotionAnalysisLanguage?: string;
+  enableVoiceAdvisor?: boolean;
+  voiceAdviceMaxCandidates?: number;
+  speakerVoiceProfiles?: Record<string, VoiceProfile>;
   enableLaughterDetection?: boolean;
   laughterMode?: 'dub' | 'preserve';
+  enableVocalEventDetection?: boolean;
+  vocalEventsMode?: 'dub' | 'preserve';
+  vocalEventKinds?: string[];
+  enableVocalEventLoudnessDetection?: boolean;
   enableContentValidation?: boolean;
   enableContextStyle?: boolean;
   contextStyleMaxChars?: number;
@@ -190,14 +238,19 @@ export interface AppConfig {
   // Audio extras
   dubbedVolume?: number;
   backgroundVolume?: number;
+  backgroundVoiceVolume?: number;
   normalizeAudio?: boolean;
   keepOriginalAudioRanges?: string[];
   useTwoPassEncoding?: boolean;
   videoQualityPreset?: VideoQualityPreset;
   
   // Transcription extras
-  transcriptionSystem?: 'assemblyai' | 'openai' | 'whisperx';
+  transcriptionSystem?: 'openrouter' | 'assemblyai' | 'openai' | 'whisperx';
+  openrouterSttModel?: string;
   whisperModel?: string;
+  enableGeminiSpeakerLabeling?: boolean;
+  geminiSpeakerLabelingModel?: string;
+  geminiSpeakerLabelingMaxSpeakers?: number;
   
   // Processing extras
   maxWorkers?: number;

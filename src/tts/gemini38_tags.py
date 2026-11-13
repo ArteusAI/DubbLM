@@ -80,6 +80,7 @@ INLINE_TAG_MAP: Dict[str, str] = {
     "chuckle": "chuckle",
     "chuckles": "chuckle",
     "gasp": "gasp",
+    "gasping": "gasp",
     "cough": "cough",
     "sob": "sob",
     "cry": "sob",
@@ -89,9 +90,19 @@ INLINE_TAG_MAP: Dict[str, str] = {
     "yawn": "yawn",
     "pant": "pant",
     "pants": "pant",
+    "panting": "pant",
     "whimper": "whimper",
+    "whimpers": "whimper",
     "groan": "groan",
+    "groans": "groan",
     "grunt": "grunt",
+    "grunts": "grunt",
+    "scream": "scream",
+    "screaming": "scream",
+    "shout": "shout",
+    "breath": "breath",
+    "snort": "snort",
+    "sighing": "sigh",
     "tsk": "tsk",
     "phew": "phew",
     "pff": "pff",
@@ -131,6 +142,44 @@ STYLE_TAG_MAP: Dict[str, str] = {
     "calm": "calm",
     "nervous": "nervous",
 }
+
+# Canonical emotion labels (from the translation-stage Gemini labeler) ->
+# compact sustained style phrases for speech_metadata.style. Unknown labels keep
+# their lowercase form so existing behavior is preserved.
+EMOTION_STYLE_MAP: Dict[str, str] = {
+    "neutral": "",
+    "happy": "happy",
+    "joyful": "happy, warm",
+    "excited": "excited",
+    "sad": "sad",
+    "sorrowful": "sad, gentle",
+    "grieving": "grieving, breaking",
+    "angry": "angry tone",
+    "furious": "furious",
+    "irritated": "irritated, clipped",
+    "fearful": "fearful, trembling",
+    "scared": "fearful, trembling",
+    "panicked": "panicked",
+    "surprised": "surprised",
+    "shocked": "shocked, hushed",
+    "tense": "tense, restrained",
+    "awe": "awed, hushed wonder",
+    "tender": "tender, warm",
+    "loving": "tender, warm",
+    "serious": "serious",
+    "solemn": "solemn, measured",
+    "playful": "playful, mischievous",
+    "sarcastic": "sarcastic",
+    "tired": "tired",
+    "hopeful": "hopeful, warm",
+    "desperate": "desperate, urgent",
+    "commanding": "commanding, authoritative",
+    "triumphant": "triumphant, powerful",
+    "crying": "tearful, breaking",
+    "whispering": "whispering",
+}
+
+EMOTION_LABELS: Tuple[str, ...] = tuple(EMOTION_STYLE_MAP.keys())
 
 # Filler tags become literal disfluency words (per the prompting guide the
 # transcript should keep natural spoken disfluencies as plain text).
@@ -259,6 +308,38 @@ def strip_tts_markup(text: str) -> str:
     return cleaned.strip()
 
 
+def style_for_emotion(emotion: Optional[str]) -> str:
+    """Map a canonical emotion label to a compact 3.8 style phrase."""
+    if not emotion:
+        return ""
+    key = re.sub(r"\s+", " ", str(emotion).strip().lower())
+    if key in {"", "neutral", "none", "n/a"}:
+        return ""
+    return EMOTION_STYLE_MAP.get(key, key)
+
+
+def sanitize_style_note(note: Optional[str], max_chars: int = 140) -> str:
+    """Normalize a director's note into a compact style fragment.
+
+    The note comes from the video+audio emotion analysis and describes the
+    delivery (tone, pace, volume, breath). It is merged into the sustained
+    style, so it must stay short and must not contain markup.
+    """
+    if not note:
+        return ""
+    cleaned = re.sub(r"\s+", " ", str(note)).strip()
+    cleaned = re.sub(r"[<>\[\]{}()]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-")
+    if not cleaned:
+        return ""
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+        cut = cleaned.rfind(" ")
+        if cut > 20:
+            cleaned = cleaned[:cut]
+    return cleaned.strip(" ,.;:-")
+
+
 def sanitize_style(style: Optional[str]) -> str:
     """Normalize a legacy style prompt into a compact 3.8 style string."""
     if not style:
@@ -374,6 +455,8 @@ def build_gemini38_prompt(
     speaker_prompt: Optional[str] = None,
     segment_style: Optional[str] = None,
     emotion: Optional[str] = None,
+    emotion_note: Optional[str] = None,
+    voice_note: Optional[str] = None,
     context_style: Optional[str] = None,
     max_style_chars: int = 280,
 ) -> Gemini38Prompt:
@@ -383,15 +466,21 @@ def build_gemini38_prompt(
     # legacy text before the request reaches the model.
     converted_text = sanitize_angle_tags(converted_text)
 
-    emotion_style = ""
-    if emotion and str(emotion).strip().lower() not in {"", "neutral", "none"}:
-        emotion_style = str(emotion).strip().lower()
+    emotion_style = style_for_emotion(emotion)
+    # The director's note describes HOW the line is delivered; it follows the
+    # emotion label and precedes the (droppable) context quote.
+    note_style = sanitize_style_note(emotion_note)
+    # The voice advice describes the character (timbre). It goes early so it
+    # survives the length cap.
+    voice_style = sanitize_style_note(voice_note)
 
     style = build_style(
         prompt_prefix,
         speaker_prompt,
+        voice_style,
         segment_style,
         emotion_style,
+        note_style,
         # Context quote goes last so a length cap drops it before the actual
         # acting direction for the current line.
         context_style,

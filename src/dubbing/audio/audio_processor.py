@@ -7,7 +7,6 @@ import json
 import re
 from statistics import median
 from typing import Optional, List, Callable
-from pydub import AudioSegment
 from audio_separator.separator import Separator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from celery.exceptions import SoftTimeLimitExceeded
@@ -77,33 +76,36 @@ class AudioProcessor:
         # Set the total duration first
         self._determine_video_duration(video_path, start_time, duration)
         
+        # Extract with ffmpeg directly. pydub decodes the whole track into a WAV
+        # held in memory and refuses to patch headers for files over 4GB, so long
+        # recordings (e.g. multi-hour podcasts) fail with "Unable to process >4GB
+        # files". 16 kHz mono PCM is what all downstream consumers work with
+        # (transcription, diarization, normalization, vocal event detection) and
+        # keeps even multi-hour sources small on disk and in RAM.
+        #
+        # Use argv form to avoid shell-quoting issues when video_path contains
+        # both quotes and apostrophes.
+        extract_cmd: list[str] = ["ffmpeg", "-y"]
+        if start_time is not None:
+            extract_cmd += ["-ss", str(start_time)]
+        extract_cmd += ["-i", str(video_path)]
+        if duration is not None:
+            extract_cmd += ["-t", str(duration)]
+        extract_cmd += ["-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_file]
+
+        result = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0 or not os.path.exists(audio_file):
+            stderr_tail = result.stderr.decode(errors="replace")[-1000:]
+            raise RuntimeError(
+                f"ffmpeg audio extraction failed (rc={result.returncode}) for "
+                f"{video_path}: {stderr_tail}"
+            )
+
         if start_time is not None or duration is not None:
-            # Use argv form to avoid shell-quoting issues when video_path contains both
-            # quotes and apostrophes.
-            trim_cmd: list[str] = ["ffmpeg", "-y"]
-            if start_time is not None:
-                trim_cmd += ["-ss", str(start_time)]
-            trim_cmd += ["-i", str(video_path)]
-            if duration is not None:
-                trim_cmd += ["-t", str(duration)]
-            trim_cmd += ["-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_file]
-
-            result = subprocess.run(trim_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if result.returncode != 0 or not os.path.exists(audio_file):
-                stderr_tail = result.stderr.decode(errors="replace")[-1000:]
-                raise RuntimeError(
-                    f"ffmpeg audio extraction failed (rc={result.returncode}) for "
-                    f"{video_path}: {stderr_tail}"
-                )
-
             start_str = f"from {start_time}s" if start_time is not None else "from beginning"
             duration_str = f"for {duration}s" if duration is not None else "to the end"
             logger.debug(f"Extracted audio segment {start_str} {duration_str} to {audio_file}")
         else:
-            # Extract full audio. Let pydub autodetect the container instead of
-            # forcing mp4, which breaks webm/mkv sources.
-            audio = AudioSegment.from_file(video_path)
-            audio.export(audio_file, format="wav")
             logger.debug(f"Extracted full audio to {audio_file}")
         
         # End timing

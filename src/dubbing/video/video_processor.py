@@ -482,6 +482,45 @@ class VideoProcessor:
         dubbed_volume_expr = f"1-{orig_expr}"
         return original_volume_expr, dubbed_volume_expr
 
+    def _build_laughter_gain_expr(
+        self,
+        base_gain: float,
+        target_gain: float,
+        ranges: Optional[List[Tuple[float, float]]],
+        ramp_seconds: float = 0.25,
+    ) -> str:
+        """Build an FFmpeg frame-evaluated gain expression for laughter.
+
+        The gate is 1 inside a laughter range and 0 outside, with linear
+        fades of ``ramp_seconds``.  Multiple ranges are combined with ``max``
+        so overlapping/padded ranges cannot exceed the target.
+        """
+        if not ranges:
+            return str(float(base_gain))
+
+        base = float(base_gain)
+        target = max(float(target_gain), base)
+        ramp = max(0.02, float(ramp_seconds or 0.0))
+        gates: List[str] = []
+        for start, end in ranges:
+            try:
+                start_f = float(start)
+                end_f = float(end)
+            except (TypeError, ValueError):
+                continue
+            if end_f <= start_f:
+                continue
+            fade_in = f"min(max((t-({start_f}-{ramp}))/{ramp},0),1)"
+            fade_out = f"min(max((({end_f}+{ramp})-t)/{ramp},0),1)"
+            gates.append(f"min({fade_in},{fade_out})")
+        if not gates:
+            return str(base)
+
+        gate_expr = gates[0]
+        for gate in gates[1:]:
+            gate_expr = f"max({gate_expr},{gate})"
+        return f"{base}+({target}-{base})*({gate_expr})"
+
     def _format_filter_input_label(self, label: str) -> str:
         """Return a filter_complex input label bracketed exactly once.
 
@@ -1275,6 +1314,12 @@ class VideoProcessor:
                                 start_time: Optional[float] = None,
                                 duration: Optional[float] = None,
                                 keep_original_audio_ranges: Optional[List[Tuple[float, float]]] = None,
+                background_voice_path: Optional[str] = None,
+                background_voice_volume: float = 0.0,
+                laughter_ranges: Optional[List[Tuple[float, float]]] = None,
+                laughter_ranges_original: Optional[List[Tuple[float, float]]] = None,
+                laughter_volume: float = 0.70,
+                laughter_volume_ramp_seconds: float = 0.25,
                                 source_language: str = "en",
                                 target_language: str = "es",
                                 normalize_audio: bool = False,
@@ -1305,6 +1350,16 @@ class VideoProcessor:
             start_time: Start time in seconds (for trimming)
             duration: Duration in seconds (for trimming)
             keep_original_audio_ranges: Optional list of [start, end] tuples to keep original audio
+            background_voice_path: Optional path to the original vocals stem, mixed under
+                the dubbed track (the "background voice" layer)
+            background_voice_volume: Gain of the background voice layer (0 = disabled)
+            laughter_ranges: Laughter intervals on the dubbed/output timeline.
+                The background-voice layer is smoothly raised to laughter_volume
+                inside them; translation timing is not changed.
+            laughter_ranges_original: Laughter intervals on the source timeline,
+                used for the background-music layer.
+            laughter_volume: Target gain inside laughter intervals (0.70 = 70%).
+            laughter_volume_ramp_seconds: Fade in/out duration of the envelope.
             source_language: Source language code for metadata
             target_language: Target language code for metadata
             normalize_audio: Whether to normalize audio volume (default: False)
@@ -1439,6 +1494,17 @@ class VideoProcessor:
             logger.warning(f"Invalid dubbed_volume {dubbed_volume}, defaulting to 1.0")
             dubbed_volume = 1.0
 
+        # Background voice layer: 0 disables it, negative values are ignored.
+        try:
+            background_voice_volume = float(background_voice_volume or 0.0)
+        except (TypeError, ValueError):
+            background_voice_volume = 0.0
+        if background_voice_volume < 0:
+            logger.warning(
+                f"Invalid background_voice_volume {background_voice_volume}, disabling the background voice layer"
+            )
+            background_voice_volume = 0.0
+
         # Add start time if specified (only for original video, not speed-adjusted)
         if start_time is not None and effective_video_path == video_path:
             command.extend(["-ss", str(start_time)])
@@ -1451,9 +1517,17 @@ class VideoProcessor:
         current_ffmpeg_input_idx = 1  # 0 is video, 1 is normalized translated audio
 
         # If video was speed-adjusted (no audio track), add original video as
-        # a separate input so keep_original_audio_ranges can reference its audio.
+        # a separate input so keep_original_audio_ranges or the laughter
+        # fallback can reference its audio.
         original_audio_ffmpeg_idx = "0"  # default: original video is input 0
-        if effective_video_path != video_path and keep_original_audio_ranges:
+        needs_original_audio_input = bool(
+            effective_video_path != video_path
+            and (
+                keep_original_audio_ranges
+                or (laughter_ranges and not background_voice_path)
+            )
+        )
+        if needs_original_audio_input:
             current_ffmpeg_input_idx += 1
             original_audio_ffmpeg_idx = str(current_ffmpeg_input_idx)
             if start_time is not None:
@@ -1461,7 +1535,10 @@ class VideoProcessor:
             if duration is not None:
                 command.extend(["-t", str(duration)])
             command.extend(["-i", video_path])
-            logger.debug(f"Added original video as input {original_audio_ffmpeg_idx} for keep-original-audio")
+            logger.debug(
+                "Added original video as input %s for original/laughter audio",
+                original_audio_ffmpeg_idx,
+            )
 
         background_audio_ffmpeg_idx_str = None
         if background_audio_path:
@@ -1472,6 +1549,43 @@ class VideoProcessor:
             if duration is not None:
                 command.extend(["-t", str(duration)])
             command.extend(["-i", background_audio_path])
+
+        # Optional "background voice" layer: the original voice mixed under
+        # the dubbed track, quieter than the dub.
+        background_voice_ffmpeg_idx_str = None
+        needs_voice_layer = bool(
+            (background_voice_volume and background_voice_volume > 0)
+            or laughter_ranges
+        )
+        if background_voice_path and os.path.exists(background_voice_path) and needs_voice_layer:
+            current_ffmpeg_input_idx += 1
+            background_voice_ffmpeg_idx_str = str(current_ffmpeg_input_idx)
+            if start_time is not None:
+                command.extend(["-ss", str(start_time)])
+            if duration is not None:
+                command.extend(["-t", str(duration)])
+            command.extend(["-i", background_voice_path])
+            logger.debug(
+                f"Adding background voice layer: {background_voice_path} at volume {background_voice_volume}"
+            )
+        elif needs_voice_layer:
+            logger.warning(
+                "Background voice/laughter layer requested but the original vocals stem is not available - skipping"
+            )
+
+        # Last-resort laughter layer: if neither a background nor a warped
+        # vocals stem is available, use the original video audio directly.
+        # It is silent outside the laughter ranges.
+        laughter_fallback_ffmpeg_idx_str = None
+        if (
+            laughter_ranges
+            and not background_voice_ffmpeg_idx_str
+            and not background_audio_path
+        ):
+            laughter_fallback_ffmpeg_idx_str = original_audio_ffmpeg_idx
+            logger.info(
+                "Laughter preserve: using original video audio as the laughter layer"
+            )
 
         watermark_ffmpeg_idx_str = None
         if watermark_path and os.path.exists(watermark_path):
@@ -1585,15 +1699,82 @@ class VideoProcessor:
 
         # Optionally mix with background after speech gain
         if background_audio_path and background_audio_ffmpeg_idx_str:
-            # Apply user-specified background volume (default ≈ -5 dB)
+            # Apply user-specified background volume (default ≈ -5 dB).
+            # In laughter-preserve mode the same layer is smoothly raised to
+            # the requested target inside the detected laughter ranges.
             bg_vol = background_volume if background_volume and background_volume > 0 else 0.562341
-            all_filter_complex_parts.append(
-                f"[{background_audio_ffmpeg_idx_str}:a:0]volume={bg_vol}[bg_audio_reduced]"
-            )
+            bg_laughter_ranges = laughter_ranges_original or laughter_ranges
+            if bg_laughter_ranges:
+                bg_expr = self._build_laughter_gain_expr(
+                    bg_vol,
+                    laughter_volume,
+                    bg_laughter_ranges,
+                    laughter_volume_ramp_seconds,
+                )
+                all_filter_complex_parts.append(
+                    f"[{background_audio_ffmpeg_idx_str}:a:0]volume='{bg_expr}':eval=frame[bg_audio_reduced]"
+                )
+                logger.info(
+                    "Laughter preserve: background audio envelope %.2f -> %.2f "
+                    "over %d range(s)",
+                    bg_vol,
+                    max(float(laughter_volume), bg_vol),
+                    len(bg_laughter_ranges),
+                )
+            else:
+                all_filter_complex_parts.append(
+                    f"[{background_audio_ffmpeg_idx_str}:a:0]volume={bg_vol}[bg_audio_reduced]"
+                )
             all_filter_complex_parts.append(
                 f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}[bg_audio_reduced]amix=inputs=2:duration=longest[dub_mixed_with_bg]"
             )
             processed_dubbed_audio_stream_label = "[dub_mixed_with_bg]"
+
+        if laughter_fallback_ffmpeg_idx_str:
+            fallback_expr = self._build_laughter_gain_expr(
+                0.0,
+                laughter_volume,
+                laughter_ranges,
+                laughter_volume_ramp_seconds,
+            )
+            all_filter_complex_parts.append(
+                f"[{laughter_fallback_ffmpeg_idx_str}:a:0]"
+                f"volume='{fallback_expr}':eval=frame[laughter_bed]"
+            )
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}"
+                "[laughter_bed]amix=inputs=2:duration=longest:normalize=0"
+                "[dub_with_laughter]"
+            )
+            processed_dubbed_audio_stream_label = "[dub_with_laughter]"
+
+        # Optional "background voice" layer: the original voice mixed under the
+        # dubbed track. It is added with explicit weights so the levels of the
+        # existing streams stay exactly the same.
+        background_voice_label = None
+        if background_voice_ffmpeg_idx_str:
+            if laughter_ranges:
+                voice_expr = self._build_laughter_gain_expr(
+                    background_voice_volume,
+                    laughter_volume,
+                    laughter_ranges,
+                    laughter_volume_ramp_seconds,
+                )
+                all_filter_complex_parts.append(
+                    f"[{background_voice_ffmpeg_idx_str}:a:0]volume='{voice_expr}':eval=frame[bg_voice_layer]"
+                )
+                logger.info(
+                    "Laughter preserve: background voice envelope %.2f -> %.2f "
+                    "over %d range(s)",
+                    background_voice_volume,
+                    max(float(laughter_volume), float(background_voice_volume)),
+                    len(laughter_ranges),
+                )
+            else:
+                all_filter_complex_parts.append(
+                    f"[{background_voice_ffmpeg_idx_str}:a:0]volume={background_voice_volume}[bg_voice_layer]"
+                )
+            background_voice_label = "[bg_voice_layer]"
 
         # Main audio track selection logic
         if keep_original_audio_ranges and len(keep_original_audio_ranges) > 0:
@@ -1606,10 +1787,29 @@ class VideoProcessor:
             all_filter_complex_parts.append(
                 f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}volume='{dubbed_volume_expr}':eval=frame[dubbed_conditional]"
             )
-            all_filter_complex_parts.append(
-                f"[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_mixed_audio]"
-            )
+            if background_voice_label:
+                # The original voice ducks together with the dubbed track, so it
+                # does not double the preserved original audio.
+                all_filter_complex_parts.append(
+                    f"{background_voice_label}volume='{dubbed_volume_expr}':eval=frame[bg_voice_conditional]"
+                )
+                all_filter_complex_parts.append(
+                    "[original_conditional][dubbed_conditional][bg_voice_conditional]"
+                    "amix=inputs=3:duration=longest:weights='0.5 0.5 1':normalize=0[final_mixed_audio]"
+                )
+            else:
+                all_filter_complex_parts.append(
+                    f"[original_conditional][dubbed_conditional]amix=inputs=2:duration=longest[final_mixed_audio]"
+                )
             final_audio_stream_label = "[final_mixed_audio]"
+        elif background_voice_label:
+            # weights + normalize=0 keep the existing stream levels untouched
+            # and add the original voice on top of them.
+            all_filter_complex_parts.append(
+                f"{self._format_filter_input_label(processed_dubbed_audio_stream_label)}"
+                f"{background_voice_label}amix=inputs=2:duration=longest:weights='1 1':normalize=0[dub_mixed_with_voice]"
+            )
+            final_audio_stream_label = "[dub_mixed_with_voice]"
         else:
             final_audio_stream_label = processed_dubbed_audio_stream_label
         

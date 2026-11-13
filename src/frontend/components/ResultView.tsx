@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X, Maximize2, Minimize2, Scissors, Loader2, ExternalLink, AlertCircle, XCircle, Share2, Link2, Check } from 'lucide-react';
+import { Download, FileText, ArrowLeft, CheckCircle, Clock, DollarSign, ChevronDown, X, Maximize2, Minimize2, Scissors, Loader2, ExternalLink, AlertCircle, XCircle, Share2, Link2, Check, UploadCloud, KeyRound } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import api, { ProjectStatsResponse, ClipQuality, ClipJobStatusResponse } from '../api';
+import api, { ProjectStatsResponse, ClipQuality, ClipJobStatusResponse, BorschPublishState } from '../api';
 
 interface ResultViewProps {
   projectId: string;
@@ -19,6 +19,32 @@ interface PersistedClipJob {
 
 const CLIP_JOB_STORAGE_TTL = 3600_000; // 1h
 const CLIP_POLL_INTERVAL = 1500;
+const BORSCH_TOKEN_STORAGE_KEY = 'dubblm_borsch_admin_token';
+const BORSCH_POLL_INTERVAL = 5000;
+
+const readBorschToken = (): string => {
+  try {
+    return localStorage.getItem(BORSCH_TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+};
+
+const writeBorschToken = (token: string) => {
+  try {
+    localStorage.setItem(BORSCH_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // ignore
+  }
+};
+
+const clearBorschToken = () => {
+  try {
+    localStorage.removeItem(BORSCH_TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+};
 
 const clipJobStorageKey = (projectId: string) => `dubblm_clip_job_${projectId}`;
 
@@ -414,6 +440,12 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
   const [shareExpiresAt, setShareExpiresAt] = useState<string | null>(null);
   const [shareCopied, setShareCopied] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
+  const [borschState, setBorschState] = useState<BorschPublishState | null>(null);
+  const [borschLoading, setBorschLoading] = useState(false);
+  const [borschError, setBorschError] = useState<string | null>(null);
+  const [borschTokenOpen, setBorschTokenOpen] = useState(false);
+  const [borschTokenInput, setBorschTokenInput] = useState('');
+  const [borschTokenError, setBorschTokenError] = useState<string | null>(null);
   const clipPollRef = useRef<number | null>(null);
   const isClipRendering = clipJobId !== null && clipStatus?.status !== 'failed';
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -435,6 +467,99 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
     setShareError(null);
     setShareCopied(false);
   }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const token = readBorschToken();
+    api.getBorschPublish(projectId, token || undefined)
+      .then((state) => {
+        if (!cancelled) setBorschState(state);
+      })
+      .catch(() => {
+        if (!cancelled) setBorschState(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (
+      !borschState?.enabled ||
+      !borschState.published ||
+      borschState.status !== 'processing'
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const token = readBorschToken();
+        const next = await api.getBorschPublish(projectId, token || undefined);
+        if (!cancelled) setBorschState(next);
+      } catch {
+        // Keep the last known state; the next poll may succeed.
+      }
+    }, BORSCH_POLL_INTERVAL);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [projectId, borschState?.enabled, borschState?.published, borschState?.status]);
+
+  const runBorschPublish = async (token: string) => {
+    setBorschLoading(true);
+    setBorschError(null);
+    setBorschTokenError(null);
+    try {
+      const state = await api.publishToBorsch(projectId, token);
+      writeBorschToken(token);
+      setBorschState(state);
+      setBorschTokenOpen(false);
+      setBorschTokenInput('');
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      const message = err instanceof Error ? err.message : 'Не удалось опубликовать видео';
+      if (status === 401) {
+        clearBorschToken();
+        setBorschTokenError('Неверный admin token ИИ Борща');
+        setBorschTokenOpen(true);
+      } else {
+        setBorschError(message);
+      }
+    } finally {
+      setBorschLoading(false);
+    }
+  };
+
+  const handleBorschPublishClick = () => {
+    const token = readBorschToken();
+    if (!token) {
+      setBorschTokenInput('');
+      setBorschTokenError(null);
+      setBorschTokenOpen(true);
+      return;
+    }
+    void runBorschPublish(token);
+  };
+
+  const handleBorschTokenSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    const token = borschTokenInput.trim();
+    if (!token) {
+      setBorschTokenError('Введите admin token');
+      return;
+    }
+    void runBorschPublish(token);
+  };
+
+  const handleForgetBorschToken = () => {
+    clearBorschToken();
+    setBorschError(null);
+    setBorschTokenError(null);
+    setBorschTokenInput('');
+    setBorschTokenOpen(true);
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -988,6 +1113,94 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
         </div>
       )}
 
+      {borschState?.enabled && (
+        <div className="w-full max-w-3xl space-y-2">
+          {borschState.published ? (
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/80 px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                  {borschState.status === 'ready' ? (
+                    <CheckCircle className="h-4 w-4 text-emerald-400" />
+                  ) : borschState.status === 'failed' || borschState.status === 'missing' ? (
+                    <AlertCircle className="h-4 w-4 text-red-400" />
+                  ) : (
+                    <Loader2 className="h-4 w-4 animate-spin text-brand-400" />
+                  )}
+                  <span>
+                    {borschState.status === 'ready'
+                      ? 'Опубликовано в ИИ Борщ'
+                      : borschState.status === 'failed'
+                        ? 'Ошибка обработки в ИИ Борщ'
+                        : borschState.status === 'missing'
+                          ? 'Видео не найдено в ИИ Борщ'
+                          : 'Обрабатывается в ИИ Борщ…'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {borschState.url && (
+                    <a
+                      href={borschState.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-brand-500"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      Открыть
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleForgetBorschToken}
+                    className="inline-flex items-center gap-1 rounded-lg bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-300 transition-colors hover:bg-zinc-700"
+                    title="Забыть сохранённый admin token"
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    Забыть токен
+                  </button>
+                </div>
+              </div>
+              {borschState.metadata && (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-xs font-medium text-zinc-400 hover:text-zinc-200">
+                    Сгенерированные метаданные
+                  </summary>
+                  <div className="mt-2 space-y-1.5 rounded-lg bg-zinc-950/70 p-3 text-xs leading-relaxed text-zinc-300">
+                    <div className="font-semibold text-white">{borschState.metadata.title}</div>
+                    <p className="!my-0">{borschState.metadata.summary}</p>
+                    {borschState.metadata.why_hn && (
+                      <p className="!my-0 text-zinc-400">{borschState.metadata.why_hn}</p>
+                    )}
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {borschState.metadata.tags.map((tag) => (
+                        <span key={tag} className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-300">
+                          #{tag}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </details>
+              )}
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={handleBorschPublishClick}
+              disabled={borschLoading}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-brand-500/20 transition-all hover:bg-brand-500 disabled:cursor-wait disabled:opacity-70"
+            >
+              {borschLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
+              {borschLoading ? 'Генерирую описание и публикую…' : 'Опубликовать в ИИ Борщ'}
+            </button>
+          )}
+          {borschError && (
+            <div className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span className="break-words">{borschError}</span>
+            </div>
+          )}
+        </div>
+      )}
+
       <button 
         onClick={onReset}
         className="flex items-center gap-2 text-zinc-500 hover:text-zinc-300 transition-colors text-sm mt-8"
@@ -1103,6 +1316,62 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
           )}
         </div>
       </div>
+
+      {borschTokenOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
+          <form
+            onSubmit={handleBorschTokenSubmit}
+            className="w-full max-w-md rounded-2xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl"
+          >
+            <div className="mb-1 flex items-center gap-2 text-lg font-semibold text-white">
+              <KeyRound className="h-5 w-5 text-brand-400" />
+              Публикация в ИИ Борщ
+            </div>
+            <p className="mb-4 text-sm leading-relaxed text-zinc-400">
+              Введите admin token ИИ Борща. Он сохранится только в этом браузере
+              и не попадёт в серверные логи.
+            </p>
+            <label className="block text-xs font-medium uppercase tracking-wide text-zinc-500">
+              Admin token
+              <input
+                type="password"
+                value={borschTokenInput}
+                onChange={(event) => setBorschTokenInput(event.target.value)}
+                autoFocus
+                autoComplete="current-password"
+                placeholder="ADMIN_TOKEN"
+                className="mt-1.5 w-full rounded-lg border border-zinc-700/60 bg-zinc-900 px-3 py-2.5 text-sm text-white outline-none focus:border-brand-500"
+              />
+            </label>
+            {borschTokenError && (
+              <div className="mt-2 flex items-start gap-1.5 text-xs text-red-300">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{borschTokenError}</span>
+              </div>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!borschLoading) setBorschTokenOpen(false);
+                }}
+                disabled={borschLoading}
+                className="rounded-lg bg-zinc-800 px-3 py-2 text-sm text-zinc-300 transition-colors hover:bg-zinc-700 disabled:opacity-50"
+              >
+                Отмена
+              </button>
+              <button
+                type="submit"
+                disabled={borschLoading}
+                className="inline-flex items-center gap-2 rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-brand-500 disabled:cursor-wait disabled:opacity-70"
+              >
+                {borschLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {borschLoading ? 'Публикую…' : 'Опубликовать'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

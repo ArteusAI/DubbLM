@@ -32,6 +32,8 @@ class TTSConfig:
         default_voice: Optional[str] = None,
         voice_mapping: Optional[Dict[str, str]] = None,
         voice_prompt_mapping: Optional[Dict[str, str]] = None,
+        speaker_voice_profiles: Optional[Dict[str, Any]] = None,
+        voice_advice_max_candidates: int = 8,
         prompt_prefix: Optional[str] = None,
         blocked_voices: Optional[List[str]] = None,
         cost_tracker: Optional[Any] = None,
@@ -43,6 +45,10 @@ class TTSConfig:
         self.default_voice = default_voice
         self.voice_mapping = voice_mapping if voice_mapping is not None else {}
         self.voice_prompt_mapping = voice_prompt_mapping if voice_prompt_mapping is not None else {}
+        self.speaker_voice_profiles = (
+            dict(speaker_voice_profiles) if speaker_voice_profiles else {}
+        )
+        self.voice_advice_max_candidates = max(1, int(voice_advice_max_candidates or 8))
         self.prompt_prefix = prompt_prefix
         self.blocked_voices = list(blocked_voices) if blocked_voices else []
         self.cost_tracker = cost_tracker
@@ -58,6 +64,8 @@ class TTSFactory:
         device: str = "cpu", # device is not used by OpenAI or Gemini but kept for interface consistency
         voice_config: Optional[Union[str, Dict[str, str]]] = None,
         voice_prompt: Optional[Dict[str, str]] = None,
+        speaker_voice_profiles: Optional[Dict[str, Any]] = None,
+        voice_advice_max_candidates: int = 8,
         prompt_prefix: Optional[str] = None,
         blocked_voices: Optional[List[str]] = None,
         **kwargs: Any # To catch any other potential args like model name for specific TTS
@@ -93,6 +101,8 @@ class TTSFactory:
         config_args = {
             "provider": provider_name_lower,
             "voice_prompt_mapping": voice_prompt,
+            "speaker_voice_profiles": speaker_voice_profiles,
+            "voice_advice_max_candidates": voice_advice_max_candidates,
             "prompt_prefix": prompt_prefix,
             "blocked_voices": blocked_voices,
         }
@@ -150,6 +160,8 @@ class TTSFactory:
             init_args["default_voice"] = config.default_voice
         if config.cost_tracker is not None and provider_name_lower in ("openai", "gemini", "gemini38", "minimax", "openrouter"):
             init_args["cost_tracker"] = config.cost_tracker
+        if config.voice_advice_max_candidates is not None:
+            init_args["voice_advice_max_candidates"] = config.voice_advice_max_candidates
         
         # Add provider-specific args
         if provider_name_lower in ("gemini", "gemini38"):
@@ -163,10 +175,20 @@ class TTSFactory:
             fallback = config.kwargs.get("fallback_model") if isinstance(config.kwargs, dict) else None
             if fallback is not None:
                 init_args["fallback_model"] = fallback
+        elif provider_name_lower == "openrouter":
+            if config.blocked_voices:
+                init_args["blocked_voices"] = list(config.blocked_voices)
+            enable_voice_cloning = config.kwargs.get("enable_voice_cloning")
+            if enable_voice_cloning is not None:
+                init_args["enable_voice_cloning"] = bool(enable_voice_cloning)
         
         # Pass through any additional kwargs from TTSConfig (drop None values)
         if isinstance(config.kwargs, dict):
-            init_args.update({k: v for k, v in config.kwargs.items() if v is not None})
+            init_args.update({
+                k: v
+                for k, v in config.kwargs.items()
+                if v is not None and k != "enable_voice_cloning"
+            })
         
         try:
             tts_client = provider_class(**init_args)
@@ -177,7 +199,9 @@ class TTSFactory:
                 tts_client.set_voice_mapping(config.voice_mapping)
             if config.voice_prompt_mapping: # This is also fine
                 tts_client.set_voice_prompt_mapping(config.voice_prompt_mapping)
-                
+            if config.speaker_voice_profiles:
+                tts_client.set_speaker_voice_profiles(config.speaker_voice_profiles)
+
             return tts_client
         except Exception as e:
             # Ensure we catch and re-raise with context

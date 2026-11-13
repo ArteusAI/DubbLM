@@ -42,6 +42,44 @@ GEMINI_VOICE_GENDERS: Dict[str, str] = {
 
 ALL_GEMINI_VOICES: List[str] = list(GEMINI_VOICE_GENDERS.keys())
 
+# Voice character of the prebuilt voices, used to match a speaker against a
+# voice. The style column follows the official Gemini voice table; the age
+# and energy columns are curated approximations (Google does not publish a
+# pitch/energy table), so they are only used to *rank* candidates, never to
+# exclude one.
+GEMINI_VOICE_TRAITS: Dict[str, Dict[str, str]] = {
+    "Achernar": {"style": "soft", "timbre": "soft, gentle, airy", "age": "adult", "energy": "medium"},
+    "Achird": {"style": "bright", "timbre": "bright, youthful, clear", "age": "young adult", "energy": "high"},
+    "Algenib": {"style": "gravelly", "timbre": "rough, gravelly, low", "age": "older", "energy": "medium"},
+    "Algieba": {"style": "smooth", "timbre": "smooth, warm, rounded", "age": "adult", "energy": "medium"},
+    "Alnilam": {"style": "firm", "timbre": "firm, steady, clear", "age": "adult", "energy": "medium"},
+    "Aoede": {"style": "breezy", "timbre": "light, breezy, bright", "age": "young adult", "energy": "medium"},
+    "Autonoe": {"style": "clear", "timbre": "clear, crisp, articulate", "age": "adult", "energy": "medium"},
+    "Callirrhoe": {"style": "easy-going", "timbre": "relaxed, warm, casual", "age": "adult", "energy": "low"},
+    "Charon": {"style": "deep", "timbre": "deep, resonant, authoritative", "age": "older", "energy": "low"},
+    "Despina": {"style": "smooth", "timbre": "smooth, soft, even", "age": "adult", "energy": "low"},
+    "Enceladus": {"style": "crisp", "timbre": "crisp, precise, cool", "age": "adult", "energy": "medium"},
+    "Erinome": {"style": "clear", "timbre": "clear, precise, cool", "age": "adult", "energy": "medium"},
+    "Fenrir": {"style": "excitable", "timbre": "excitable, sharp, energetic", "age": "young adult", "energy": "high"},
+    "Gacrux": {"style": "mature", "timbre": "mature, low, measured", "age": "older", "energy": "low"},
+    "Iapetus": {"style": "even", "timbre": "even, flat, controlled", "age": "adult", "energy": "low"},
+    "Kore": {"style": "firm", "timbre": "firm, confident, clear", "age": "adult", "energy": "medium"},
+    "Laomedeia": {"style": "upbeat", "timbre": "upbeat, bright, lively", "age": "young adult", "energy": "high"},
+    "Leda": {"style": "soft", "timbre": "soft, warm, gentle", "age": "adult", "energy": "low"},
+    "Orus": {"style": "firm", "timbre": "firm, authoritative, deep", "age": "adult", "energy": "medium"},
+    "Puck": {"style": "upbeat", "timbre": "upbeat, bright, playful", "age": "young adult", "energy": "high"},
+    "Pulcherrima": {"style": "forward", "timbre": "forward, energetic, sharp", "age": "adult", "energy": "high"},
+    "Rasalgethi": {"style": "informative", "timbre": "informative, clear, neutral", "age": "adult", "energy": "medium"},
+    "Sadachbia": {"style": "lively", "timbre": "lively, bright, quick", "age": "young adult", "energy": "high"},
+    "Sadaltager": {"style": "knowledgeable", "timbre": "knowledgeable, calm, warm", "age": "older", "energy": "medium"},
+    "Schedar": {"style": "even", "timbre": "even, steady, low", "age": "older", "energy": "low"},
+    "Sulafat": {"style": "warm", "timbre": "warm, soft, rich", "age": "adult", "energy": "medium"},
+    "Umbriel": {"style": "easy-going", "timbre": "easy-going, relaxed, warm", "age": "adult", "energy": "low"},
+    "Vindemiatrix": {"style": "gentle", "timbre": "gentle, soft, calm", "age": "adult", "energy": "low"},
+    "Zephyr": {"style": "lively", "timbre": "lively, bright, warm", "age": "young adult", "energy": "high"},
+    "Zubenelgenubi": {"style": "casual", "timbre": "casual, relaxed, light", "age": "young adult", "energy": "medium"},
+}
+
 # Use stable non-breathy defaults when gender is known and the configured
 # default voice is either missing or incompatible.
 DEFAULT_GEMINI_VOICE_BY_GENDER: Dict[str, str] = {
@@ -49,6 +87,13 @@ DEFAULT_GEMINI_VOICE_BY_GENDER: Dict[str, str] = {
     "male": "Puck",
     "unknown": "Kore",
 }
+
+
+def get_gemini_voice_traits(voice_name: Optional[str]) -> Dict[str, str]:
+    """Return the character of a Gemini voice (empty when unknown)."""
+    if not voice_name:
+        return {}
+    return dict(GEMINI_VOICE_TRAITS.get(str(voice_name).strip(), {}))
 
 
 def get_gemini_voice_gender(voice_name: Optional[str]) -> str:

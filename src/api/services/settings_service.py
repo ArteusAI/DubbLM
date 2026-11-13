@@ -42,30 +42,38 @@ def _deep_merge(base: dict, update: dict) -> dict:
 def _load_dubbing_defaults() -> Dict[str, Any]:
     """Build frontend defaults from dubbing_config.yml."""
     base: Dict[str, Any] = {
-        "sourceLang": "en",
+        "sourceLang": "auto",
         "targetLang": "ru",
         "personaId": "normal",
-        "preset": "hq",
+        "preset": "ultra",
         "keepBackground": False,
         "pauseRemoval": "disabled",
         "translationPromptPrefix": "",
+        "transcriptionSystem": "openrouter",
+        "openrouterSttModel": "microsoft/mai-transcribe-2",
         "ttsSystem": "gemini38",
+        "ttsTransport": "openrouter",
+        "ttsModel": "google/gemini-3.8-flash-tts",
         "enableContextStyle": True,
-        "llmProvider": "gemini",
-        "llmModelName": "gemini-2.5-pro",
+        "llmProvider": "openrouter",
+        "llmModelName": "~google/gemini-flash-latest",
         "llmTemperature": 0.5,
         "enableLlmEditor": False,
         "enableLlmTextAdjustment": True,
         "refinementLlmProvider": "openrouter",
-        "refinementModelName": "openai/gpt-6-sol",
-        "refinementTemperature": 1.0,
+        "refinementModelName": "google/gemini-4-carbon",
+        "refinementTemperature": 0.8,
         "editorLlmProvider": "openrouter",
-        "editorModelName": "openai/gpt-5.6-terra",
+        "editorModelName": "openai/gpt-5.6-sol",
         "editorTemperature": 1.0,
         "editorReasoningEffort": "xhigh",
         "voiceAutoSelection": True,
+        "enableVoiceCloning": None,
         "enableSpeakerGenderInference": True,
         "enableEmotionEnrichment": False,
+        "enableVocalEventDetection": False,
+        "enableVocalEventLoudnessDetection": False,
+        "vocalEventsMode": "preserve",
         "enableContentValidation": True,
         "contentValidatorProvider": "whisper",
         "contentValidatorWhisperModel": "base",
@@ -74,6 +82,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "contentValidatorSpeechModel": "nano",
         "dubbedVolume": 1.0,
         "backgroundVolume": 0.562341,
+        "backgroundVoiceVolume": 0.0,
         "normalizeAudio": False,
         "useTwoPassEncoding": True,
         "maxWorkers": 4,
@@ -97,6 +106,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "keep_background": "keepBackground",
         "pause_removal": "pauseRemoval",
         "transcription_system": "transcriptionSystem",
+        "openrouter_stt_model": "openrouterSttModel",
         "whisper_model": "whisperModel",
         "llm_provider": "llmProvider",
         "llm_model_name": "llmModelName",
@@ -112,12 +122,24 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "editor_reasoning_effort": "editorReasoningEffort",
         "translation_prompt_prefix": "translationPromptPrefix",
         "tts_system": "ttsSystem",
+        "tts_transport": "ttsTransport",
         "tts_model": "ttsModel",
         "tts_prompt_prefix": "ttsPromptPrefix",
         "voice_auto_selection": "voiceAutoSelection",
+        "enable_voice_cloning": "enableVoiceCloning",
         "enable_emotion_enrichment": "enableEmotionEnrichment",
+        "enable_video_emotion_analysis": "enableVideoEmotionAnalysis",
+        "video_emotion_analysis_model": "videoEmotionAnalysisModel",
+        "video_emotion_analysis_fps": "videoEmotionAnalysisFps",
+        "video_emotion_analysis_direction_max_chars": "videoEmotionAnalysisDirectionMaxChars",
+        "video_emotion_analysis_language": "videoEmotionAnalysisLanguage",
+        "enable_voice_advisor": "enableVoiceAdvisor",
+        "voice_advice_max_candidates": "voiceAdviceMaxCandidates",
         "enable_laughter_detection": "enableLaughterDetection",
         "laughter_mode": "laughterMode",
+        "enable_vocal_event_detection": "enableVocalEventDetection",
+        "enable_vocal_event_loudness_detection": "enableVocalEventLoudnessDetection",
+        "vocal_events_mode": "vocalEventsMode",
         "enable_content_validation": "enableContentValidation",
         "enable_context_style": "enableContextStyle",
         "context_style_max_chars": "contextStyleMaxChars",
@@ -128,6 +150,7 @@ def _load_dubbing_defaults() -> Dict[str, Any]:
         "content_validator_speech_model": "contentValidatorSpeechModel",
         "dubbed_volume": "dubbedVolume",
         "background_volume": "backgroundVolume",
+        "background_voice_volume": "backgroundVoiceVolume",
         "normalize_audio": "normalizeAudio",
         "use_two_pass_encoding": "useTwoPassEncoding",
         "max_workers": "maxWorkers",
@@ -222,6 +245,126 @@ def set_api_key(provider: str, key: str) -> None:
         settings["apiKeys"] = {}
     settings["apiKeys"][provider] = key
     save_settings(settings)
+
+
+def _env_file_path() -> Path:
+    """Locate the project .env file (the container workdir is /app)."""
+    return Path(os.getenv("DUBBLM_ENV_FILE", ".env")).expanduser()
+
+
+def _read_env_value(name: str, path: Optional[Path] = None) -> Optional[str]:
+    env_path = path or _env_file_path()
+    if not env_path.exists() or not env_path.is_file():
+        return None
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip().removeprefix("export ").strip() == name:
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                return value or None
+    except OSError:
+        return None
+    return None
+
+
+def has_openrouter_key() -> bool:
+    """True when an OpenRouter key is available from env, settings or .env."""
+    if get_api_key("openrouter"):
+        return True
+    return bool(_read_env_value("OPENROUTER_API_KEY"))
+
+
+def _write_env_value(name: str, value: str) -> Path:
+    """Atomically update one key in .env while preserving comments/order."""
+    env_path = _env_file_path()
+    lines: list[str] = []
+    if env_path.exists() and env_path.is_file():
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+
+    new_line = f"{name}={value}"
+    replaced = False
+    updated: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            updated.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip().removeprefix("export ").strip()
+        if key == name:
+            if not replaced:
+                updated.append(new_line)
+                replaced = True
+            # Drop duplicate assignments.
+            continue
+        updated.append(line)
+    if not replaced:
+        if updated and updated[-1].strip():
+            updated.append("")
+        updated.append(new_line)
+    elif not updated:
+        updated.append(new_line)
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = env_path.with_name(env_path.name + ".tmp")
+    temp_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+    try:
+        os.replace(temp_path, env_path)
+    except OSError as exc:
+        # A single-file bind mount (Docker) is a mount point and cannot be
+        # replaced with rename(2). Fall back to truncating the mounted file.
+        import errno
+
+        if exc.errno not in (errno.EBUSY, errno.EXDEV, errno.EPERM, errno.EACCES, errno.EROFS):
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        env_path.write_text(temp_path.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError:
+            pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return env_path
+
+
+def save_openrouter_key(key: str) -> Dict[str, Any]:
+    """Persist the OpenRouter key to .env, settings.yml and the environment."""
+    cleaned = str(key or "").strip()
+    if not cleaned:
+        raise ValueError("OpenRouter key is empty")
+    env_path: Optional[Path] = None
+    env_error: Optional[str] = None
+    try:
+        env_path = _write_env_value("OPENROUTER_API_KEY", cleaned)
+    except OSError as exc:
+        # settings.yml is still enough for the worker; report the env issue.
+        env_error = str(exc)
+    set_api_key("openrouter", cleaned)
+    os.environ["OPENROUTER_API_KEY"] = cleaned
+    return {
+        "configured": True,
+        "source": "env+settings" if env_path else "settings",
+        "env_file": str(env_path) if env_path else None,
+        "env_error": env_error,
+        "masked": mask_api_key(cleaned),
+    }
 
 
 def get_defaults() -> Dict[str, Any]:

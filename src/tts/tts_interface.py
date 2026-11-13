@@ -133,6 +133,16 @@ class TTSInterface(ABC):
     def set_voice_prompt_mapping(self, mapping: Dict[str, str]) -> None:
         """Set a global mapping of speaker IDs to voice style prompts for the TTS system."""
         pass # Specific implementation in derived classes
+
+    def set_speaker_voice_profiles(self, profiles: Dict[str, Any]) -> None:
+        """Set the voice advice per speaker (timbre, age, energy, accent).
+
+        The profiles come from the video+audio delivery analysis. They are a
+        recommendation: providers may use them to rank the candidate voices
+        and to enrich the delivery instruction. The default implementation
+        only stores them.
+        """
+        self.speaker_voice_profiles = dict(profiles or {})
     
     @abstractmethod
     def clone_voice(self, audio_path: str, voice_id: str) -> str:

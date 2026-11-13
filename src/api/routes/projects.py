@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from ..database.session import get_db
-from ..database.models import Project, Segment, ProjectStatus
+from ..database.models import Project
 from ..models.schemas import (
     ProjectCreate,
     ProjectResponse,
@@ -39,7 +39,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             speakerCount=config.get("speakerCount"),
             keepBackground=config.get("keepBackground", False),
             pauseRemoval=config.get("pauseRemoval", "disabled"),
-            preset=config.get("preset", "hq"),
+            preset=(config.get("preset") if config.get("preset") in {"fast", "hq", "ultra"} else "ultra"),
             apiKeys=None,  # Never expose API keys
             autoProcess=config.get("autoProcess"),
             # LLM settings
@@ -53,6 +53,8 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             editorReasoningEffort=config.get("editorReasoningEffort"),
             speakerTtsPrompts=config.get("speakerTtsPrompts"),
             speakerVoiceMappings=config.get("speakerVoiceMappings"),
+            autoSelectedVoices=config.get("autoSelectedVoices"),
+            blockedVoices=config.get("blockedVoices"),
             enableSpeakerGenderInference=config.get("enableSpeakerGenderInference", True),
             speakerMetadata=config.get("speakerMetadata"),
             refinementLlmProvider=config.get("refinementLlmProvider"),
@@ -61,14 +63,38 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             translationPromptPrefix=config.get("translationPromptPrefix"),
             # TTS settings
             ttsSystem=config.get("ttsSystem"),
+            ttsTransport=config.get("ttsTransport"),
             ttsModel=config.get("ttsModel"),
             ttsPromptPrefix=config.get("ttsPromptPrefix"),
             voiceAutoSelection=config.get("voiceAutoSelection"),
+            enableVoiceCloning=config.get("enableVoiceCloning"),
             enableEmotionEnrichment=config.get("enableEmotionEnrichment"),
+            enableVideoEmotionAnalysis=config.get("enableVideoEmotionAnalysis"),
             enableContentValidation=config.get("enableContentValidation"),
+            refinerEmotionTags=config.get("refinerEmotionTags"),
+            creativeRecoveryVariants=config.get("creativeRecoveryVariants"),
+            enableLlmTextAdjustment=config.get("enableLlmTextAdjustment"),
+            enableContextStyle=config.get("enableContextStyle"),
+            contextStyleMaxChars=config.get("contextStyleMaxChars"),
+            enableLaughterDetection=config.get("enableLaughterDetection"),
+            laughterMode=config.get("laughterMode"),
+            enableVocalEventDetection=config.get("enableVocalEventDetection"),
+            vocalEventsMode=config.get("vocalEventsMode"),
+            vocalEventKinds=config.get("vocalEventKinds"),
+            enableGeminiSpeakerLabeling=config.get("enableGeminiSpeakerLabeling"),
+            geminiSpeakerLabelingModel=config.get("geminiSpeakerLabelingModel"),
+            geminiSpeakerLabelingMaxSpeakers=config.get("geminiSpeakerLabelingMaxSpeakers"),
+            transcribeOnVocals=config.get("transcribeOnVocals"),
+            ttsFallbackModel=config.get("ttsFallbackModel"),
+            contentValidatorProvider=config.get("contentValidatorProvider"),
+            contentValidatorWhisperModel=config.get("contentValidatorWhisperModel"),
+            contentValidatorWhisperComputeType=config.get("contentValidatorWhisperComputeType"),
+            contentValidatorWhisperCpuThreads=config.get("contentValidatorWhisperCpuThreads"),
+            contentValidatorSpeechModel=config.get("contentValidatorSpeechModel"),
             # Audio settings
             dubbedVolume=config.get("dubbedVolume"),
             backgroundVolume=config.get("backgroundVolume"),
+            backgroundVoiceVolume=config.get("backgroundVoiceVolume"),
             keepOriginalAudioRanges=config.get("keepOriginalAudioRanges"),
             useTwoPassEncoding=config.get("useTwoPassEncoding"),
             videoQualityPreset=config.get("videoQualityPreset"),
@@ -77,6 +103,7 @@ def _project_to_response(project: Project, include_segments: bool = False) -> di
             startTime=config.get("startTime"),
             duration=config.get("duration"),
             transcriptionSystem=config.get("transcriptionSystem"),
+            openrouterSttModel=config.get("openrouterSttModel"),
             whisperModel=config.get("whisperModel"),
             # Segment optimization
             postDiarizationMergeGap=config.get("postDiarizationMergeGap"),

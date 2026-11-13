@@ -128,6 +128,12 @@ def _run_dubbing(config) -> Tuple[int, Optional[Dict[str, float]]]:
                     target_language=config.get("target_language"),
                     dubbed_volume=config.get("dubbed_volume", 1.0),
                     background_volume=config.get("background_volume", 0.562341),
+                    background_voice_path=(
+                        dubber.resolve_background_voice_stem(config.get("input"))
+                        if float(config.get("background_voice_volume", 0.0) or 0.0) > 0
+                        else None
+                    ),
+                    background_voice_volume=config.get("background_voice_volume", 0.0),
                     normalize_audio=config.get("normalize_audio", False),
                     upscale_factor=config.get("upscale_factor", 1.0),
                     upscale_sharpen=config.get("upscale_sharpen", True),

@@ -7,8 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
 from .database.session import init_db
-from .routes import projects, upload, process, segments, resources, download, status, frames, translate
+from .routes import projects, upload, process, segments, resources, download, status, frames, translate, publish
 from .routes import settings as settings_routes
+from .routes import setup as setup_routes
 
 
 @asynccontextmanager
@@ -54,7 +55,9 @@ def create_app() -> FastAPI:
     app.include_router(download.router, prefix=app_settings.api_prefix)
     app.include_router(status.router, prefix=app_settings.api_prefix)
     app.include_router(settings_routes.router, prefix=app_settings.api_prefix)
+    app.include_router(setup_routes.router, prefix=app_settings.api_prefix)
     app.include_router(frames.router, prefix=app_settings.api_prefix)
+    app.include_router(publish.router, prefix=app_settings.api_prefix)
     
     @app.get("/health")
     async def health_check():

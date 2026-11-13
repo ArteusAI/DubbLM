@@ -4,7 +4,7 @@ import os
 import sys
 import json
 import argparse
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any
 from pathlib import Path
 import yaml
 from .log_config import get_logger
@@ -40,15 +40,30 @@ class DubbingConfig:
             'duration': None,
             'no_cache': False,
             'tts_system': 'gemini38',
+            'tts_transport': 'openrouter',
             'tts_model': DEFAULT_GEMINI38_TTS_MODEL,
             'tts_fallback_model': DEFAULT_GEMINI38_TTS_FALLBACK_MODEL,
-            'transcription_system': 'assemblyai',
+            'transcription_system': 'openrouter',
+            'openrouter_stt_model': 'microsoft/mai-transcribe-2',
+            'openrouter_stt_fallback_models': [
+                'elevenlabs/scribe-v2',
+                'deepgram/nova-3',
+            ],
+            'openrouter_stt_chunk_seconds': 600,
+            'openrouter_stt_overlap_seconds': 15,
+            # Gemini-assisted speaker labeling: keep AssemblyAI word timings but
+            # let Gemini (which hears the audio) re-label who speaks. Helps on
+            # rapid/overlapping trailer dialogue where AssemblyAI diarization
+            # collapses different characters onto one speaker.
+            'enable_gemini_speaker_labeling': False,
+            'gemini_speaker_labeling_model': 'gemini-2.5-pro',
+            'gemini_speaker_labeling_max_speakers': 4,
             'translator_type': 'llm',
-            'llm_provider': 'gemini',
-            'llm_model_name': 'gemini-2.5-pro',
+            'llm_provider': 'openrouter',
+            'llm_model_name': '~google/gemini-flash-latest',
             'llm_temperature': 0.5,
-            'refinement_llm_provider': None,
-            'refinement_model_name': None,
+            'refinement_llm_provider': 'openrouter',
+            'refinement_model_name': 'openai/gpt-6-sol',
             'refinement_temperature': 1.0,
             'refinement_max_tokens': None,
             'refinement_persona': 'normal',
@@ -75,6 +90,18 @@ class DubbingConfig:
             'voice_prompt': None,
             'voice_auto_selection': True,
             'enable_emotion_analysis': False,
+            # Video+audio emotion analysis (Gemini VLM): one request sees the
+            # trailer as a single stream (picture + original audio) and tells
+            # how every line is performed. The result drives the TTS style.
+            'enable_video_emotion_analysis': False,
+            'video_emotion_analysis_model': 'gemini-flash-latest',
+            'video_emotion_analysis_fps': 0.5,
+            'video_emotion_analysis_direction_max_chars': 90,
+            'video_emotion_analysis_language': 'en',
+            # Voice advice (timbre per speaker) from the same VLM request.
+            'enable_voice_advisor': False,
+            'voice_advice_max_candidates': 8,
+            'speaker_voice_profiles': {},
             'enable_laughter_detection': False,
             # Laughter handling mode: 'dub' (voice laughter via TTS tags) or
             # 'preserve' (keep the original laughter audio, rearrange the
@@ -85,6 +112,39 @@ class DubbingConfig:
             'laughter_preserve_min_duration': 0.25,
             'laughter_preserve_boundary_snap_seconds': 1.5,
             'laughter_preserve_target_dbfs': -20.0,
+            # Volume-envelope preserve mode: keep translation segments in
+            # place, raise the original/background layer during laughter.
+            'laughter_volume': 0.70,
+            'laughter_volume_ramp_seconds': 0.25,
+            # Non-verbal vocal event detection (AST AudioSet) for trailers and
+            # drama: screams, sobbing, gasps, whispers, ...
+            'enable_vocal_event_detection': False,
+            'vocal_event_kinds': None,
+            'vocal_event_threshold': 0.35,
+            'vocal_event_min_seconds': 0.3,
+            'vocal_event_merge_gap_seconds': 0.5,
+            'vocal_event_max_per_segment': 3,
+            # How non-laugh events are handled: 'dub' (TTS tags) or 'preserve'
+            # (keep the original audio and split speech around it). Laughter is
+            # controlled separately by laughter_mode.
+            'vocal_events_mode': 'preserve',
+            'vocal_event_window_seconds': 10.0,
+            'vocal_event_hop_seconds': 1.0,
+            'vocal_event_detection_mode': 'window',
+            # Loudness based detection of shouted lines / screams. The AST
+            # classifier stays silent on shouted dialogue, so the loudness
+            # envelope of the vocals stem is used as a second signal.
+            'enable_vocal_event_loudness_detection': False,
+            'vocal_event_loudness_margin_db': 3.0,
+            'vocal_event_loudness_floor_db': -25.0,
+            'vocal_event_loudness_min_seconds': 0.1,
+            'vocal_event_loudness_merge_gap_seconds': 0.3,
+            'vocal_event_loudness_kind': 'scream',
+            'vocal_event_probability_mode': 'softmax',
+            'vocal_event_model_cache_dir': None,
+            # Verify synthesized scream/sob/gasp tags against the audio with
+            # AST. None = follow enable_vocal_event_detection.
+            'enable_vocal_event_verification': None,
             'include_original_audio': False,
             'output': None, 
             'keep_original_audio_ranges': None,
@@ -96,9 +156,23 @@ class DubbingConfig:
             'keyframe_buffer': 0.2,
             'dubbed_volume': 1.0,
             'background_volume': 0.562341,
+            # "Background voice": the original voice mixed under the dubbed
+            # track, quieter than the dub (0 = disabled).
+            'background_voice_volume': 0.0,
             'normalize_audio': False,
+            # Run ASR + diarization on the isolated vocals stem (UVR) instead of
+            # the full mix. Much better speaker attribution on music-heavy
+            # material (trailers). None = auto: follow keep_background, since the
+            # separation is already paid for then and reused for the background.
+            'transcribe_on_vocals': None,
             'enable_emotion_enrichment': False,
-            'emotion_enrichment_model': 'gemini-2.5-pro',
+            # When true, the refinement LLM owns inline delivery tags and the
+            # runtime Gemini 3.8 tag enricher is skipped (avoids double tags).
+            'refiner_emotion_tags': False,
+            # Request short variants even in video/audio_and_video stretch mode
+            # so punchy-but-longer creative lines can avoid video slowdown.
+            'creative_recovery_variants': False,
+            'emotion_enrichment_model': '~google/gemini-flash-latest',
             'emotion_enrichment_temperature': 0.7,
             'enable_content_validation': True,
             'enable_context_style': True,
@@ -121,6 +195,10 @@ class DubbingConfig:
             'exit_before_synthesis': False,
             'clone_voice': None,
             'voice_names': None,
+            # Stateless voice cloning for models that support reference audio
+            # (currently Fish Audio Drama 3 through OpenRouter). The API
+            # resolves the per-model default before building this config.
+            'enable_voice_cloning': False,
             # Segment stretch mode: audio | audio_and_video | video
             'segment_stretch': 'audio_and_video',
             # Segment optimization settings (grouped)
@@ -143,6 +221,10 @@ class DubbingConfig:
                 'speaker_fragment_max_words': 10,
                 'speaker_fragment_max_gap': 0.75,
                 'speaker_fragment_repair_passes': 3,
+                # Merge adjacent same-speaker segments to reduce TTS calls. Keep
+                # this off to synthesize strictly one recognized turn per segment
+                # (safer when diarization is noisy).
+                'merge_same_speaker_segments': True,
                 # Video pause processing
                 'min_pause_duration': 3,
                 'preserve_pause_duration': 1.5,
@@ -306,6 +388,49 @@ class DubbingConfig:
             logger.warning(f"Warning: Invalid laughter_mode '{laughter_mode}'. Falling back to 'dub'.")
             laughter_mode = 'dub'
         self.config['laughter_mode'] = laughter_mode
+
+        # Normalize vocal_events_mode
+        vocal_events_mode = str(self.config.get('vocal_events_mode') or 'preserve').strip().lower()
+        if vocal_events_mode not in ('dub', 'preserve'):
+            logger.warning(
+                f"Warning: Invalid vocal_events_mode '{vocal_events_mode}'. Falling back to 'preserve'."
+            )
+            vocal_events_mode = 'preserve'
+        self.config['vocal_events_mode'] = vocal_events_mode
+
+        # Normalize voice cloning (YAML may supply a string).
+        clone_enabled = self.config.get('enable_voice_cloning')
+        if isinstance(clone_enabled, str):
+            self.config['enable_voice_cloning'] = clone_enabled.strip().lower() in (
+                '1', 'true', 'yes', 'on', 'enabled'
+            )
+        elif clone_enabled is not None:
+            self.config['enable_voice_cloning'] = bool(clone_enabled)
+
+        # Normalize transcribe_on_vocals (tri-state: None = auto).
+        transcribe_on_vocals = self.config.get('transcribe_on_vocals')
+        if transcribe_on_vocals is None:
+            self.config['transcribe_on_vocals'] = None
+        elif isinstance(transcribe_on_vocals, str):
+            normalized = transcribe_on_vocals.strip().lower()
+            if normalized in ('', 'auto', 'none', 'default'):
+                self.config['transcribe_on_vocals'] = None
+            else:
+                self.config['transcribe_on_vocals'] = normalized in ('true', '1', 'yes', 'on', 'enabled')
+        else:
+            self.config['transcribe_on_vocals'] = bool(transcribe_on_vocals)
+
+    def transcribe_on_vocals_enabled(self) -> bool:
+        """Resolve whether ASR/diarization should run on the isolated vocals stem.
+
+        ``transcribe_on_vocals`` is a tri-state: True/False force the behavior,
+        while None follows ``keep_background`` because the UVR separation is
+        already performed (and cached) for the background track in that case.
+        """
+        explicit = self.config.get('transcribe_on_vocals')
+        if explicit is not None:
+            return bool(explicit)
+        return bool(self.config.get('keep_background'))
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value."""
@@ -335,7 +460,15 @@ class DubbingConfig:
         parser.add_argument('--tts_system', type=str, choices=['coqui', 'openai', 'f5_tts', 'gemini', 'gemini38', 'minimax', 'openrouter', 'f5'], help="Text-to-speech system to use ('gemini' is deprecated, use 'gemini38')")
         parser.add_argument('--tts_model', type=str, help='Model name for the selected TTS provider')
         parser.add_argument('--tts_fallback_model', type=str, help='Fallback model name for the TTS provider (used by Gemini)')
-        parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx'], help='Transcription system to use')
+        parser.add_argument('--tts_transport', type=str, choices=['openrouter', 'google'], help='Transport for Gemini 3.8 TTS')
+        parser.add_argument('--transcription_system', type=str, choices=['openai', 'whisperx', 'assemblyai', 'openrouter'], help='Transcription system to use')
+        parser.add_argument('--openrouter_stt_model', type=str, help='Speech-to-text model served through OpenRouter')
+        parser.add_argument('--openrouter_stt_chunk_seconds', type=float, help='Audio chunk length for OpenRouter STT')
+        parser.add_argument('--openrouter_stt_overlap_seconds', type=float, help='Overlap between OpenRouter STT chunks')
+        parser.add_argument('--transcribe_on_vocals', type=lambda x: (str(x).lower() == 'true'), help='Run ASR/diarization on the isolated vocals stem (True/False; default: follow keep_background)')
+        parser.add_argument('--enable_gemini_speaker_labeling', type=lambda x: (str(x).lower() == 'true'), help='Let Gemini re-label speakers on the ASR transcript while keeping ASR word timings (True/False)')
+        parser.add_argument('--gemini_speaker_labeling_model', type=str, help='Gemini model used for speaker labeling (e.g. gemini-2.5-pro)')
+        parser.add_argument('--gemini_speaker_labeling_max_speakers', type=int, help='Maximum number of distinct voices for Gemini speaker labeling')
         parser.add_argument('--translator_type', type=str, choices=['llm'], help='Translator type to use')
         parser.add_argument('--llm_provider', type=str, choices=['gemini', 'openrouter'], help='LLM provider to use')
         parser.add_argument('--llm_model_name', type=str, help='Model name for the LLM')
@@ -373,8 +506,20 @@ class DubbingConfig:
         parser.add_argument('--content_repetition_min_words', type=int, help='N-gram size used for unexpected TTS repetition detection')
         parser.add_argument('--content_repetition_extra_allowance', type=int, help='Allowed extra ASR occurrences of an n-gram before flagging a TTS repetition')
         parser.add_argument('--enable_emotion_analysis', type=lambda x: (str(x).lower() == 'true'), help='Enable emotion analysis for speech synthesis (True/False)')
+        parser.add_argument('--enable_video_emotion_analysis', type=lambda x: (str(x).lower() == 'true'), help='Analyze the original performance (video + audio) with a Gemini VLM and use it for the TTS style (True/False)')
+        parser.add_argument('--video_emotion_analysis_model', type=str, help='Model used for the video+audio emotion analysis')
+        parser.add_argument('--video_emotion_analysis_fps', type=float, help='Frames per second sampled from the video for the emotion analysis')
+        parser.add_argument('--enable_voice_advisor', type=lambda x: (str(x).lower() == 'true'), help='Use the voice advice (timbre per speaker) of the delivery analysis for the voice choice and the TTS style (True/False)')
+        parser.add_argument('--enable_emotion_enrichment', type=lambda x: (str(x).lower() == 'true'), help='Label per-segment emotions for TTS style guidance (True/False)')
+        parser.add_argument('--refiner_emotion_tags', type=lambda x: (str(x).lower() == 'true'), help='Let the refinement LLM own inline delivery tags and skip the runtime emotion enricher (True/False)')
+        parser.add_argument('--creative_recovery_variants', type=lambda x: (str(x).lower() == 'true'), help='Request short/long variants in video modes for creative timing recovery (True/False)')
         parser.add_argument('--enable_laughter_detection', type=lambda x: (str(x).lower() == 'true'), help='Detect laughter moments and voice them with TTS laughter tags (True/False)')
         parser.add_argument('--laughter_mode', type=str, choices=['dub', 'preserve'], help="Laughter handling: 'dub' voices laughter via TTS tags, 'preserve' keeps the original laughter audio")
+        parser.add_argument('--enable_vocal_event_detection', type=lambda x: (str(x).lower() == 'true'), help='Detect non-verbal vocal events (screams, sobbing, gasps, ...) with the AST AudioSet model (True/False)')
+        parser.add_argument('--vocal_events_mode', type=str, choices=['dub', 'preserve'], help="Non-verbal event handling: 'dub' voices them via TTS tags, 'preserve' keeps the original audio")
+        parser.add_argument('--vocal_event_kinds', type=str, help='Comma-separated event kinds to detect (laugh, cry, scream, shout, whisper, gasp, pant, sigh, groan, grunt, whimper, breath, snort)')
+        parser.add_argument('--vocal_event_threshold', type=float, help='Minimum per-frame AST probability for a vocal event')
+        parser.add_argument('--vocal_event_max_per_segment', type=int, help='Maximum number of distinct vocal event tags per segment')
         parser.add_argument('--run_step', type=str, choices=['combine_video'], 
                             help='Run only a specific, advanced pipeline step. This is intended for debugging or resuming a failed run where prior steps have successfully created their expected output files in the default locations. \
                                   Example: --run_step combine_video (Assumes audio/output.wav and potentially audio/background.wav exist from prior steps). \
@@ -400,6 +545,8 @@ class DubbingConfig:
                             help='Save translated segments to JSON and exit before speech synthesis. Edit the file, rename it to *_edited.json, and rerun to use edited translations.')
         parser.add_argument('--clone_voice', type=str, default=None,
                             help='Comma-separated list of speakers to clone (e.g., SPEAKER_A,SPEAKER_B). Voices will be cloned after diarization and test samples generated.')
+        parser.add_argument('--enable_voice_cloning', type=lambda x: (str(x).lower() == 'true'), default=None,
+                            help='Build a clean reference from the source audio for every speaker and use stateless voice cloning (Drama 3 / OpenRouter).')
         parser.add_argument('--voice_names', type=str, default=None,
                             help='Comma-separated list of custom voice names for cloned voices (e.g., alice_voice,bob_voice). Must match the order of --clone_voice. If not provided, auto-generates as cloned_{SPEAKER_ID}.')
         
