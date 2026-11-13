@@ -102,6 +102,10 @@ tmp/
 
 *.yml
 
+# Tracked deployment templates (other local *.yml files stay ignored)
+!docker-compose.yml
+!settings.example.yml
+
 # Ignore Gemini voice stats file
 tts/samples/gemini/gemini_voice_stats.json
 

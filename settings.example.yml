@@ -1,0 +1,31 @@
+# DubbLM system settings template.
+# Copy to settings.yml before starting docker compose:
+#   cp settings.example.yml settings.yml
+#
+# The first-run web wizard writes the OpenRouter key to both .env and
+# settings.yml. This file intentionally contains no real keys.
+
+apiKeys:
+  openai: ""
+  gemini: ""
+  google: ""
+  huggingface: ""
+  openrouter: ""
+  assemblyai: ""
+  minimax: ""
+
+defaults:
+  preset: ultra
+  sourceLang: auto
+  targetLang: ru
+  personaId: normal
+  keepBackground: false
+  transcriptionSystem: openrouter
+  openrouterSttModel: microsoft/mai-transcribe-2
+  llmProvider: openrouter
+  llmModelName: ~google/gemini-flash-latest
+  refinementLlmProvider: openrouter
+  refinementModelName: google/gemini-4-carbon
+  ttsSystem: gemini38
+  ttsTransport: openrouter
+  ttsModel: google/gemini-3.8-flash-tts

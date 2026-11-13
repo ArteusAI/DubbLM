@@ -1,0 +1,96 @@
+# Docker Compose for DubbLM
+
+services:
+  frontend:
+    build:
+      context: ./src/frontend
+      dockerfile: Dockerfile
+    container_name: dubblm-frontend
+    ports:
+      - "3007:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: dubblm-redis
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dubblm-api
+    ports:
+      - "8007:8000"
+    volumes:
+      - ./projects:/app/projects
+      - ./dubblm.db:/app/dubblm.db
+      - ./settings.yml:/app/settings.yml
+      - ./.env:/app/.env
+      - ./src/tts/samples:/app/src/tts/samples
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite:///./dubblm.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - PROJECTS_DIR=./projects
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    command: python run_api.py
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dubblm-worker
+    volumes:
+      - ./projects:/app/projects
+      - ./dubblm.db:/app/dubblm.db
+      - ./cache:/app/cache
+      - ./cache/huggingface:/root/.cache/huggingface
+      - ./settings.yml:/app/settings.yml
+      - ./.env:/app/.env
+      - ./src/tts/samples:/app/src/tts/samples
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite:///./dubblm.db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - PROJECTS_DIR=./projects
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    command: >
+      celery -A src.api.workers.celery_app worker
+      --loglevel=INFO
+      --autoscale=8,1
+      -Q default,heavy,light
+      -n worker@%h
+
+volumes:
+  redis_data:
