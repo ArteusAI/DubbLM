@@ -1,5 +1,9 @@
 """Publish a dubbed project to the ИИ Борщ video library.
 
+DubbLM only uploads the finished video and the aligned transcript.  ИИ Борщ
+generates the public card (title, summary, tags, categories) and the timeline
+from that transcript, so the video never has to be transcribed again.
+
 The feature is intentionally opt-in: ``BORSCH_PUBLISH_ENABLED`` must be true.
 The admin token is supplied by the browser on the first publish and is never
 persisted on the server.
@@ -11,10 +15,9 @@ import json
 import logging
 import re
 import secrets
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from sqlalchemy.orm.attributes import flag_modified
@@ -24,27 +27,15 @@ from ..database.models import Project, ProjectStatus, Segment
 from ..database.session import get_db_session
 from ..services.object_storage import get_object_storage
 from ..services.project_manager import ProjectManager
-from ..services.settings_service import get_api_key
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_CONTENT_TYPES = {
-    "talk",
-    "lecture",
-    "explainer",
-    "tutorial",
-    "documentary",
-    "interview",
-    "demo",
-    "commentary",
-    "comedy",
-    "music",
-    "course",
-}
-ALLOWED_LEVELS = {"intro", "intermediate", "advanced"}
-ALLOWED_SHELF_LIFE = {"evergreen", "news", "historical"}
-_TAXONOMY_TTL_SECONDS = 300
-_taxonomy_cache: dict[str, Any] = {"at": 0.0, "areas": []}
+_SRT_TIME_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+_TTS_TAG_RE = re.compile(r"\[[^\[\]]{1,40}\]")
+_ANGLE_TAG_RE = re.compile(r"<[^<>]{1,40}>")
+_PIPE_TAG_RE = re.compile(r"\|([^|]{1,60})\|")
+_MAX_TRANSCRIPT_CHARS = 200000
+_MAX_TRANSCRIPT_SEGMENTS = 20000
 
 
 class BorschPublishError(Exception):
@@ -59,11 +50,6 @@ class BorschPublishError(Exception):
 class BorschAuthError(BorschPublishError):
     def __init__(self, message: str = "Invalid ИИ Борщ admin token"):
         super().__init__(message, status_code=401, code="borsch_invalid_token")
-
-
-class BorschMetadataError(BorschPublishError):
-    def __init__(self, message: str):
-        super().__init__(message, status_code=502, code="borsch_metadata_failed")
 
 
 def _api_url(path: str) -> str:
@@ -103,101 +89,141 @@ def validate_borsch_token(admin_token: str) -> None:
         raise BorschPublishError(_request_error(response, "ИИ Борщ token validation failed"))
 
 
-def _taxonomy() -> List[dict[str, Any]]:
-    now = time.time()
-    if now - float(_taxonomy_cache.get("at") or 0) < _TAXONOMY_TTL_SECONDS:
-        return _taxonomy_cache.get("areas") or []
+def _clean_text(value: Any) -> str:
+    """Remove TTS/emotion markup before sending text to ИИ Борщ."""
+    text = str(value or "")
+    text = _TTS_TAG_RE.sub(" ", text)
+    text = _ANGLE_TAG_RE.sub(" ", text)
+    text = _PIPE_TAG_RE.sub(lambda match: f" {match.group(1)} ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _srt_seconds(parts: tuple[str, str, str, str]) -> float:
+    hours, minutes, seconds, millis = parts
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(millis.ljust(3, "0")[:3]) / 1000.0
+    )
+
+
+def _parse_srt(path: Path) -> List[Dict[str, Any]]:
+    """Parse an SRT file into the timed chunks accepted by ИИ Борщ."""
     try:
-        response = requests.get(_api_url("/api/browse"), timeout=15)
-        response.raise_for_status()
-        areas = response.json()
-        if not isinstance(areas, list):
-            areas = []
-    except Exception as exc:
-        logger.warning("Could not load ИИ Борщ taxonomy: %s", exc)
-        areas = []
-    _taxonomy_cache["at"] = now
-    _taxonomy_cache["areas"] = areas
-    return areas
+        text = path.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
+    except OSError as exc:
+        logger.warning("Could not read subtitles %s: %s", path, exc)
+        return []
 
-
-def _flatten_categories(areas: List[dict[str, Any]]) -> List[dict[str, Any]]:
-    out: List[dict[str, Any]] = []
-    for area in areas:
-        for category in area.get("categories") or []:
-            cid = category.get("id")
-            if cid:
-                out.append(
-                    {
-                        "id": str(cid),
-                        "name": str(category.get("name") or cid),
-                        "area": str(area.get("name") or area.get("id") or ""),
-                    }
-                )
+    out: List[Dict[str, Any]] = []
+    for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        index = 0
+        if lines[0].strip().isdigit():
+            index = 1
+        if index >= len(lines):
+            continue
+        times = _SRT_TIME_RE.findall(lines[index])
+        if len(times) < 2:
+            continue
+        start = max(0.0, _srt_seconds(times[0]))
+        end = max(start + 0.01, _srt_seconds(times[1]))
+        body = _clean_text(" ".join(lines[index + 1 :]))
+        if not body:
+            continue
+        out.append(
+            {
+                "start_s": round(start, 3),
+                "end_s": round(end, 3),
+                "text": body,
+            }
+        )
+    out.sort(key=lambda item: item["start_s"])
     return out
 
 
-def _sample_transcript(segments: Iterable[Segment], target_lang: str, max_chars: int = 32000) -> str:
-    rows: list[tuple[float, str, str]] = []
-    for segment in segments:
-        text = (segment.translated_text or segment.original_text or "").strip()
-        if not text:
-            continue
-        rows.append((float(segment.start_time or 0), str(segment.speaker or "speaker"), text))
-    if not rows:
-        return ""
-    rows.sort(key=lambda row: row[0])
-
-    # Keep the first/last part and an even sample in the middle for long videos.
-    if len(rows) > 120:
-        head = rows[:12]
-        tail = rows[-12:]
-        middle = rows[12:-12]
-        step = max(1, len(middle) // 36)
-        sampled = head + middle[::step][:36] + tail
-    else:
-        sampled = rows
-
-    lines: list[str] = []
-    total = 0
-    for start, speaker, text in sampled:
-        minutes = int(start // 60)
-        seconds = int(start % 60)
-        line = f"[{minutes:02d}:{seconds:02d}] {speaker}: {text}"
-        if total + len(line) > max_chars and lines:
-            break
-        lines.append(line)
-        total += len(line) + 1
-    return "\n".join(lines)
-
-
-def _report_summary(project_id: str, project: Project) -> Dict[str, Any]:
-    pm = ProjectManager(project_id)
-    json_path = pm.artifacts_dir / "report.json"
-    if not json_path.exists():
-        try:
-            store = get_object_storage()
-            restored = store.ensure_local_report(project_id, project, kind="json")
-            if restored and restored.exists():
-                json_path = restored
-        except Exception as exc:
-            logger.warning("Could not restore report for %s: %s", project_id, exc)
-    if not json_path.exists():
-        return {}
+def _segments_from_db(project_id: str) -> List[Dict[str, Any]]:
+    """Fallback transcript builder that keeps speaker labels in the text."""
+    db = get_db_session(fresh=True)
     try:
-        report = json.loads(json_path.read_text(encoding="utf-8"))
+        rows = (
+            db.query(Segment)
+            .filter(Segment.project_id == project_id)
+            .order_by(Segment.sequence.asc())
+            .all()
+        )
+        out: List[Dict[str, Any]] = []
+        for segment in rows:
+            if segment.is_muted:
+                continue
+            text = _clean_text(segment.translated_text)
+            if not text:
+                continue
+            start = max(0.0, float(segment.start_time or 0))
+            end = max(start + 0.01, float(segment.end_time or start))
+            out.append(
+                {
+                    "start_s": round(start, 3),
+                    "end_s": round(end, 3),
+                    "text": text,
+                    "speaker": str(segment.speaker or "").strip(),
+                }
+            )
+        out.sort(key=lambda item: item["start_s"])
+        return out
+    finally:
+        db.close()
+
+
+def _build_publish_transcript(project_id: str, project: Project) -> Dict[str, Any]:
+    """Return the transcript payload for ИИ Борщ.
+
+    The rendered SRT is preferred because its timings already match the final
+    MP4.  If it is missing, project segments are used as a safe fallback.
+    """
+    target_lang = str((project.config or {}).get("targetLang") or "ru").strip().lower() or "ru"
+
+    segments: List[Dict[str, Any]] = []
+    from_srt = False
+    try:
+        store = get_object_storage()
+        srt_path = store.ensure_local_subtitle(project_id, project, target_lang, "srt")
+        if srt_path and srt_path.exists():
+            segments = _parse_srt(srt_path)
+            from_srt = bool(segments)
     except Exception as exc:
-        logger.warning("Could not parse report for %s: %s", project_id, exc)
-        return {}
+        logger.warning("Could not prepare subtitles for %s: %s", project_id, exc)
+
+    if not segments:
+        segments = _segments_from_db(project_id)
+
+    if not segments:
+        return {"transcript": "", "transcript_segments": [], "transcript_language": target_lang}
+
+    if from_srt:
+        transcript = "\n".join(item["text"] for item in segments)
+    else:
+        transcript = "\n".join(
+            f"{item['speaker']}: {item['text']}" if item.get("speaker") else item["text"]
+            for item in segments
+        )
+
+    public_segments = [
+        {
+            "start_s": item["start_s"],
+            "end_s": item["end_s"],
+            "text": item["text"],
+        }
+        for item in segments[:_MAX_TRANSCRIPT_SEGMENTS]
+    ]
     return {
-        "project": report.get("project") or {},
-        "totals": report.get("totals") or {},
-        "stages": report.get("stages") or [],
-        "artifacts": [
-            {"path": item.get("path"), "size_bytes": item.get("size_bytes")}
-            for item in (report.get("artifacts") or [])[:40]
-            if isinstance(item, dict)
-        ],
+        "transcript": transcript[:_MAX_TRANSCRIPT_CHARS],
+        "transcript_segments": public_segments,
+        "transcript_language": target_lang,
     }
 
 
@@ -210,24 +236,6 @@ def _metadata_language(project: Project) -> str:
     return str(target).strip().lower() or "ru"
 
 
-def _language_label(code: str) -> str:
-    labels = {
-        "ru": "русский",
-        "en": "английский",
-        "de": "немецкий",
-        "fr": "французский",
-        "es": "испанский",
-        "it": "итальянский",
-        "pt": "португальский",
-        "uk": "украинский",
-        "tr": "турецкий",
-        "zh": "китайский",
-        "ja": "японский",
-        "ko": "корейский",
-    }
-    return labels.get(code, code)
-
-
 def _source_url(project: Project) -> Optional[str]:
     config = project.config or {}
     for key in ("downloadUrl", "sourceUrl", "url"):
@@ -235,264 +243,6 @@ def _source_url(project: Project) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
-
-
-def _llm_chat(messages: List[dict[str, str]]) -> Dict[str, Any]:
-    settings = get_settings()
-    provider = (settings.borsch_llm_provider or "openrouter").strip().lower()
-    if provider == "openai":
-        url = "https://api.openai.com/v1/chat/completions"
-        key = get_api_key("openai")
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
-    elif provider == "openrouter":
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        key = get_api_key("openrouter")
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "HTTP-Referer": settings.borsch_public_url,
-            "X-Title": "DubbLM",
-        } if key else {}
-    else:
-        raise BorschMetadataError(f"Unsupported BORSCH_LLM_PROVIDER: {provider}")
-
-    if not key:
-        raise BorschMetadataError(f"No API key configured for LLM provider '{provider}'")
-
-    payload: dict[str, Any] = {
-        "model": settings.borsch_llm_model,
-        "messages": messages,
-        "temperature": settings.borsch_llm_temperature,
-        "response_format": {"type": "json_object"},
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=settings.borsch_llm_timeout)
-        if response.status_code == 400 and "response_format" in response.text.lower():
-            payload.pop("response_format", None)
-            response = requests.post(url, json=payload, headers=headers, timeout=settings.borsch_llm_timeout)
-    except requests.RequestException as exc:
-        raise BorschMetadataError(f"LLM request failed: {exc}") from exc
-
-    if response.status_code in (401, 403):
-        raise BorschMetadataError("LLM authentication failed")
-    if not response.ok:
-        raise BorschMetadataError(
-            f"LLM returned HTTP {response.status_code}: {response.text[:500]}"
-        )
-
-    try:
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        if isinstance(content, list):
-            content = "".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in content
-            )
-    except Exception as exc:
-        raise BorschMetadataError(f"Unexpected LLM response: {exc}") from exc
-
-    if not isinstance(content, str) or not content.strip():
-        raise BorschMetadataError("LLM returned an empty response")
-
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        try:
-            import json_repair  # type: ignore
-
-            parsed = json_repair.loads(content)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", content)
-            if not match:
-                raise BorschMetadataError("LLM did not return a JSON object")
-            try:
-                parsed = json.loads(match.group(0))
-            except json.JSONDecodeError as exc:
-                raise BorschMetadataError(f"LLM JSON is invalid: {exc}") from exc
-
-    if not isinstance(parsed, dict):
-        raise BorschMetadataError("LLM JSON is not an object")
-    return parsed
-
-
-def _as_str(value: Any, fallback: str = "", limit: int = 4000) -> str:
-    if value is None:
-        return fallback
-    text = str(value).strip()
-    if not text:
-        return fallback
-    return text[:limit]
-
-
-def _as_tags(value: Any) -> List[str]:
-    if isinstance(value, str):
-        values = re.split(r"[,;]+", value)
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = []
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in values:
-        tag = re.sub(r"\s+", " ", str(item)).strip().strip("#")
-        tag = tag[:48]
-        if tag and tag.lower() not in seen:
-            seen.add(tag.lower())
-            out.append(tag)
-    return out[:12]
-
-
-def _normalize_metadata(
-    raw: Dict[str, Any],
-    project: Project,
-    categories: List[dict[str, Any]],
-    language: str,
-    transcript: str,
-) -> Dict[str, Any]:
-    allowed_ids = {c["id"] for c in categories}
-    name_to_id = {c["name"].strip().lower(): c["id"] for c in categories}
-    raw_categories = raw.get("category_ids") or raw.get("categories") or []
-    if isinstance(raw_categories, str):
-        raw_categories = [raw_categories]
-    category_ids: list[str] = []
-    for item in raw_categories if isinstance(raw_categories, list) else []:
-        value = str(item).strip()
-        cid = value if value in allowed_ids else name_to_id.get(value.lower())
-        if cid and cid not in category_ids:
-            category_ids.append(cid)
-    category_ids = category_ids[:4]
-
-    title = _as_str(raw.get("title"), project.name or "Без названия", 300)
-    summary = _as_str(raw.get("summary"), "", 3000)
-    why_hn = _as_str(raw.get("why_hn"), "", 2000)
-    if not summary and transcript:
-        summary = transcript[:600].strip()
-    if not why_hn:
-        why_hn = "Видео переведено и озвучено с помощью DubbLM."
-
-    content_type = _as_str(raw.get("content_type"), "talk", 32).lower()
-    if content_type not in ALLOWED_CONTENT_TYPES:
-        content_type = "talk"
-    level = _as_str(raw.get("level"), "intermediate", 32).lower()
-    if level not in ALLOWED_LEVELS:
-        level = "intermediate"
-    shelf_life = _as_str(raw.get("shelf_life"), "evergreen", 32).lower()
-    if shelf_life not in ALLOWED_SHELF_LIFE:
-        shelf_life = "evergreen"
-
-    tags = _as_tags(raw.get("tags"))
-    primary_topic = _as_str(raw.get("primary_topic"), tags[0] if tags else "", 160)
-    reason = _as_str(raw.get("reason"), "Опубликовано из DubbLM", 300)
-
-    return {
-        "title": title,
-        "channel": get_settings().borsch_channel,
-        "summary": summary,
-        "why_hn": why_hn,
-        "content_type": content_type,
-        "level": level,
-        "shelf_life": shelf_life,
-        "primary_topic": primary_topic,
-        "tags": tags,
-        "category_ids": category_ids,
-        "reason": reason,
-        "license": "Права на исходное видео принадлежат автору; дубляж выполнен DubbLM.",
-    }
-
-
-def generate_metadata(project_id: str, admin_token: str) -> tuple[Project, Dict[str, Any], Optional[str]]:
-    """Build LLM metadata for a dubbed project. Returns (project, metadata, source_url)."""
-    settings = get_settings()
-    db = get_db_session(fresh=True)
-    try:
-        project = db.query(Project).filter(Project.id == project_id).first()
-        if not project:
-            raise BorschPublishError("Project not found", status_code=404, code="project_not_found")
-        if project.status != ProjectStatus.DUBBED:
-            raise BorschPublishError(
-                "Video is not dubbed yet",
-                status_code=400,
-                code="project_not_dubbed",
-            )
-        segments = (
-            db.query(Segment)
-            .filter(Segment.project_id == project_id)
-            .order_by(Segment.sequence.asc())
-            .all()
-        )
-        config = dict(project.config or {})
-        target_lang = str(config.get("targetLang") or "ru")
-        language = _metadata_language(project)
-        source_url = _source_url(project)
-        transcript = _sample_transcript(segments, target_lang)
-        report = _report_summary(project_id, project)
-        areas = _taxonomy()
-        categories = _flatten_categories(areas)
-        category_catalog = [
-            {"id": c["id"], "name": c["name"], "area": c["area"]}
-            for c in categories
-        ]
-
-        prompt_payload = {
-            "project": {
-                "name": project.name,
-                "source_filename": project.source_filename,
-                "source_language": config.get("sourceLang"),
-                "target_language": target_lang,
-                "duration_seconds": project.result_duration or project.source_duration,
-                "source_url": source_url,
-            },
-            "metadata_language": language,
-            "metadata_language_label": _language_label(language),
-            "transcript_digest": transcript,
-            "report": report,
-            "taxonomy": category_catalog,
-            "allowed_content_types": sorted(ALLOWED_CONTENT_TYPES),
-            "allowed_levels": sorted(ALLOWED_LEVELS),
-            "allowed_shelf_life": sorted(ALLOWED_SHELF_LIFE),
-        }
-
-        system_prompt = (
-            "Ты редактор видеотеки «ИИ Борщ» — библиотеки лучших видео для инженеров, "
-            "разработчиков и людей из Hacker News. Ты получаешь артефакты переведённого "
-            "и озвученного видео: название проекта, язык, транскрипт и отчёт пайплайна. "
-            "Придумай честную, конкретную карточку видео. Не выдумывай факты, которых "
-            "нет в транскрипте. Верни ТОЛЬКО валидный JSON без markdown."
-        )
-        user_prompt = f"""
-Сгенерируй метаданные для публикации видео в ИИ Борщ.
-
-Язык всех текстовых полей: {_language_label(language)} ({language}).
-Пиши title, summary, why_hn, primary_topic, tags и reason на этом языке.
-Категории выбирай только из списка taxonomy по id.
-
-Верни JSON строго такой структуры:
-{{
-  "title": "краткий цепляющий заголовок, до 120 символов",
-  "summary": "2–4 предложения о содержании видео",
-  "why_hn": "1–3 предложения, почему это интересно инженерам / HN-аудитории",
-  "content_type": "одно из allowed_content_types",
-  "level": "одно из allowed_levels",
-  "shelf_life": "одно из allowed_shelf_life",
-  "primary_topic": "главная тема, коротко",
-  "tags": ["5–10 конкретных тегов"],
-  "category_ids": ["1–4 id из taxonomy"],
-  "reason": "короткая причина для ленты, до 160 символов"
-}}
-
-Данные проекта:
-{json.dumps(prompt_payload, ensure_ascii=False)}
-"""
-        raw = _llm_chat(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-        )
-        metadata = _normalize_metadata(raw, project, categories, language, transcript)
-        return project, metadata, source_url
-    finally:
-        db.close()
 
 
 def _result_local_path(project_id: str, project: Project) -> Optional[Path]:
@@ -506,6 +256,46 @@ def _result_local_path(project_id: str, project: Project) -> Optional[Path]:
         if videos:
             return videos[0]
     return None
+
+
+def _upload_result_to_borsch(local: Path, dest_key: str) -> None:
+    """Upload a large result video with retries and a longer read timeout.
+
+    The default boto3 60-second read timeout is too short for multi-gigabyte
+    multipart uploads to Hetzner Object Storage.
+    """
+    import boto3
+    from boto3.s3.transfer import TransferConfig
+    from botocore.config import Config
+
+    settings = get_settings()
+    client = boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        region_name=settings.s3_region or "fsn1",
+        aws_access_key_id=settings.s3_access_key,
+        aws_secret_access_key=settings.s3_secret_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+            connect_timeout=30,
+            read_timeout=300,
+            retries={"max_attempts": 10, "mode": "standard"},
+            max_pool_connections=16,
+        ),
+    )
+    client.upload_file(
+        str(local),
+        settings.borsch_s3_bucket,
+        dest_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+        Config=TransferConfig(
+            multipart_threshold=64 * 1024 * 1024,
+            multipart_chunksize=32 * 1024 * 1024,
+            max_concurrency=4,
+            use_threads=True,
+        ),
+    )
 
 
 def _copy_result_to_borsch(
@@ -528,12 +318,7 @@ def _copy_result_to_borsch(
 
     try:
         if local and local.exists():
-            store.client.upload_file(
-                str(local),
-                settings.borsch_s3_bucket,
-                dest_key,
-                ExtraArgs={"ContentType": "video/mp4"},
-            )
+            _upload_result_to_borsch(local, dest_key)
         elif source_key:
             # Hetzner Object Storage does not currently support cross-bucket
             # CopyObject reliably. Fall back to a server-side download + upload
@@ -558,22 +343,12 @@ def _copy_result_to_borsch(
                         status_code=404,
                         code="video_not_found",
                     ) from copy_exc
-                store.client.upload_file(
-                    str(restored),
-                    settings.borsch_s3_bucket,
-                    dest_key,
-                    ExtraArgs={"ContentType": "video/mp4"},
-                )
+                _upload_result_to_borsch(restored, dest_key)
         else:
             restored = store.ensure_local_result_video(project_id, project)
             if not restored or not restored.exists():
                 raise BorschPublishError("Dubbed video not found", status_code=404, code="video_not_found")
-            store.client.upload_file(
-                str(restored),
-                settings.borsch_s3_bucket,
-                dest_key,
-                ExtraArgs={"ContentType": "video/mp4"},
-            )
+            _upload_result_to_borsch(restored, dest_key)
         store.client.head_object(Bucket=settings.borsch_s3_bucket, Key=dest_key)
         return dest_key
     except BorschPublishError:
@@ -592,29 +367,39 @@ def _delete_borsch_object(key: str) -> None:
         logger.warning("Could not clean up ИИ Борщ object %s: %s", key, exc)
 
 
-def _register_in_borsch(vid: str, source_key: str, metadata: Dict[str, Any], admin_token: str) -> str:
-    payload = {
-        "vid": vid,
-        "source_key": source_key,
-        "title": metadata["title"],
-        "channel": metadata["channel"],
-        "summary": metadata["summary"],
-        "why_hn": metadata["why_hn"],
-        "published": datetime.now(timezone.utc).isoformat(),
-        "content_type": metadata["content_type"],
-        "level": metadata["level"],
-        "shelf_life": metadata["shelf_life"],
-        "primary_topic": metadata["primary_topic"],
-        "tags": metadata["tags"],
-        "category_ids": metadata["category_ids"],
-        "views": 0,
-        "likes": 0,
-        "score": 0,
-        "reason": metadata["reason"],
-        "license": metadata["license"],
-        "source_url": metadata.get("source_url"),
-        "featured": False,
+def _publish_payload(project: Project, transcript_payload: Dict[str, Any]) -> Dict[str, Any]:
+    settings = get_settings()
+    return {
+        "title": project.name or "Без названия",
+        "channel": settings.borsch_channel,
+        "published": _now_iso(),
+        "source_url": _source_url(project),
+        "license": "Права на исходное видео принадлежат автору; дубляж выполнен DubbLM.",
+        "auto_metadata": True,
+        "metadata_language": _metadata_language(project),
+        "transcript": transcript_payload["transcript"],
+        "transcript_language": transcript_payload["transcript_language"],
+        "transcript_segments": transcript_payload["transcript_segments"],
     }
+
+
+def _ensure_remote_metadata_supported(data: Dict[str, Any]) -> None:
+    if data.get("auto_metadata") is not True:
+        raise BorschPublishError(
+            "ИИ Борщ не подтвердил генерацию метаданных из переданного транскрипта. "
+            "Обновите ИИ Борщ до версии с поддержкой auto_metadata.",
+            code="borsch_metadata_not_supported",
+        )
+
+
+def _register_in_borsch(
+    vid: str,
+    source_key: str,
+    project: Project,
+    transcript_payload: Dict[str, Any],
+    admin_token: str,
+) -> Dict[str, Any]:
+    payload = {"vid": vid, "source_key": source_key, **_publish_payload(project, transcript_payload)}
     try:
         response = requests.post(
             _api_url("/api/admin/videos/register"),
@@ -629,15 +414,16 @@ def _register_in_borsch(vid: str, source_key: str, metadata: Dict[str, Any], adm
     if not response.ok:
         raise BorschPublishError(_request_error(response, "ИИ Борщ register failed"))
     data = response.json()
-    return str(data.get("status") or "processing")
+    _ensure_remote_metadata_supported(data)
+    return data
 
 
 def _fallback_upload(
     project_id: str,
     project: Project,
-    metadata: Dict[str, Any],
+    transcript_payload: Dict[str, Any],
     admin_token: str,
-) -> tuple[str, str]:
+) -> tuple[str, Dict[str, Any]]:
     settings = get_settings()
     local = _result_local_path(project_id, project)
     if not local or not local.exists():
@@ -650,24 +436,21 @@ def _fallback_upload(
             "Video is too large for the fallback upload. Direct S3 copy failed.",
             code="video_too_large",
         )
+    payload = _publish_payload(project, transcript_payload)
     data = {
-        "title": metadata["title"],
-        "channel": metadata["channel"],
-        "summary": metadata["summary"],
-        "why_hn": metadata["why_hn"],
-        "published": datetime.now(timezone.utc).isoformat(),
-        "content_type": metadata["content_type"],
-        "level": metadata["level"],
-        "shelf_life": metadata["shelf_life"],
-        "primary_topic": metadata["primary_topic"],
-        "tags": ", ".join(metadata["tags"]),
-        "category_ids": ", ".join(metadata["category_ids"]),
+        "title": payload["title"],
+        "channel": payload["channel"],
+        "published": payload["published"],
+        "source_url": payload["source_url"] or "",
+        "license": payload["license"],
+        "auto_metadata": "true",
+        "metadata_language": payload["metadata_language"],
+        "transcript": payload["transcript"],
+        "transcript_language": payload["transcript_language"],
+        "transcript_segments": json.dumps(payload["transcript_segments"], ensure_ascii=False),
         "views": "0",
         "likes": "0",
         "score": "0",
-        "reason": metadata["reason"],
-        "license": metadata["license"],
-        "source_url": metadata.get("source_url") or "",
     }
     try:
         with local.open("rb") as handle:
@@ -684,8 +467,67 @@ def _fallback_upload(
         raise BorschAuthError()
     if not response.ok:
         raise BorschPublishError(_request_error(response, "Fallback upload failed"))
-    payload = response.json()
-    return str(payload["vid"]), str(payload.get("status") or "processing")
+    result = response.json()
+    _ensure_remote_metadata_supported(result)
+    return str(result["vid"]), result
+
+
+def _get_project(project_id: str) -> Project:
+    db = get_db_session(fresh=True)
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise BorschPublishError("Project not found", status_code=404, code="project_not_found")
+        if project.status != ProjectStatus.DUBBED:
+            raise BorschPublishError(
+                "Video is not dubbed yet",
+                status_code=400,
+                code="project_not_dubbed",
+            )
+        return project
+    finally:
+        db.close()
+
+
+def _store_publish_state(project_id: str, state: Dict[str, Any]) -> None:
+    db = get_db_session(fresh=True)
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+        config = dict(project.config or {})
+        config["borsch"] = state
+        project.config = config
+        flag_modified(project, "config")
+        db.commit()
+    finally:
+        db.close()
+
+
+def _state_from_result(
+    vid: str,
+    status: str,
+    project: Project,
+    remote: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    settings = get_settings()
+    state: Dict[str, Any] = {
+        "vid": vid,
+        "status": status,
+        "url": f"{settings.borsch_public_url}/watch/{vid}",
+        "publishedAt": _now_iso(),
+        "sourceUrl": _source_url(project),
+        "metadataStatus": (remote or {}).get("metadata_status") or ("pending" if status == "processing" else None),
+        "timelineStatus": (remote or {}).get("timeline_status"),
+    }
+    if remote:
+        metadata = _remote_metadata(remote)
+        if metadata:
+            state["metadata"] = metadata
+        timeline = _remote_timeline(remote)
+        if timeline:
+            state["timeline"] = timeline
+    return state
 
 
 def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, Any]:
@@ -694,8 +536,14 @@ def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, An
         raise BorschPublishError("Publishing is disabled", status_code=404, code="publish_disabled")
 
     validate_borsch_token(admin_token)
-    project, metadata, source_url = generate_metadata(project_id, admin_token)
-    metadata["source_url"] = source_url
+    project = _get_project(project_id)
+    transcript_payload = _build_publish_transcript(project_id, project)
+    if not transcript_payload["transcript"]:
+        raise BorschPublishError(
+            "Project has no translated transcript to publish",
+            status_code=400,
+            code="empty_transcript",
+        )
 
     last_error: Optional[Exception] = None
     for _ in range(3):
@@ -703,26 +551,20 @@ def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, An
         source_key = ""
         try:
             source_key = _copy_result_to_borsch(project_id, project, vid, admin_token=admin_token)
-            status = _register_in_borsch(vid, source_key, metadata, admin_token)
-            state = {
-                "vid": vid,
-                "status": status,
-                "url": f"{settings.borsch_public_url}/watch/{vid}",
-                "publishedAt": _now_iso(),
-                "metadata": metadata,
-                "sourceUrl": source_url,
-            }
-            db = get_db_session(fresh=True)
-            try:
-                fresh = db.query(Project).filter(Project.id == project_id).first()
-                if fresh:
-                    config = dict(fresh.config or {})
-                    config["borsch"] = state
-                    fresh.config = config
-                    flag_modified(fresh, "config")
-                    db.commit()
-            finally:
-                db.close()
+            remote = _register_in_borsch(
+                vid,
+                source_key,
+                project,
+                transcript_payload,
+                admin_token,
+            )
+            state = _state_from_result(
+                vid,
+                str(remote.get("status") or "processing"),
+                project,
+                remote,
+            )
+            _store_publish_state(project_id, state)
             return {"enabled": True, "published": True, **state}
         except BorschAuthError:
             if source_key:
@@ -732,6 +574,8 @@ def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, An
             if source_key:
                 _delete_borsch_object(source_key)
             last_error = exc
+            if exc.code == "borsch_metadata_not_supported":
+                raise
             # A collision is the only error worth retrying with a new id.
             if "already exists" not in str(exc).lower():
                 break
@@ -742,27 +586,18 @@ def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, An
             break
 
     # Direct S3 copy failed: try the normal multipart API for smaller files.
+    if getattr(last_error, "code", "") == "borsch_metadata_not_supported":
+        raise last_error  # type: ignore[misc]
+
     try:
-        vid, status = _fallback_upload(project_id, project, metadata, admin_token)
-        state = {
-            "vid": vid,
-            "status": status,
-            "url": f"{settings.borsch_public_url}/watch/{vid}",
-            "publishedAt": _now_iso(),
-            "metadata": metadata,
-            "sourceUrl": source_url,
-        }
-        db = get_db_session(fresh=True)
-        try:
-            fresh = db.query(Project).filter(Project.id == project_id).first()
-            if fresh:
-                config = dict(fresh.config or {})
-                config["borsch"] = state
-                fresh.config = config
-                flag_modified(fresh, "config")
-                db.commit()
-        finally:
-            db.close()
+        vid, remote = _fallback_upload(project_id, project, transcript_payload, admin_token)
+        state = _state_from_result(
+            vid,
+            str(remote.get("status") or "processing"),
+            project,
+            remote,
+        )
+        _store_publish_state(project_id, state)
         return {"enabled": True, "published": True, **state}
     except Exception as fallback_exc:
         if isinstance(fallback_exc, BorschAuthError):
@@ -774,6 +609,44 @@ def publish_project_to_borsch(project_id: str, admin_token: str) -> Dict[str, An
             f"Could not publish to ИИ Борщ: {message}; fallback: {fallback_exc}",
             code=getattr(last_error, "code", "borsch_publish_failed"),
         ) from fallback_exc
+
+
+def _remote_metadata(remote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if remote.get("metadata_status") != "ready":
+        return None
+    return {
+        "title": remote.get("title") or "",
+        "channel": remote.get("channel") or "",
+        "summary": remote.get("summary") or "",
+        "why_hn": remote.get("why_hn") or "",
+        "content_type": remote.get("content_type") or "",
+        "level": remote.get("level") or "",
+        "shelf_life": remote.get("shelf_life") or "",
+        "primary_topic": remote.get("primary_topic") or "",
+        "tags": remote.get("tags") or [],
+        "category_ids": remote.get("category_ids") or [],
+        "reason": remote.get("reason") or "",
+        "license": remote.get("license") or "",
+        "source_url": remote.get("source_url"),
+    }
+
+
+def _remote_timeline(remote: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = remote.get("timeline")
+    if not isinstance(items, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0, int(round(float(item.get("start_s") or 0))))
+        except (TypeError, ValueError):
+            start = 0
+        title = str(item.get("title") or "").strip()
+        if title:
+            out.append({"start_s": start, "title": title[:160]})
+    return out[:40]
 
 
 def get_publish_state(project_id: str, admin_token: Optional[str] = None) -> Dict[str, Any]:
@@ -801,13 +674,26 @@ def get_publish_state(project_id: str, admin_token: Optional[str] = None) -> Dic
                 )
                 if response.status_code == 200:
                     remote = response.json()
-                    remote_status = str(remote.get("status") or state.get("status") or "processing")
-                    if remote_status != state.get("status"):
-                        state["status"] = remote_status
-                        config["borsch"] = state
-                        project.config = config
-                        flag_modified(project, "config")
-                        db.commit()
+                    state["status"] = str(
+                        remote.get("status") or state.get("status") or "processing"
+                    )
+                    state["metadataStatus"] = remote.get("metadata_status")
+                    state["timelineStatus"] = remote.get("timeline_status")
+                    state["metadataError"] = remote.get("metadata_error")
+                    state["hasTranscript"] = bool(remote.get("has_transcript"))
+                    state["transcriptSegments"] = int(
+                        remote.get("transcript_segments_count") or 0
+                    )
+                    metadata = _remote_metadata(remote)
+                    if metadata:
+                        state["metadata"] = metadata
+                    timeline = _remote_timeline(remote)
+                    if timeline:
+                        state["timeline"] = timeline
+                    config["borsch"] = state
+                    project.config = config
+                    flag_modified(project, "config")
+                    db.commit()
                 elif response.status_code == 404:
                     state["status"] = "missing"
             except requests.RequestException:

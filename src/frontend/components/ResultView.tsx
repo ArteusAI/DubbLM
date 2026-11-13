@@ -1133,7 +1133,7 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
                         ? 'Ошибка обработки в ИИ Борщ'
                         : borschState.status === 'missing'
                           ? 'Видео не найдено в ИИ Борщ'
-                          : 'Обрабатывается в ИИ Борщ…'}
+                          : 'ИИ Борщ обрабатывает видео и генерирует описание…'}
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
@@ -1159,10 +1159,25 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
                   </button>
                 </div>
               </div>
+              {(borschState.metadataStatus === 'failed' || borschState.timelineStatus === 'failed') && (
+                <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  {borschState.metadataStatus === 'failed'
+                    ? `Видео опубликовано, но метаданные не сгенерированы${borschState.metadataError ? `: ${borschState.metadataError}` : '.'}`
+                    : 'Видео опубликовано, но таймлайн не сгенерирован.'}
+                </div>
+              )}
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-400">
+                {typeof borschState.transcriptSegments === 'number' && borschState.transcriptSegments > 0 && (
+                  <span>Транскрипт: {borschState.transcriptSegments} сегментов</span>
+                )}
+                {borschState.timeline && borschState.timeline.length > 0 && (
+                  <span>Таймлайн: {borschState.timeline.length} глав</span>
+                )}
+              </div>
               {borschState.metadata && (
                 <details className="mt-2">
                   <summary className="cursor-pointer text-xs font-medium text-zinc-400 hover:text-zinc-200">
-                    Сгенерированные метаданные
+                    Метаданные из ИИ Борща
                   </summary>
                   <div className="mt-2 space-y-1.5 rounded-lg bg-zinc-950/70 p-3 text-xs leading-relaxed text-zinc-300">
                     <div className="font-semibold text-white">{borschState.metadata.title}</div>
@@ -1189,7 +1204,7 @@ export const ResultView: React.FC<ResultViewProps> = ({ projectId, onReset }) =>
               className="flex w-full items-center justify-center gap-2 rounded-xl bg-brand-600 px-4 py-3 text-sm font-bold text-white shadow-lg shadow-brand-500/20 transition-all hover:bg-brand-500 disabled:cursor-wait disabled:opacity-70"
             >
               {borschLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UploadCloud className="h-4 w-4" />}
-              {borschLoading ? 'Генерирую описание и публикую…' : 'Опубликовать в ИИ Борщ'}
+              {borschLoading ? 'Публикую в ИИ Борщ…' : 'Опубликовать в ИИ Борщ'}
             </button>
           )}
           {borschError && (

@@ -948,6 +948,11 @@ export interface BorschPublishMetadata {
   source_url?: string | null;
 }
 
+export interface BorschTimelineChapter {
+  start_s: number;
+  title: string;
+}
+
 export interface BorschPublishState {
   enabled: boolean;
   published: boolean;
@@ -956,6 +961,12 @@ export interface BorschPublishState {
   url?: string;
   publishedAt?: string;
   metadata?: BorschPublishMetadata;
+  metadataStatus?: 'pending' | 'running' | 'ready' | 'failed' | 'skipped' | string | null;
+  timelineStatus?: string | null;
+  metadataError?: string | null;
+  timeline?: BorschTimelineChapter[];
+  hasTranscript?: boolean;
+  transcriptSegments?: number;
   sourceUrl?: string | null;
   error?: string;
 }

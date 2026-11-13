@@ -31,7 +31,9 @@ preservation, LLM editor passes, or high-resolution video.
 - **Video controls** for background audio, original-audio ranges, segment
   stretching, volume, subtitles, and quality.
 - **Optional ИИ Борщ publishing** from the result view when
-  `BORSCH_PUBLISH_ENABLED=true`.
+  `BORSCH_PUBLISH_ENABLED=true`. DubbLM uploads the finished video and its
+  aligned transcript; ИИ Борщ generates the public card and timeline without
+  transcribing the video again.
 
 ## How It Works
 

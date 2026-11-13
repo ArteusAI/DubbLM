@@ -87,18 +87,6 @@ class Settings:
     borsch_metadata_language: str = field(
         default_factory=lambda: (os.getenv("BORSCH_METADATA_LANGUAGE") or "auto").strip().lower()
     )
-    borsch_llm_provider: str = field(
-        default_factory=lambda: (os.getenv("BORSCH_LLM_PROVIDER") or "openrouter").strip().lower()
-    )
-    borsch_llm_model: str = field(
-        default_factory=lambda: os.getenv("BORSCH_LLM_MODEL") or "~google/gemini-flash-latest"
-    )
-    borsch_llm_temperature: float = field(
-        default_factory=lambda: float(os.getenv("BORSCH_LLM_TEMPERATURE", "0.4"))
-    )
-    borsch_llm_timeout: int = field(
-        default_factory=lambda: int(os.getenv("BORSCH_LLM_TIMEOUT", "120"))
-    )
     borsch_publish_timeout: int = field(
         default_factory=lambda: int(os.getenv("BORSCH_PUBLISH_TIMEOUT", "1800"))
     )
