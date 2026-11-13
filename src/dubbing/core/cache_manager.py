@@ -3,10 +3,25 @@
 import os
 import hashlib
 import pickle
+import re
 import shutil
 import json
 from pathlib import Path
 from typing import Any, Optional, Dict, List
+
+_CACHE_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_cache_component(value: str) -> str:
+    """Turn a cache key or filename into one filesystem-safe path component.
+
+    Cache keys include provider model ids such as ``microsoft/mai-transcribe-2``.
+    Without sanitizing, the slash becomes a directory separator and cache
+    writes fail with ENOENT on the first run (when no cache exists yet).
+    """
+    cleaned = _CACHE_UNSAFE_RE.sub("_", str(value or "")).strip(".")
+    return cleaned or "cache"
+
 
 
 class CacheManager:
@@ -106,10 +121,10 @@ class CacheManager:
         if self.input_file:
             # Use input-hash-based directory structure: ./cache/<hash>/<step_name>/
             input_hash = self.generate_input_hash(self.input_file)
-            cache_dir = self.cache_root / input_hash / step_name
+            cache_dir = self.cache_root / input_hash / _safe_cache_component(step_name)
         else:
             # Fallback to old structure if no input file is set
-            cache_dir = self.cache_root / step_name
+            cache_dir = self.cache_root / _safe_cache_component(step_name)
         
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
@@ -127,7 +142,7 @@ class CacheManager:
         if not self.use_cache:
             return False
             
-        cache_file = self.get_cache_path(step_name) / f"{cache_key}.pkl"
+        cache_file = self.get_cache_path(step_name) / f"{_safe_cache_component(cache_key)}.pkl"
         return cache_file.exists()
     
     def save_to_cache(self, step_name: str, cache_key: str, data: Any) -> None:
@@ -141,7 +156,7 @@ class CacheManager:
         if not self.use_cache:
             return
             
-        cache_file = self.get_cache_path(step_name) / f"{cache_key}.pkl"
+        cache_file = self.get_cache_path(step_name) / f"{_safe_cache_component(cache_key)}.pkl"
         with open(cache_file, "wb") as f:
             pickle.dump(data, f)
     
@@ -158,7 +173,7 @@ class CacheManager:
         if not self.use_cache:
             return None
             
-        cache_file = self.get_cache_path(step_name) / f"{cache_key}.pkl"
+        cache_file = self.get_cache_path(step_name) / f"{_safe_cache_component(cache_key)}.pkl"
         with open(cache_file, "rb") as f:
             return pickle.load(f)
     
@@ -175,7 +190,7 @@ class CacheManager:
             return
             
         cache_path = self.get_cache_path(step_name)
-        cache_dir = cache_path / cache_key
+        cache_dir = cache_path / _safe_cache_component(cache_key)
         
         if cache_dir.exists():
             os.makedirs(destination_dir, exist_ok=True)
@@ -195,7 +210,7 @@ class CacheManager:
             return
             
         cache_dir = self.get_cache_path(step_name)
-        cache_file = cache_dir / cache_filename
+        cache_file = cache_dir / _safe_cache_component(cache_filename)
         
         if os.path.exists(source_file):
             shutil.copy(source_file, cache_file)
@@ -216,7 +231,7 @@ class CacheManager:
             return False
             
         cache_dir = self.get_cache_path(step_name)
-        cache_file = cache_dir / cache_filename
+        cache_file = cache_dir / _safe_cache_component(cache_filename)
         
         if cache_file.exists():
             shutil.copy(cache_file, destination_file)
@@ -272,7 +287,7 @@ class CacheManager:
             Path to the saved JSON file
         """
         cache_dir = self.get_cache_path(step_name)
-        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_filename = f"{_safe_cache_component(cache_key)}{_safe_cache_component(filename_suffix) if filename_suffix else ''}.json"
         json_file = cache_dir / json_filename
         
         data = {
@@ -300,7 +315,7 @@ class CacheManager:
             Dictionary with segments and metadata if file exists, None otherwise
         """
         cache_dir = self.get_cache_path(step_name)
-        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_filename = f"{_safe_cache_component(cache_key)}{_safe_cache_component(filename_suffix) if filename_suffix else ''}.json"
         json_file = cache_dir / json_filename
         
         if not json_file.exists():
@@ -324,6 +339,6 @@ class CacheManager:
             True if file exists, False otherwise
         """
         cache_dir = self.get_cache_path(step_name)
-        json_filename = f"{cache_key}{filename_suffix}.json"
+        json_filename = f"{_safe_cache_component(cache_key)}{_safe_cache_component(filename_suffix) if filename_suffix else ''}.json"
         json_file = cache_dir / json_filename
         return json_file.exists() 
